@@ -7,7 +7,9 @@ import (
 	"time"
 )
 
-// Strategy deliberately does not infer liquidity or exitability from a creation event.
+// Strategy admits only fresh, non-duplicated PumpPortal creation events. Capital
+// and operational limits remain enforced by the execution engine immediately
+// before an entry is created.
 type Strategy struct {
 	db                     *database.DB
 	maxAge time.Duration
@@ -21,7 +23,7 @@ func (s *Strategy) Evaluate(ctx context.Context, mint string, receivedAt time.Ti
 		return false, "missing mint"
 	}
 	if s.maxAge > 0 && time.Since(receivedAt) > s.maxAge {
-		return false, "token event exceeded maximum entry age"
+		return false, "token creation exceeded maximum entry age"
 	}
 	active, e := s.db.ActiveForMint(mint)
 	if e != nil {

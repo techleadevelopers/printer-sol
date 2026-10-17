@@ -141,7 +141,12 @@ func (d *DB) RecordAssessment(mint string, approved bool, reason string) error {
 	return e
 }
 func (d *DB) ListTrades() (rows *sql.Rows, err error) {
-	return d.Query(`SELECT id,mint,side,quantity,requested_value_sol,COALESCE(executed_value_sol,0),COALESCE(fees_sol,0),slippage_pct,COALESCE(signature,''),state FROM trades ORDER BY created_at DESC LIMIT 200`)
+	return d.Query(`SELECT id,mint,side,quantity,requested_value_sol,COALESCE(executed_value_sol,0),COALESCE(fees_sol,0),slippage_pct,COALESCE(signature,''),state,created_at FROM trades ORDER BY created_at DESC LIMIT 200`)
+}
+func (d *DB) TokenEventCount() (int, error) {
+	var n int
+	e := d.QueryRow(`SELECT COUNT(*) FROM token_events`).Scan(&n)
+	return n, e
 }
 func (d *DB) RecordRPC(endpoint string, healthy bool, latency int64, status int, msg string) error {
 	_, e := d.Exec(d.bind(`INSERT INTO rpc_health(endpoint,checked_at,latency_ms,healthy,http_status,error,supports_read) VALUES(?,?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET checked_at=excluded.checked_at,latency_ms=excluded.latency_ms,healthy=excluded.healthy,http_status=excluded.http_status,error=excluded.error,supports_read=excluded.supports_read`), endpoint, time.Now().UTC(), latency, healthy, status, strings.TrimSpace(msg), healthy)
@@ -153,7 +158,7 @@ func (d *DB) ListTokens() (*sql.Rows, error) {
 	// Pump.fun firehose.
 	return d.Query(d.bind(`SELECT e.mint,COALESCE(e.creator,''),e.received_at,e.latency_ms
 		FROM token_events e
-		WHERE EXISTS (SELECT 1 FROM risk_assessments r WHERE r.mint=e.mint AND r.approved=?)
+		WHERE EXISTS (SELECT 1 FROM risk_assessments r WHERE r.mint=e.mint AND r.id=(SELECT MAX(r2.id) FROM risk_assessments r2 WHERE r2.mint=e.mint) AND r.approved=?)
 		ORDER BY e.id DESC LIMIT 200`), true)
 }
 func (d *DB) OpenSimulationPosition(mint string, amount float64) error {

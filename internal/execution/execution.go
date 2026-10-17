@@ -49,6 +49,7 @@ func New(db *database.DB, w *wallet.Wallet, p *pumpportal.Client, r *rpcmanager.
 }
 func (e *Engine) Limits() Limits     { e.mu.RLock(); defer e.mu.RUnlock(); return e.limits }
 func (e *Engine) SetLimits(l Limits) { e.mu.Lock(); e.limits = l; e.mu.Unlock() }
+func (e *Engine) SimulationBalanceSOL() float64 { return float64(e.simulationBalance) / 1e9 }
 func (e *Engine) emit(kind string, data any) {
 	if e.bus != nil {
 		e.bus.Publish(kind, data)
@@ -178,7 +179,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		if e.controller != nil && !e.controller.AllowsEntries() {
 			return "", fmt.Errorf("bot is not accepting new entries")
 		}
-		if !e.rpcs.Available() {
+		if !e.simulation && !e.rpcs.Available() {
 			return "", fmt.Errorf("no healthy RPC; purchases blocked")
 		}
 		if needed, err := e.db.ReconciliationRequired(); err != nil {

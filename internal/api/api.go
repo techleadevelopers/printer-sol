@@ -18,6 +18,7 @@ import (
 	"solana-sniper-backend/internal/rpcmanager"
 	"solana-sniper-backend/internal/tokenmonitor"
 	"solana-sniper-backend/internal/wallet"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -66,23 +67,21 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
-	trading := s.rpcs.Available() && (s.cfg.Simulation || s.cfg.EnableLiveTrading)
-	write(w, 200, map[string]any{
-		"service": map[string]any{"active": true},
-		"monitor": map[string]any{"connected": s.monitor != nil && s.monitor.Connected()},
-		"trading": map[string]any{"available": trading, "simulation": s.cfg.Simulation, "botState": s.controller.State()},
-		"at":      time.Now().UTC(),
-	})
+	monitorState := "disconnected"
+	if s.monitor != nil && s.monitor.Connected() { monitorState = "connected" }
+	write(w, 200, map[string]any{"status": "ok", "eventMonitorStatus": monitorState, "checkedAt": time.Now().UTC()})
 }
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
 	positions, _ := s.db.OpenPositionCount()
-	unknown, _ := s.db.UnknownTradeCount()
 	exposure, _ := s.db.OpenExposureSOL()
-	loss, _ := s.db.DailyRealizedLossSOL()
-	write(w, 200, map[string]any{"botState": s.controller.State(), "simulation": s.cfg.Simulation, "openPositions": positions, "openExposureSol": exposure, "dailyLossSol": loss, "reconciliationRequired": unknown > 0, "rpcAvailable": s.rpcs.Available()})
+	detected, _ := s.db.TokenEventCount()
+	trades := s.tradeItems()
+	balance := s.balanceSOL(exposure)
+	now := time.Now().UTC()
+	write(w, 200, map[string]any{"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance, "walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "detectedTokens": detected, "analyzedTokens": detected, "tradesCount": len(trades), "openPositions": positions, "realizedPnlSol": 0.0, "estimatedOpenPnlSol": 0.0, "netPnlSol": 0.0, "costsSol": 0.0, "cumulativeResult": []map[string]any{{"timestamp": now, "value": 0.0}}, "tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": len(trades), "positive": 0, "negative": 0}}, "balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades})
 }
 func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
@@ -99,10 +98,10 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 		var mint, creator, at string
 		var latency int64
 		if rows.Scan(&mint, &creator, &at, &latency) == nil {
-			out = append(out, map[string]any{"mint": mint, "creator": creator, "receivedAt": at, "latencyMs": latency})
+			out = append(out, map[string]any{"id": mint, "detectedAt": at, "name": nil, "symbol": nil, "mint": mint, "creatorWallet": creator, "analysisStatus": "approved", "liquiditySol": nil, "tradeCount": nil, "riskResult": "accepted", "decisionReason": "entry accepted by engine", "operationStatus": "position_open"})
 		}
 	}
-	write(w, 200, map[string]any{"items": out})
+	write(w, 200, map[string]any{"items": out, "nextCursor": nil})
 }
 func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
@@ -119,7 +118,8 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 		var mint, q, status, opened, updated string
 		var cost float64
 		if rows.Scan(&mint, &q, &cost, &status, &opened, &updated) == nil {
-			out = append(out, map[string]any{"mint": mint, "quantity": q, "costSol": cost, "status": status, "openedAt": opened, "updatedAt": updated})
+			quantity, _ := strconv.ParseFloat(q, 64)
+			out = append(out, map[string]any{"id": mint, "tokenName": nil, "symbol": nil, "mint": mint, "quantity": quantity, "averageEntryPriceSol": cost, "buyValueSol": cost, "costsSol": 0.0, "estimatedValueSol": cost, "estimatedPnlSol": 0.0, "realizedPnlSol": nil, "openedAt": opened, "status": status, "sellStatus": "not_requested"})
 		}
 	}
 	write(w, 200, map[string]any{"items": out})
@@ -128,21 +128,43 @@ func (s *Server) trades(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
-	rows, e := s.db.ListTrades()
-	if e != nil {
-		fail(w, 500, "database_unavailable", "database unavailable")
-		return
-	}
+	write(w, 200, map[string]any{"items": s.tradeItems(), "nextCursor": nil})
+}
+func (s *Server) tradeItems() []map[string]any {
+	rows, err := s.db.ListTrades()
+	if err != nil { return []map[string]any{} }
 	defer rows.Close()
-	out := []map[string]any{}
+	items := []map[string]any{}
 	for rows.Next() {
-		var id, mint, side, q, sig, state string
-		var req, done, fees, slip float64
-		if rows.Scan(&id, &mint, &side, &q, &req, &done, &fees, &slip, &sig, &state) == nil {
-			out = append(out, map[string]any{"id": id, "mint": mint, "side": side, "quantity": q, "requestedValueSol": req, "executedValueSol": done, "feesSol": fees, "slippagePct": slip, "signature": sig, "state": state})
-		}
+		var id, mint, side, quantityText, signature, state, createdAt string
+		var requested, executed, fees, slippage float64
+		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &fees, &slippage, &signature, &state, &createdAt); err != nil { continue }
+		quantity, _ := strconv.ParseFloat(quantityText, 64)
+		status := state
+		if state == "simulated" || state == "finalized" { status = "confirmed" }
+		if status != "pending" && status != "submitted" && status != "confirmed" && status != "failed" { status = "unknown" }
+		item := map[string]any{"id": id, "timestamp": createdAt, "tokenName": nil, "symbol": nil, "mint": mint, "side": side, "quantity": quantity, "buyValueSol": nil, "sellValueSol": nil, "feesSol": fees, "slippage": slippage, "grossPnlSol": nil, "netPnlSol": nil, "transactionId": nil, "signature": nil, "status": status}
+		if side == "buy" { item["buyValueSol"] = requested } else { item["sellValueSol"] = requested }
+		if signature != "" { item["transactionId"] = signature; item["signature"] = signature }
+		items = append(items, item)
 	}
-	write(w, 200, map[string]any{"items": out})
+	return items
+}
+func (s *Server) mode() string {
+	if s.cfg.Simulation { return "simulation" }
+	return "real"
+}
+func (s *Server) balanceSOL(exposure float64) float64 {
+	if s.cfg.Simulation {
+		balance := s.engine.SimulationBalanceSOL() - exposure
+		if balance < 0 { return 0 }
+		return balance
+	}
+	if s.wallet.Address() == "" || !s.rpcs.Available() { return 0 }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if lamports, err := s.rpcs.Balance(ctx, s.wallet.Address()); err == nil { return float64(lamports) / 1e9 }
+	return 0
 }
 func (s *Server) rpcsList(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
@@ -180,12 +202,12 @@ func (s *Server) walletInfo(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
-	result := map[string]any{"address": s.wallet.Address(), "simulation": s.cfg.Simulation, "feeReserveSol": s.engine.Limits().FeeReserveSOL}
+	result := map[string]any{"publicAddress": s.wallet.Address(), "balanceSol": nil, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "tokenHoldings": []any{}, "syncStatus": "synced", "updatedAt": time.Now().UTC()}
+	if s.cfg.Simulation { result["publicAddress"] = nil; result["balanceSol"] = s.balanceSOL(0) }
 	if s.wallet.Address() != "" && s.rpcs.Available() {
 		ctx, c := context.WithTimeout(r.Context(), 5*time.Second)
 		defer c()
 		if bal, e := s.rpcs.Balance(ctx, s.wallet.Address()); e == nil {
-			result["balanceLamports"] = bal
 			result["balanceSol"] = float64(bal) / 1e9
 		} else {
 			result["balanceError"] = e.Error()
@@ -339,7 +361,7 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 func write(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"data": v})
+	_ = json.NewEncoder(w).Encode(v)
 }
 func fail(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")

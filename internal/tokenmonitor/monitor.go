@@ -9,6 +9,8 @@ import (
 	"solana-sniper-backend/internal/database"
 	"solana-sniper-backend/internal/events"
 	"solana-sniper-backend/internal/strategy"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +21,7 @@ type Event struct {
 	Creator  string `json:"creator"`
 	User     string `json:"user"`
 	Received time.Time
+	Created  time.Time
 	Raw      string
 }
 // Entrier is implemented by the execution engine. Keeping the dependency as
@@ -84,7 +87,10 @@ func (m *Monitor) connect(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		var d struct{ Mint, Creator, User string }
+		var d struct {
+			Mint, Creator, User string
+			CreatedTimestamp, Timestamp, BlockTime json.RawMessage
+		}
 		if err = json.Unmarshal(b, &d); err != nil || d.Mint == "" {
 			m.log.Warn("invalid token event", zap.Error(err))
 			continue
@@ -93,7 +99,10 @@ func (m *Monitor) connect(ctx context.Context) error {
 		if creator == "" {
 			creator = d.User
 		}
-		e := Event{Mint: d.Mint, Creator: creator, Received: time.Now(), Raw: string(b)}
+		received := time.Now().UTC()
+		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
+		if created.IsZero() { created = received }
+		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, Raw: string(b)}
 		if _, loaded := m.seen.LoadOrStore(e.Mint, true); loaded {
 			continue
 		}
@@ -118,26 +127,47 @@ func (m *Monitor) consume(ctx context.Context) {
 				m.log.Warn("record event", zap.Error(err))
 				m.bus.Publish("operational_error", map[string]string{"component": "database", "message": "unable to record token"})
 			}
-			ok, reason := m.strategy.Evaluate(ctx, e.Mint, e.Received)
-			if assessmentErr := m.db.RecordAssessment(e.Mint, ok, reason); assessmentErr != nil {
-				m.log.Warn("record strategy assessment", zap.Error(assessmentErr))
-			}
-			kind := "token_rejected"
-			if ok {
-				kind = "token_approved"
-			}
-			m.bus.Publish(kind, map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
+			ok, reason := m.strategy.Evaluate(ctx, e.Mint, e.Created)
 			m.log.Info("token evaluated", zap.String("mint", e.Mint), zap.Bool("eligible", ok), zap.String("reason", reason), zap.Int64("latency_ms", latency))
 			if !ok || m.entry == nil {
+				_ = m.db.RecordAssessment(e.Mint, false, reason)
+				m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 				continue
 			}
 			id, entryErr := m.entry.BuyNewTokenUSD(ctx, e.Mint, m.tradeUSD, m.slippage, m.priorityFee, "pump", reason)
 			if entryErr != nil {
+				_ = m.db.RecordAssessment(e.Mint, false, entryErr.Error())
 				m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": entryErr.Error()})
 				m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.Error(entryErr))
 				continue
 			}
+			if assessmentErr := m.db.RecordAssessment(e.Mint, true, reason); assessmentErr != nil {
+				m.log.Warn("record entered-token assessment", zap.Error(assessmentErr))
+			}
+			m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": true})
 		}
 	}
+}
+
+// timestampFromEvent accepts the timestamp variants emitted by PumpPortal. A
+// missing timestamp is safe here because subscribeNewToken is a live-only
+// stream; its receipt time then becomes the creation-time upper bound.
+func timestampFromEvent(values ...json.RawMessage) time.Time {
+	for _, raw := range values {
+		if len(raw) == 0 || string(raw) == "null" { continue }
+		var numeric float64
+		if json.Unmarshal(raw, &numeric) == nil && numeric > 0 {
+			if numeric > 1e12 { numeric /= 1000 }
+			return time.Unix(int64(numeric), 0).UTC()
+		}
+		var text string
+		if json.Unmarshal(raw, &text) != nil { continue }
+		if numeric, err := strconv.ParseFloat(strings.TrimSpace(text), 64); err == nil && numeric > 0 {
+			if numeric > 1e12 { numeric /= 1000 }
+			return time.Unix(int64(numeric), 0).UTC()
+		}
+		if parsed, err := time.Parse(time.RFC3339, text); err == nil { return parsed.UTC() }
+	}
+	return time.Time{}
 }
