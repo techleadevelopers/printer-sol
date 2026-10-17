@@ -13,7 +13,7 @@ func TestSplitEndpointsDropsEmptyValues(t *testing.T) {
 }
 
 func TestLiveTradingRequiresSafetyConfiguration(t *testing.T) {
-	keys := []string{"SIMULATION", "ENABLE_LIVE_TRADING", "BOT_PRIVATE_KEY", "KEY_PROVIDER_REF", "WALLET_PUBLIC_ADDRESS", "ADMIN_API_TOKEN"}
+	keys := []string{"SIMULATION", "ENABLE_LIVE_TRADING", "BOT_PRIVATE_KEY", "KEY_PROVIDER_REF", "WALLET_PUBLIC_ADDRESS", "ADMIN_PASSWORD"}
 	old := map[string]string{}
 	for _, k := range keys {
 		old[k] = os.Getenv(k)
@@ -28,7 +28,7 @@ func TestLiveTradingRequiresSafetyConfiguration(t *testing.T) {
 	_ = os.Setenv("BOT_PRIVATE_KEY", "")
 	_ = os.Setenv("KEY_PROVIDER_REF", "")
 	_ = os.Setenv("WALLET_PUBLIC_ADDRESS", "")
-	_ = os.Setenv("ADMIN_API_TOKEN", "")
+	_ = os.Setenv("ADMIN_PASSWORD", "test-master-password")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected live trading validation error")
 	}

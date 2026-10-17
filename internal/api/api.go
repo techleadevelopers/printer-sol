@@ -2,7 +2,10 @@ package api
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -35,6 +38,7 @@ func New(db *database.DB, w *wallet.Wallet, r *rpcmanager.Manager, e *execution.
 	s := &Server{db: db, wallet: w, rpcs: r, engine: e, controller: c, monitor: m, bus: b, cfg: cfg, log: l}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.health)
+	mux.HandleFunc("/api/auth/login", s.login)
 	mux.HandleFunc("/api/dashboard", s.dashboard)
 	mux.HandleFunc("/api/tokens", s.tokens)
 	mux.HandleFunc("/api/positions", s.positions)
@@ -194,12 +198,24 @@ func (s *Server) admin(h http.HandlerFunc) http.HandlerFunc {
 		h(w, r)
 	}
 }
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	if !method(w, r, "POST") { return }
+	var body struct { Password string `json:"password"` }
+	if !decode(w, r, &body) { return }
+	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(s.cfg.AdminPassword)) != 1 {
+		fail(w, http.StatusUnauthorized, "invalid_credentials", "invalid master password")
+		return
+	}
+	write(w, http.StatusOK, map[string]string{"token": s.sessionToken()})
+}
 func (s *Server) authorized(r *http.Request) bool {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if token == "" {
-		token = r.Header.Get("X-Admin-Token")
-	}
-	return s.cfg.AdminToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) == 1
+	return token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.sessionToken())) == 1
+}
+func (s *Server) sessionToken() string {
+	mac := hmac.New(sha256.New, []byte(s.cfg.AdminPassword))
+	_, _ = mac.Write([]byte("solana-sniper-admin-session-v1"))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
@@ -340,7 +356,7 @@ func fail(w http.ResponseWriter, status int, code, message string) {
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Token")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)

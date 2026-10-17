@@ -6,7 +6,7 @@ Backend Go conservador para observação de novos tokens, controles de risco e e
 
 O padrão é `SIMULATION=true`. Neste modo o serviço registra a negociação simulada, mas não assina nem envia bytes de transação.
 
-Para ativar execução real é necessário, simultaneamente: `SIMULATION=false`, `ENABLE_LIVE_TRADING=true`, `BOT_PRIVATE_KEY` carregada somente no ambiente de execução, `KEY_PROVIDER_REF`, `WALLET_PUBLIC_ADDRESS`, `ADMIN_API_TOKEN`, um RPC saudável e saldo suficiente além da reserva de taxas. A chave privada nunca é salva no SQLite, devolvida por HTTP/WebSocket ou registrada em logs.
+Para ativar execução real é necessário, simultaneamente: `SIMULATION=false`, `ENABLE_LIVE_TRADING=true`, `BOT_PRIVATE_KEY` carregada somente no ambiente de execução, `KEY_PROVIDER_REF`, `WALLET_PUBLIC_ADDRESS`, um RPC saudável e saldo suficiente além da reserva de taxas. `ADMIN_PASSWORD` é obrigatória para acessar o console. A chave privada nunca é salva no banco, devolvida por HTTP/WebSocket ou registrada em logs.
 
 Copie os nomes de variáveis de `.env.example` para o secret manager/deployment. Não versione um `.env` real.
 
@@ -34,7 +34,7 @@ Rotas de leitura:
 - `GET /api/health` — separa serviço ativo, monitor conectado e capacidade de negociação.
 - `GET /api/dashboard`, `/api/tokens`, `/api/positions`, `/api/trades`, `/api/rpcs`, `/api/config`, `/api/wallet`.
 
-Rotas administrativas (`Authorization: Bearer <ADMIN_API_TOKEN>` ou `X-Admin-Token`):
+Autenticação: `POST /api/auth/login` recebe `{ "password": "..." }` e retorna uma sessão de administrador. Rotas administrativas usam `Authorization: Bearer <session-token>`:
 
 - `POST /api/bot/start`, `/stop`, `/pause`, `/resume`, `/emergency-stop`
 - `POST /api/config`
