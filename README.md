@@ -16,10 +16,10 @@ Requer Go 1.22+ para execução local, ou Docker para build/deploy:
 
 ```sh
 docker build -t solana-sniper-backend .
-docker run --env-file /run/secrets/sniper.env -p 8080:8080 -v sniper-data:/app/data solana-sniper-backend
+docker run --env-file /run/secrets/sniper.env -p 8080:8080 solana-sniper-backend
 ```
 
-Use volume persistente para `DATABASE_PATH`, secret manager para credenciais, reinicialização supervisionada (Compose/Kubernetes/systemd), logs centralizados e monitoramento de `/api/health`. O processo trata `SIGINT` e `SIGTERM` com desligamento gracioso; o monitor e o gerenciador de RPC tentam recuperar conexões.
+Em produção, configure `DATABASE_URL` com a URL PostgreSQL fornecida pelo Railway. `DATABASE_PATH`/SQLite permanece apenas como fallback local; o container não requer volume. Use secret manager para credenciais, reinicialização supervisionada (Compose/Kubernetes/systemd), logs centralizados e monitoramento de `/api/health`. O processo trata `SIGINT` e `SIGTERM` com desligamento gracioso; o monitor e o gerenciador de RPC tentam recuperar conexões.
 
 Na inicialização, migrações são aplicadas, RPCs são verificados e negociações pendentes são reconciliadas antes de o monitor iniciar. Uma transação sem resultado conhecido bloqueia novas compras até reconciliação. Posições já persistidas contam para os limites antes de qualquer entrada. Parar o bot nunca significa vender todas as posições.
 
@@ -46,7 +46,7 @@ Rotas administrativas (`Authorization: Bearer <ADMIN_API_TOKEN>` ou `X-Admin-Tok
 
 ## Banco e testes
 
-SQLite é usado inicialmente; migrações versionadas criam configurações, tokens, avaliações de risco, posições, negociações, transações, saúde de RPC e logs operacionais. A criação de uma negociação e seu registro de transação, assim como a mudança de estado, são transacionais.
+PostgreSQL é o banco de produção. As migrações versionadas criam configurações, tokens, avaliações de risco, posições, negociações, transações, saúde de RPC e logs operacionais. A criação de uma negociação e seu registro de transação, assim como a mudança de estado, são transacionais. SQLite é mantido somente para desenvolvimento e testes locais quando `DATABASE_URL` não estiver definido.
 
 Execute testes unitários sem rede externa:
 

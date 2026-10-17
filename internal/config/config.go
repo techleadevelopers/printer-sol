@@ -10,7 +10,7 @@ import (
 )
 
 type Config struct {
-	HTTPAddr, DatabasePath, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminToken, SOLUSDPriceURL string
+	HTTPAddr, DatabaseURL, DatabasePath, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminToken, SOLUSDPriceURL string
 	Simulation, EnableLiveTrading                                                                                                   bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD                       float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts                                             int
@@ -18,7 +18,7 @@ type Config struct {
 }
 
 func Load() (Config, error) {
-	c := Config{HTTPAddr: env("HTTP_ADDR", ":8080"), DatabasePath: env("DATABASE_PATH", "./data/sniper.db"), PrivateKey: os.Getenv("BOT_PRIVATE_KEY"), KeyProviderRef: os.Getenv("KEY_PROVIDER_REF"), WalletPublicAddress: os.Getenv("WALLET_PUBLIC_ADDRESS"), PumpPortalKey: os.Getenv("PUMPPORTAL_API_KEY"), AdminToken: os.Getenv("ADMIN_API_TOKEN"), PumpPortalURL: env("PUMPPORTAL_URL", "https://pumpportal.fun/api/trade-local"), PumpPortalWS: env("PUMPPORTAL_WS", "wss://pumpportal.fun/api/data"), SOLUSDPriceURL: env("SOL_USD_PRICE_URL", "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"), RPCEndpoints: splitEndpoints(env("RPC_ENDPOINTS", "https://api.mainnet.solana.com,https://solana-rpc.publicnode.com"))}
+	c := Config{HTTPAddr: env("HTTP_ADDR", ":8080"), DatabaseURL: strings.TrimSpace(os.Getenv("DATABASE_URL")), DatabasePath: env("DATABASE_PATH", "./data/sniper.db"), PrivateKey: os.Getenv("BOT_PRIVATE_KEY"), KeyProviderRef: os.Getenv("KEY_PROVIDER_REF"), WalletPublicAddress: os.Getenv("WALLET_PUBLIC_ADDRESS"), PumpPortalKey: os.Getenv("PUMPPORTAL_API_KEY"), AdminToken: os.Getenv("ADMIN_API_TOKEN"), PumpPortalURL: env("PUMPPORTAL_URL", "https://pumpportal.fun/api/trade-local"), PumpPortalWS: env("PUMPPORTAL_WS", "wss://pumpportal.fun/api/data"), SOLUSDPriceURL: env("SOL_USD_PRICE_URL", "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"), RPCEndpoints: splitEndpoints(env("RPC_ENDPOINTS", "https://api.mainnet.solana.com,https://solana-rpc.publicnode.com"))}
 	var err error
 	if c.Simulation, err = boolEnv("SIMULATION", true); err != nil {
 		return c, err
@@ -59,8 +59,11 @@ func Load() (Config, error) {
 	if c.TradeUSD, err = floatEnv("TRADE_USD", 1); err != nil {
 		return c, err
 	}
-	if strings.TrimSpace(c.HTTPAddr) == "" || strings.TrimSpace(c.DatabasePath) == "" || strings.TrimSpace(c.PumpPortalURL) == "" || strings.TrimSpace(c.PumpPortalWS) == "" || len(c.RPCEndpoints) == 0 {
-		return c, fmt.Errorf("HTTP_ADDR, DATABASE_PATH, PumpPortal URLs and at least one RPC endpoint are required")
+	if strings.TrimSpace(c.HTTPAddr) == "" || (c.DatabaseURL == "" && strings.TrimSpace(c.DatabasePath) == "") || strings.TrimSpace(c.PumpPortalURL) == "" || strings.TrimSpace(c.PumpPortalWS) == "" || len(c.RPCEndpoints) == 0 {
+		return c, fmt.Errorf("HTTP_ADDR, DATABASE_URL (or DATABASE_PATH locally), PumpPortal URLs and at least one RPC endpoint are required")
+	}
+	if c.DatabaseURL != "" && !strings.HasPrefix(c.DatabaseURL, "postgres://") && !strings.HasPrefix(c.DatabaseURL, "postgresql://") {
+		return c, fmt.Errorf("DATABASE_URL must use postgres:// or postgresql://")
 	}
 	if err := validateURL(c.PumpPortalURL, "http", "https"); err != nil {
 		return c, fmt.Errorf("PUMPPORTAL_URL: %w", err)
