@@ -68,7 +68,12 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	trading := s.rpcs.Available() && (s.cfg.Simulation || s.cfg.EnableLiveTrading)
-	write(w, 200, map[string]any{"service": {"active": true}, "monitor": {"connected": s.monitor != nil && s.monitor.Connected()}, "trading": {"available": trading, "simulation": s.cfg.Simulation, "botState": s.controller.State()}, "at": time.Now().UTC()})
+	write(w, 200, map[string]any{
+		"service": map[string]any{"active": true},
+		"monitor": map[string]any{"connected": s.monitor != nil && s.monitor.Connected()},
+		"trading": map[string]any{"available": trading, "simulation": s.cfg.Simulation, "botState": s.controller.State()},
+		"at":      time.Now().UTC(),
+	})
 }
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
