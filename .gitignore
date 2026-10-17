@@ -20,7 +20,7 @@ wallet*.json
 secrets/
 
 # Go binaries, coverage and temporary files.
-server
+/server
 sniper
 *.exe
 *.test
