@@ -105,6 +105,12 @@ func Load() (Config, error) {
 	if !c.Simulation && (!c.EnableLiveTrading || c.PrivateKey == "" || c.KeyProviderRef == "" || c.WalletPublicAddress == "") {
 		return c, fmt.Errorf("live trading requires ENABLE_LIVE_TRADING=true, BOT_PRIVATE_KEY via KEY_PROVIDER_REF and WALLET_PUBLIC_ADDRESS")
 	}
+	if c.Simulation && c.EnableLiveTrading {
+		return c, fmt.Errorf("SIMULATION=true and ENABLE_LIVE_TRADING=true cannot be enabled together")
+	}
+	if c.Simulation && c.SimulationBalanceSOL <= 0 {
+		return c, fmt.Errorf("SIMULATION_BALANCE_SOL must be positive when SIMULATION=true")
+	}
 	return c, nil
 }
 func validateURL(raw string, allowed ...string) error {

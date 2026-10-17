@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"github.com/gorilla/websocket"
@@ -142,13 +143,15 @@ func (s *Server) tradeItems() []map[string]any {
 	for rows.Next() {
 		var id, mint, side, quantityText, signature, state, createdAt string
 		var requested, executed, fees, slippage float64
-		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &fees, &slippage, &signature, &state, &createdAt); err != nil { continue }
+		var realized sql.NullFloat64
+		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &fees, &slippage, &signature, &state, &createdAt, &realized); err != nil { continue }
 		quantity, _ := strconv.ParseFloat(quantityText, 64)
 		status := state
 		if state == "simulated" || state == "finalized" { status = "confirmed" }
 		if status != "pending" && status != "submitted" && status != "confirmed" && status != "failed" { status = "unknown" }
 		item := map[string]any{"id": id, "timestamp": createdAt, "tokenName": nil, "symbol": nil, "mint": mint, "side": side, "quantity": quantity, "buyValueSol": nil, "sellValueSol": nil, "feesSol": fees, "slippage": slippage, "grossPnlSol": nil, "netPnlSol": nil, "transactionId": nil, "signature": nil, "status": status}
 		if side == "buy" { item["buyValueSol"] = requested } else { item["sellValueSol"] = requested }
+		if realized.Valid { item["grossPnlSol"] = realized.Float64; item["netPnlSol"] = realized.Float64-fees }
 		if signature != "" { item["transactionId"] = signature; item["signature"] = signature }
 		items = append(items, item)
 	}
@@ -161,7 +164,10 @@ func (s *Server) mode() string {
 func (s *Server) balanceSOL(exposure float64) float64 {
 	if s.cfg.Simulation {
 		realized, _ := s.db.RealizedPnlSOL()
-		balance := s.engine.SimulationBalanceSOL() - exposure + realized
+		// This is total paper equity, not the free buying power. Open positions
+		// remain part of the virtual portfolio, so a 1 SOL simulation starts at
+		// 1 SOL on the dashboard even after entries have been opened.
+		balance := s.engine.SimulationBalanceSOL() + realized
 		if balance < 0 { return 0 }
 		return balance
 	}

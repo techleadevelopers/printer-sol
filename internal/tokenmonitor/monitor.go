@@ -181,7 +181,9 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 	if err := m.db.RecordPaperMark(mint, marketCapSOL); err != nil { m.log.Warn("record missing paper mark", zap.Error(err)); return }
 	if err := m.db.UpdatePaperMark(mint, marketCapSOL); err != nil { m.log.Warn("update paper mark", zap.Error(err)); return }
 	returnPct, known, err := m.db.PaperReturnPct(mint)
-	if err != nil || !known || returnPct < m.takeProfit { return }
+	if err != nil || !known { return }
+	m.bus.Publish("paper_mark_updated", map[string]any{"mint": mint, "marketCapSol": marketCapSOL, "returnPct": returnPct, "takeProfitPct": m.takeProfit})
+	if returnPct < m.takeProfit { return }
 	id, err := m.entry.ClosePaperPosition(ctx, mint, returnPct, "take profit reached in simulation")
 	if err != nil { m.log.Warn("paper take-profit exit", zap.String("mint", mint), zap.Error(err)); return }
 	m.tracked.Delete(mint)

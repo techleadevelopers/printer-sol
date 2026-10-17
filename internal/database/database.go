@@ -141,7 +141,7 @@ func (d *DB) RecordAssessment(mint string, approved bool, reason string) error {
 	return e
 }
 func (d *DB) ListTrades() (rows *sql.Rows, err error) {
-	return d.Query(`SELECT id,mint,side,quantity,requested_value_sol,COALESCE(executed_value_sol,0),COALESCE(fees_sol,0),slippage_pct,COALESCE(signature,''),state,created_at FROM trades ORDER BY created_at DESC LIMIT 200`)
+	return d.Query(`SELECT id,mint,side,quantity,requested_value_sol,COALESCE(executed_value_sol,0),COALESCE(fees_sol,0),slippage_pct,COALESCE(signature,''),state,created_at,realized_pnl_sol FROM trades ORDER BY created_at DESC LIMIT 200`)
 }
 func (d *DB) TokenEventCount() (int, error) {
 	var n int
