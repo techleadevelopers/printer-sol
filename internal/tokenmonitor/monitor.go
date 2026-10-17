@@ -21,6 +21,11 @@ type Event struct {
 	Received time.Time
 	Raw      string
 }
+// Entrier is implemented by the execution engine. Keeping the dependency as
+// an interface lets discovery remain independent from transaction signing.
+type Entrier interface {
+	BuyNewTokenUSD(context.Context, string, float64, float64, float64, string, string) (string, error)
+}
 type Monitor struct {
 	ws, key   string
 	q         chan Event
@@ -28,12 +33,14 @@ type Monitor struct {
 	strategy  *strategy.Strategy
 	bus       *events.Bus
 	log       *zap.Logger
+	entry     Entrier
+	tradeUSD, slippage, priorityFee float64
 	seen      sync.Map
 	connected atomic.Bool
 }
 
-func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, b *events.Bus, l *zap.Logger) *Monitor {
-	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, bus: b, log: l}
+func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee float64, b *events.Bus, l *zap.Logger) *Monitor {
+	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, bus: b, log: l}
 }
 func (m *Monitor) Run(ctx context.Context) {
 	go m.consume(ctx)
@@ -111,13 +118,26 @@ func (m *Monitor) consume(ctx context.Context) {
 				m.log.Warn("record event", zap.Error(err))
 				m.bus.Publish("operational_error", map[string]string{"component": "database", "message": "unable to record token"})
 			}
-			ok, reason := m.strategy.Evaluate(ctx, e.Mint)
+			ok, reason := m.strategy.Evaluate(ctx, e.Mint, e.Received)
+			if assessmentErr := m.db.RecordAssessment(e.Mint, ok, reason); assessmentErr != nil {
+				m.log.Warn("record strategy assessment", zap.Error(assessmentErr))
+			}
 			kind := "token_rejected"
 			if ok {
 				kind = "token_approved"
 			}
 			m.bus.Publish(kind, map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 			m.log.Info("token evaluated", zap.String("mint", e.Mint), zap.Bool("eligible", ok), zap.String("reason", reason), zap.Int64("latency_ms", latency))
+			if !ok || m.entry == nil {
+				continue
+			}
+			id, entryErr := m.entry.BuyNewTokenUSD(ctx, e.Mint, m.tradeUSD, m.slippage, m.priorityFee, "pump", reason)
+			if entryErr != nil {
+				m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": entryErr.Error()})
+				m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.Error(entryErr))
+				continue
+			}
+			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": true})
 		}
 	}
 }

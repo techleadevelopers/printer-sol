@@ -35,6 +35,7 @@ type Engine struct {
 	prices     pricefeed.Provider
 	log        *zap.Logger
 	simulation bool
+	simulationBalance uint64
 	controller *bot.Controller
 	bus        *events.Bus
 	mu         sync.RWMutex
@@ -42,8 +43,9 @@ type Engine struct {
 	reserved   map[string]uint64
 }
 
-func New(db *database.DB, w *wallet.Wallet, p *pumpportal.Client, r *rpcmanager.Manager, prices pricefeed.Provider, l *zap.Logger, sim bool, c *bot.Controller, b *events.Bus, limits Limits) *Engine {
-	return &Engine{db: db, wallet: w, portal: p, rpcs: r, prices: prices, log: l, simulation: sim, controller: c, bus: b, limits: limits, reserved: make(map[string]uint64)}
+func New(db *database.DB, w *wallet.Wallet, p *pumpportal.Client, r *rpcmanager.Manager, prices pricefeed.Provider, l *zap.Logger, sim bool, simulationBalanceSOL float64, c *bot.Controller, b *events.Bus, limits Limits) *Engine {
+	balance, _ := wallet.SOLToLamports(simulationBalanceSOL)
+	return &Engine{db: db, wallet: w, portal: p, rpcs: r, prices: prices, log: l, simulation: sim, simulationBalance: balance, controller: c, bus: b, limits: limits, reserved: make(map[string]uint64)}
 }
 func (e *Engine) Limits() Limits     { e.mu.RLock(); defer e.mu.RUnlock(); return e.limits }
 func (e *Engine) SetLimits(l Limits) { e.mu.Lock(); e.limits = l; e.mu.Unlock() }
@@ -96,9 +98,13 @@ func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage,
 }
 
 func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error {
-	balance, err := e.rpcs.Balance(ctx, e.wallet.Address())
-	if err != nil {
-		return fmt.Errorf("wallet balance unavailable: %w", err)
+	balance := e.simulationBalance
+	if !e.simulation {
+		var err error
+		balance, err = e.rpcs.Balance(ctx, e.wallet.Address())
+		if err != nil {
+			return fmt.Errorf("wallet balance unavailable: %w", err)
+		}
 	}
 	reserve, err := wallet.SOLToLamports(e.Limits().FeeReserveSOL)
 	if err != nil {
@@ -113,7 +119,11 @@ func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error 
 	for _, v := range e.reserved {
 		reserved += v
 	}
-	if balance < reserve+reserved+needed {
+	exposure, err := e.db.OpenExposureSOL()
+	if err != nil { return err }
+	openCost, err := wallet.SOLToLamports(exposure)
+	if err != nil { return err }
+	if balance < reserve+openCost+reserved+needed {
 		return fmt.Errorf("insufficient free wallet balance after fee reserve and pending entries")
 	}
 	e.reserved[mint] = needed
@@ -238,6 +248,11 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	}
 	if e.simulation {
 		_ = e.db.UpdateTradeState(id, "simulated", "", true)
+		if r.Side == "buy" {
+			if err := e.db.OpenSimulationPosition(r.Mint, r.Amount); err != nil {
+				return id, fmt.Errorf("record simulated position: %w", err)
+			}
+		}
 		e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "simulation": true})
 		e.emit("position_updated", map[string]any{"mint": r.Mint, "sourceTradeId": id, "action": r.Side, "state": "simulated"})
 		return id, nil

@@ -58,9 +58,9 @@ func main() {
 	controller.Start()
 	limits := execution.Limits{MaxTradeSOL: cfg.MaxTradeSOL, MaxExposureSOL: cfg.MaxExposureSOL, MaxDailyLossSOL: cfg.MaxDailyLossSOL, MaxSlippagePct: cfg.MaxSlippagePct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL, MaxOpenPositions: cfg.MaxOpenPositions, MaxWaitSeconds: cfg.MaxConfirmationWaitSeconds, MaxAttempts: cfg.MaxSubmissionAttempts}
 	prices := pricefeed.New(cfg.SOLUSDPriceURL)
-	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, controller, bus, limits)
-	strat := strategy.New(db, w, cfg.MaxTradeSOL, cfg.MaxDailyLossSOL)
-	monitor := tokenmonitor.New(cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, bus, log)
+	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, cfg.SimulationBalanceSOL, controller, bus, limits)
+	strat := strategy.New(db, time.Duration(cfg.TokenMaxAgeSeconds)*time.Second)
+	monitor := tokenmonitor.New(cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine, cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL, bus, log)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	startupRPC, startupCancel := context.WithTimeout(ctx, 12*time.Second)

@@ -4,22 +4,24 @@ import (
 	"context"
 	"fmt"
 	"solana-sniper-backend/internal/database"
-	"solana-sniper-backend/internal/wallet"
+	"time"
 )
 
 // Strategy deliberately does not infer liquidity or exitability from a creation event.
 type Strategy struct {
 	db                     *database.DB
-	wallet                 *wallet.Wallet
-	maxTrade, maxDailyLoss float64
+	maxAge time.Duration
 }
 
-func New(db *database.DB, w *wallet.Wallet, max, maxLoss float64) *Strategy {
-	return &Strategy{db: db, wallet: w, maxTrade: max, maxDailyLoss: maxLoss}
+func New(db *database.DB, maxAge time.Duration) *Strategy {
+	return &Strategy{db: db, maxAge: maxAge}
 }
-func (s *Strategy) Evaluate(ctx context.Context, mint string) (bool, string) {
+func (s *Strategy) Evaluate(ctx context.Context, mint string, receivedAt time.Time) (bool, string) {
 	if mint == "" {
 		return false, "missing mint"
+	}
+	if s.maxAge > 0 && time.Since(receivedAt) > s.maxAge {
+		return false, "token event exceeded maximum entry age"
 	}
 	active, e := s.db.ActiveForMint(mint)
 	if e != nil {
@@ -28,6 +30,6 @@ func (s *Strategy) Evaluate(ctx context.Context, mint string) (bool, string) {
 	if active {
 		return false, "existing unreconciled position"
 	}
-	return false, "simulation/observation only: creation event lacks verified liquidity, market and exit data"
+	return true, "fresh PumpPortal token accepted by entry filters"
 }
-func (s *Strategy) String() string { return fmt.Sprintf("max trade %.9f SOL", s.maxTrade) }
+func (s *Strategy) String() string { return fmt.Sprintf("maximum event age %s", s.maxAge) }

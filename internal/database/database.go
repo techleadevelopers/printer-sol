@@ -136,6 +136,10 @@ func (d *DB) RecordEvent(mint, creator, raw string, at time.Time, latency int64)
 	_, e := d.Exec(d.bind(query), mint, creator, receivedAt, raw, latency)
 	return e
 }
+func (d *DB) RecordAssessment(mint string, approved bool, reason string) error {
+	_, e := d.Exec(d.bind(`INSERT INTO risk_assessments(mint,approved,reason,created_at) VALUES(?,?,?,?)`), mint, approved, reason, time.Now().UTC())
+	return e
+}
 func (d *DB) ListTrades() (rows *sql.Rows, err error) {
 	return d.Query(`SELECT id,mint,side,quantity,requested_value_sol,COALESCE(executed_value_sol,0),COALESCE(fees_sol,0),slippage_pct,COALESCE(signature,''),state FROM trades ORDER BY created_at DESC LIMIT 200`)
 }
@@ -144,7 +148,20 @@ func (d *DB) RecordRPC(endpoint string, healthy bool, latency int64, status int,
 	return e
 }
 func (d *DB) ListTokens() (*sql.Rows, error) {
-	return d.Query(`SELECT mint,COALESCE(creator,''),received_at,latency_ms FROM token_events ORDER BY id DESC LIMIT 200`)
+	// The portal is a high-volume discovery feed. The console intentionally
+	// exposes only candidates the strategy approved, never a mock or the full
+	// Pump.fun firehose.
+	return d.Query(d.bind(`SELECT e.mint,COALESCE(e.creator,''),e.received_at,e.latency_ms
+		FROM token_events e
+		WHERE EXISTS (SELECT 1 FROM risk_assessments r WHERE r.mint=e.mint AND r.approved=?)
+		ORDER BY e.id DESC LIMIT 200`), true)
+}
+func (d *DB) OpenSimulationPosition(mint string, amount float64) error {
+	now := time.Now().UTC()
+	query := `INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
+		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,updated_at=excluded.updated_at`
+	_, e := d.Exec(d.bind(query), mint, fmt.Sprint(amount), amount, "open", now, now)
+	return e
 }
 func (d *DB) ListPositions() (*sql.Rows, error) {
 	return d.Query(`SELECT mint,quantity,COALESCE(cost_sol,0),status,opened_at,updated_at FROM positions ORDER BY updated_at DESC`)

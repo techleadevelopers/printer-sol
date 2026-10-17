@@ -12,8 +12,8 @@ import (
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
 	Simulation, EnableLiveTrading                                                                                                   bool
-	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD                       float64
-	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds             int
+	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL float64
+	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds int
 	RPCEndpoints                                                                                                                    []string
 }
 
@@ -62,6 +62,12 @@ func Load() (Config, error) {
 	if c.TradeUSD, err = floatEnv("TRADE_USD", 1); err != nil {
 		return c, err
 	}
+	if c.SimulationBalanceSOL, err = floatEnv("SIMULATION_BALANCE_SOL", 1); err != nil {
+		return c, err
+	}
+	if c.TokenMaxAgeSeconds, err = intEnv("TOKEN_MAX_AGE_SECONDS", 5); err != nil {
+		return c, err
+	}
 	if strings.TrimSpace(c.HTTPAddr) == "" || (c.DatabaseURL == "" && strings.TrimSpace(c.DatabasePath) == "") || strings.TrimSpace(c.PumpPortalURL) == "" || strings.TrimSpace(c.PumpPortalWS) == "" || len(c.RPCEndpoints) == 0 {
 		return c, fmt.Errorf("HTTP_ADDR, DATABASE_URL (or DATABASE_PATH locally), PumpPortal URLs and at least one RPC endpoint are required")
 	}
@@ -85,10 +91,10 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("RPC_ENDPOINTS: %w", err)
 		}
 	}
-	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 {
+	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 {
 		return c, fmt.Errorf("queue, position, attempt, wait and RPC health-check interval limits must be positive")
 	}
-	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD} {
+	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}
