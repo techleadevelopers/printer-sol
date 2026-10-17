@@ -78,10 +78,12 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	positions, _ := s.db.OpenPositionCount()
 	exposure, _ := s.db.OpenExposureSOL()
 	detected, _ := s.db.TokenEventCount()
+	openPnl, _ := s.db.PaperOpenPnlSOL()
+	realizedPnl, _ := s.db.RealizedPnlSOL()
 	trades := s.tradeItems()
 	balance := s.balanceSOL(exposure)
 	now := time.Now().UTC()
-	write(w, 200, map[string]any{"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance, "walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "detectedTokens": detected, "analyzedTokens": detected, "tradesCount": len(trades), "openPositions": positions, "realizedPnlSol": 0.0, "estimatedOpenPnlSol": 0.0, "netPnlSol": 0.0, "costsSol": 0.0, "cumulativeResult": []map[string]any{{"timestamp": now, "value": 0.0}}, "tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": len(trades), "positive": 0, "negative": 0}}, "balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades})
+	write(w, 200, map[string]any{"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance, "walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "detectedTokens": detected, "analyzedTokens": detected, "tradesCount": len(trades), "openPositions": positions, "realizedPnlSol": realizedPnl, "estimatedOpenPnlSol": openPnl, "netPnlSol": realizedPnl, "costsSol": 0.0, "cumulativeResult": []map[string]any{{"timestamp": now, "value": realizedPnl}}, "tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": len(trades), "positive": 0, "negative": 0}}, "balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades})
 }
 func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
@@ -116,10 +118,12 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]any{}
 	for rows.Next() {
 		var mint, q, status, opened, updated string
-		var cost float64
-		if rows.Scan(&mint, &q, &cost, &status, &opened, &updated) == nil {
+		var cost, entryMarketCap, currentMarketCap float64
+		if rows.Scan(&mint, &q, &cost, &status, &opened, &updated, &entryMarketCap, &currentMarketCap) == nil {
 			quantity, _ := strconv.ParseFloat(q, 64)
-			out = append(out, map[string]any{"id": mint, "tokenName": nil, "symbol": nil, "mint": mint, "quantity": quantity, "averageEntryPriceSol": cost, "buyValueSol": cost, "costsSol": 0.0, "estimatedValueSol": cost, "estimatedPnlSol": 0.0, "realizedPnlSol": nil, "openedAt": opened, "status": status, "sellStatus": "not_requested"})
+			value := cost
+			if entryMarketCap > 0 && currentMarketCap > 0 { value = cost * currentMarketCap / entryMarketCap }
+			out = append(out, map[string]any{"id": mint, "tokenName": nil, "symbol": nil, "mint": mint, "quantity": quantity, "averageEntryPriceSol": cost, "buyValueSol": cost, "costsSol": 0.0, "estimatedValueSol": value, "estimatedPnlSol": value-cost, "realizedPnlSol": nil, "openedAt": opened, "status": status, "sellStatus": "not_requested"})
 		}
 	}
 	write(w, 200, map[string]any{"items": out})
@@ -156,7 +160,8 @@ func (s *Server) mode() string {
 }
 func (s *Server) balanceSOL(exposure float64) float64 {
 	if s.cfg.Simulation {
-		balance := s.engine.SimulationBalanceSOL() - exposure
+		realized, _ := s.db.RealizedPnlSOL()
+		balance := s.engine.SimulationBalanceSOL() - exposure + realized
 		if balance < 0 { return 0 }
 		return balance
 	}

@@ -22,12 +22,14 @@ type Event struct {
 	User     string `json:"user"`
 	Received time.Time
 	Created  time.Time
+	MarketCapSOL float64
 	Raw      string
 }
 // Entrier is implemented by the execution engine. Keeping the dependency as
 // an interface lets discovery remain independent from transaction signing.
 type Entrier interface {
 	BuyNewTokenUSD(context.Context, string, float64, float64, float64, string, string) (string, error)
+	ClosePaperPosition(context.Context, string, float64, string) (string, error)
 }
 type Monitor struct {
 	ws, key   string
@@ -38,12 +40,15 @@ type Monitor struct {
 	log       *zap.Logger
 	entry     Entrier
 	tradeUSD, slippage, priorityFee float64
+	takeProfit float64
+	subscriptions chan string
+	tracked sync.Map
 	seen      sync.Map
 	connected atomic.Bool
 }
 
-func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee float64, b *events.Bus, l *zap.Logger) *Monitor {
-	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, bus: b, log: l}
+func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit float64, b *events.Bus, l *zap.Logger) *Monitor {
+	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, subscriptions: make(chan string, size), bus: b, log: l}
 }
 func (m *Monitor) Run(ctx context.Context) {
 	go m.consume(ctx)
@@ -82,6 +87,18 @@ func (m *Monitor) connect(ctx context.Context) error {
 	}
 	m.connected.Store(true)
 	defer m.connected.Store(false)
+	writerDone := make(chan struct{})
+	defer close(writerDone)
+	go func() {
+		for {
+			select {
+			case <-writerDone: return
+			case mint := <-m.subscriptions:
+				if err := c.WriteJSON(map[string]any{"method": "subscribeTokenTrade", "keys": []string{mint}}); err != nil { return }
+			}
+		}
+	}()
+	m.tracked.Range(func(key, _ any) bool { select { case m.subscriptions <- key.(string): default: }; return true })
 	for {
 		_, b, err := c.ReadMessage()
 		if err != nil {
@@ -90,9 +107,14 @@ func (m *Monitor) connect(ctx context.Context) error {
 		var d struct {
 			Mint, Creator, User string
 			CreatedTimestamp, Timestamp, BlockTime json.RawMessage
+			MarketCapSol float64 `json:"marketCapSol"`
 		}
 		if err = json.Unmarshal(b, &d); err != nil || d.Mint == "" {
 			m.log.Warn("invalid token event", zap.Error(err))
+			continue
+		}
+		if _, tracked := m.tracked.Load(d.Mint); tracked && d.MarketCapSol > 0 {
+			m.markTrade(ctx, d.Mint, d.MarketCapSol)
 			continue
 		}
 		creator := d.Creator
@@ -102,7 +124,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 		received := time.Now().UTC()
 		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
 		if created.IsZero() { created = received }
-		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, Raw: string(b)}
+		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
 		if _, loaded := m.seen.LoadOrStore(e.Mint, true); loaded {
 			continue
 		}
@@ -144,10 +166,26 @@ func (m *Monitor) consume(ctx context.Context) {
 			if assessmentErr := m.db.RecordAssessment(e.Mint, true, reason); assessmentErr != nil {
 				m.log.Warn("record entered-token assessment", zap.Error(assessmentErr))
 			}
+			if err := m.db.RecordPaperMark(e.Mint, e.MarketCapSOL); err != nil { m.log.Warn("record paper mark", zap.Error(err)) }
+			m.tracked.Store(e.Mint, struct{}{})
+			select { case m.subscriptions <- e.Mint: default: m.log.Warn("token trade subscription queue full", zap.String("mint", e.Mint)) }
 			m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": true})
 		}
 	}
+}
+
+func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float64) {
+	// Some creation events omit marketCapSol. In that case the first live trade
+	// establishes the paper entry mark rather than fabricating a price.
+	if err := m.db.RecordPaperMark(mint, marketCapSOL); err != nil { m.log.Warn("record missing paper mark", zap.Error(err)); return }
+	if err := m.db.UpdatePaperMark(mint, marketCapSOL); err != nil { m.log.Warn("update paper mark", zap.Error(err)); return }
+	returnPct, known, err := m.db.PaperReturnPct(mint)
+	if err != nil || !known || returnPct < m.takeProfit { return }
+	id, err := m.entry.ClosePaperPosition(ctx, mint, returnPct, "take profit reached in simulation")
+	if err != nil { m.log.Warn("paper take-profit exit", zap.String("mint", mint), zap.Error(err)); return }
+	m.tracked.Delete(mint)
+	m.bus.Publish("paper_take_profit", map[string]any{"mint": mint, "tradeId": id, "returnPct": returnPct})
 }
 
 // timestampFromEvent accepts the timestamp variants emitted by PumpPortal. A

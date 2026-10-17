@@ -97,6 +97,16 @@ func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage,
 	}
 	return id, nil
 }
+// ClosePaperPosition records a virtual sale at the live market-marked value.
+// It is intentionally unavailable outside simulation mode.
+func (e *Engine) ClosePaperPosition(ctx context.Context, mint string, returnPct float64, reason string) (string, error) {
+	if !e.simulation { return "", fmt.Errorf("paper exits are only available in simulation") }
+	cost, err := e.db.PositionCost(mint)
+	if err != nil { return "", err }
+	value := cost * (1 + returnPct/100)
+	if value <= 0 { return "", fmt.Errorf("invalid paper exit value") }
+	return e.Execute(ctx, Request{Mint: mint, Side: "sell", Amount: value, DenominatedInSOL: true, Reason: reason})
+}
 
 func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error {
 	balance := e.simulationBalance
@@ -253,6 +263,10 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 			if err := e.db.OpenSimulationPosition(r.Mint, r.Amount); err != nil {
 				return id, fmt.Errorf("record simulated position: %w", err)
 			}
+		} else {
+			cost, err := e.db.CloseSimulationPosition(r.Mint, r.Amount)
+			if err != nil { return id, fmt.Errorf("close simulated position: %w", err) }
+			if err = e.db.SetTradePnl(id, r.Amount, r.Amount-cost); err != nil { return id, fmt.Errorf("record simulated profit: %w", err) }
 		}
 		e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "simulation": true})
 		e.emit("position_updated", map[string]any{"mint": r.Mint, "sourceTradeId": id, "action": r.Side, "state": "simulated"})

@@ -168,8 +168,57 @@ func (d *DB) OpenSimulationPosition(mint string, amount float64) error {
 	_, e := d.Exec(d.bind(query), mint, fmt.Sprint(amount), amount, "open", now, now)
 	return e
 }
+func (d *DB) RecordPaperMark(mint string, marketCapSOL float64) error {
+	if marketCapSOL <= 0 { return nil }
+	now := time.Now().UTC()
+	_, e := d.Exec(d.bind(`INSERT INTO paper_marks(mint,entry_market_cap_sol,current_market_cap_sol,updated_at) VALUES(?,?,?,?) ON CONFLICT(mint) DO NOTHING`), mint, marketCapSOL, marketCapSOL, now)
+	return e
+}
+func (d *DB) UpdatePaperMark(mint string, marketCapSOL float64) error {
+	if marketCapSOL <= 0 { return nil }
+	_, e := d.Exec(d.bind(`UPDATE paper_marks SET current_market_cap_sol=?,updated_at=? WHERE mint=?`), marketCapSOL, time.Now().UTC(), mint)
+	return e
+}
+func (d *DB) PaperReturnPct(mint string) (float64, bool, error) {
+	var entry, current float64
+	e := d.QueryRow(d.bind(`SELECT entry_market_cap_sol,current_market_cap_sol FROM paper_marks WHERE mint=?`), mint).Scan(&entry, &current)
+	if e == sql.ErrNoRows { return 0, false, nil }
+	if e != nil { return 0, false, e }
+	if entry <= 0 { return 0, false, nil }
+	return (current-entry)/entry*100, true, nil
+}
+func (d *DB) PositionCost(mint string) (float64, error) {
+	var cost float64
+	e := d.QueryRow(d.bind(`SELECT COALESCE(cost_sol,0) FROM positions WHERE mint=? AND status='open'`), mint).Scan(&cost)
+	return cost, e
+}
+func (d *DB) CloseSimulationPosition(mint string, value float64) (float64, error) {
+	tx, e := d.Begin()
+	if e != nil { return 0, e }
+	var cost float64
+	if e = tx.QueryRow(d.bind(`SELECT COALESCE(cost_sol,0) FROM positions WHERE mint=? AND status='open'`), mint).Scan(&cost); e != nil {
+		_ = tx.Rollback(); return 0, e
+	}
+	if _, e = tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=?`), time.Now().UTC(), mint); e != nil { _ = tx.Rollback(); return 0, e }
+	if e = tx.Commit(); e != nil { return 0, e }
+	return cost, nil
+}
+func (d *DB) SetTradePnl(id string, executed, pnl float64) error {
+	_, e := d.Exec(d.bind(`UPDATE trades SET executed_value_sol=?,realized_pnl_sol=?,updated_at=? WHERE id=?`), executed, pnl, time.Now().UTC(), id)
+	return e
+}
+func (d *DB) PaperOpenPnlSOL() (float64, error) {
+	var pnl float64
+	e := d.QueryRow(`SELECT COALESCE(SUM(p.cost_sol * (m.current_market_cap_sol - m.entry_market_cap_sol) / NULLIF(m.entry_market_cap_sol,0)),0) FROM positions p JOIN paper_marks m ON m.mint=p.mint WHERE p.status='open'`).Scan(&pnl)
+	return pnl, e
+}
+func (d *DB) RealizedPnlSOL() (float64, error) {
+	var pnl float64
+	e := d.QueryRow(`SELECT COALESCE(SUM(realized_pnl_sol),0) FROM trades WHERE realized_pnl_sol IS NOT NULL`).Scan(&pnl)
+	return pnl, e
+}
 func (d *DB) ListPositions() (*sql.Rows, error) {
-	return d.Query(`SELECT mint,quantity,COALESCE(cost_sol,0),status,opened_at,updated_at FROM positions ORDER BY updated_at DESC`)
+	return d.Query(`SELECT p.mint,p.quantity,COALESCE(p.cost_sol,0),p.status,p.opened_at,p.updated_at,COALESCE(m.entry_market_cap_sol,0),COALESCE(m.current_market_cap_sol,0) FROM positions p LEFT JOIN paper_marks m ON m.mint=p.mint ORDER BY p.updated_at DESC`)
 }
 func (d *DB) OpenPositionCount() (int, error) {
 	var n int
