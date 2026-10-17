@@ -1,0 +1,29 @@
+# Environment files and secrets. Keep .env.example versioned.
+.env
+.env.*
+!.env.example
+
+# Local SQLite data and its journal/WAL files.
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Wallet keys, backups and secret-manager exports.
+*.key
+*.pem
+*.p12
+*.pfx
+*-keypair.json
+wallet*.json
+secrets/
+
+# Go binaries, coverage and temporary files.
+server
+sniper
+*.exe
+*.test
+coverage.out
+coverage.html
+tmp/

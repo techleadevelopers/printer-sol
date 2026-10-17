@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS risk_assessments (id INTEGER PRIMARY KEY AUTOINCREMENT, mint TEXT NOT NULL, approved INTEGER NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS positions (mint TEXT PRIMARY KEY, quantity TEXT NOT NULL, cost_sol REAL, status TEXT NOT NULL, opened_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS transactions (id TEXT PRIMARY KEY, trade_id TEXT NOT NULL, signature TEXT, state TEXT NOT NULL, raw_hash TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS operational_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, event_type TEXT NOT NULL, message TEXT NOT NULL, payload_json TEXT, created_at TEXT NOT NULL);
