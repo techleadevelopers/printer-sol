@@ -25,6 +25,8 @@ Na inicialização, migrações são aplicadas, RPCs são verificados e negocia�
 
 Ambientes de desenvolvimento não devem ser presumidos como processos 24/7: configure armazenamento, saúde, reinício, limites de recursos e rotação de segredos no ambiente de implantação.
 
+O worker entra em `running` a cada boot. A senha `ADMIN_PASSWORD` autentica somente o console; ela nao inicia o worker e nao ha rota HTTP `/api/bot/start`. Use `RPC_HEALTH_CHECK_INTERVAL_SECONDS` (45 por padrao) para limitar a frequencia das sondas de saude RPC.
+
 ## API e contratos
 
 Todas as respostas HTTP usam `{ "data": ... }` em sucesso ou `{ "error": { "code": "...", "message": "..." } }` em erro.
@@ -36,7 +38,7 @@ Rotas de leitura:
 
 Autenticação: `POST /api/auth/login` recebe `{ "password": "..." }` e retorna uma sessão de administrador. Rotas administrativas usam `Authorization: Bearer <session-token>`:
 
-- `POST /api/bot/start`, `/stop`, `/pause`, `/resume`, `/emergency-stop`
+- `POST /api/bot/stop`, `/pause`, `/resume`, `/emergency-stop`
 - `POST /api/config`
 - `POST /api/rpcs/test` e `/api/rpcs/select`
 
@@ -55,3 +57,10 @@ go test ./...
 ```
 
 Testes de integração ficam separados em `tests/integration` e devem usar SQLite, HTTP/RPC e WebSocket simulados/localmente. Não são autorizadas compras reais na suíte.
+
+O smoke test cloud nao envia transacoes nem muda o estado do bot; ele usa `ADMIN_PASSWORD` somente para testar o login do console:
+
+```powershell
+$env:ADMIN_PASSWORD = 'sua-senha'
+.\tests\e2e-cloud.ps1
+```

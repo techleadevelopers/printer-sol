@@ -46,7 +46,6 @@ func New(db *database.DB, w *wallet.Wallet, r *rpcmanager.Manager, e *execution.
 	mux.HandleFunc("/api/rpcs", s.rpcsList)
 	mux.HandleFunc("/api/config", s.config)
 	mux.HandleFunc("/api/wallet", s.walletInfo)
-	mux.HandleFunc("/api/bot/start", s.admin(s.start))
 	mux.HandleFunc("/api/bot/stop", s.admin(s.stop))
 	mux.HandleFunc("/api/bot/pause", s.admin(s.pause))
 	mux.HandleFunc("/api/bot/resume", s.admin(s.resume))
@@ -221,17 +220,6 @@ func (s *Server) sessionToken() string {
 	mac := hmac.New(sha256.New, []byte(s.cfg.AdminPassword))
 	_, _ = mac.Write([]byte("solana-sniper-admin-session-v1"))
 	return hex.EncodeToString(mac.Sum(nil))
-}
-func (s *Server) start(w http.ResponseWriter, r *http.Request) {
-	if !method(w, r, "POST") {
-		return
-	}
-	if !s.cfg.Simulation && (!s.cfg.EnableLiveTrading || !s.rpcs.Available()) {
-		fail(w, 409, "trading_unavailable", "live trading safety validation failed")
-		return
-	}
-	s.controller.Start()
-	write(w, 200, map[string]any{"state": s.controller.State()})
 }
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {

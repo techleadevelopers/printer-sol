@@ -54,6 +54,8 @@ func main() {
 	rpcs := rpcmanager.New(cfg.RPCEndpoints, log, db, bus)
 	portal := pumpportal.New(cfg.PumpPortalURL)
 	controller := bot.New(bus)
+	// The worker is autonomous. Console credentials do not control its startup.
+	controller.Start()
 	limits := execution.Limits{MaxTradeSOL: cfg.MaxTradeSOL, MaxExposureSOL: cfg.MaxExposureSOL, MaxDailyLossSOL: cfg.MaxDailyLossSOL, MaxSlippagePct: cfg.MaxSlippagePct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL, MaxOpenPositions: cfg.MaxOpenPositions, MaxWaitSeconds: cfg.MaxConfirmationWaitSeconds, MaxAttempts: cfg.MaxSubmissionAttempts}
 	prices := pricefeed.New(cfg.SOLUSDPriceURL)
 	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, controller, bus, limits)
@@ -67,7 +69,7 @@ func main() {
 	if err := engine.Reconcile(ctx); err != nil {
 		log.Warn("startup reconciliation", logging.Err(err))
 	}
-	go rpcs.Run(ctx, 45*time.Second)
+	go rpcs.Run(ctx, time.Duration(cfg.RPCHealthCheckIntervalSeconds)*time.Second)
 	go monitor.Run(ctx)
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: api.New(db, w, rpcs, engine, controller, monitor, bus, cfg, log), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
