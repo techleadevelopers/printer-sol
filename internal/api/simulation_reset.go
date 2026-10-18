@@ -1,7 +1,6 @@
 package api
 
 import (
-	"database/sql"
 	"errors"
 	"net/http"
 	"time"
@@ -40,12 +39,6 @@ func (s *Server) simulationReset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	balanceSOL := s.cfg.SimulationBalanceSOL
-	if currentRun, err := s.db.SimulationRun(); err == nil {
-		balanceSOL = currentRun.BalanceStartSOL
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		fail(w, http.StatusServiceUnavailable, "simulation_unavailable", "could not read the current simulation balance")
-		return
-	}
 	if request.BalanceSOL != nil {
 		balanceSOL = *request.BalanceSOL
 	}

@@ -490,6 +490,7 @@ components:
         netPnlSol: { type: ["number", "null"] }
         costsSol: { type: ["number", "null"] }
         simulationBalanceSol: { type: ["number", "null"] }
+        simulationResetBalanceSol: { type: ["number", "null"], description: Configured SIMULATION_BALANCE_SOL used when resetting a paper run. }
         staleMarks:
           type: object
           required: [total, flat, pctFlat]
@@ -516,7 +517,7 @@ components:
         balance_sol:
           type: number
           exclusiveMinimum: 0
-          description: New virtual starting balance in SOL; omitted to use the current simulation balance.
+          description: New virtual starting balance in SOL; omitted to use configured SIMULATION_BALANCE_SOL.
     SimulationResetResult:
       type: object
       required: [accepted, balanceSol, deletedTrades, deletedPositions, botStatus]

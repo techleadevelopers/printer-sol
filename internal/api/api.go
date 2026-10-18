@@ -256,6 +256,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Simulation {
 		dashboard["virtualEquitySol"] = virtualEquity
 dashboard["simulationBalanceSol"] = simSummary.BalanceStartSOL
+		dashboard["simulationResetBalanceSol"] = s.cfg.SimulationBalanceSOL
 		dashboard["simulation"] = simSummary
 		dashboard["closedTrades"] = simSummary.TotalTrades
 		dashboard["staleMarks"] = staleMarks

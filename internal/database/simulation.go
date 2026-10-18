@@ -143,7 +143,7 @@ func (d *DB) ResetSimulation(ctx context.Context, newBalanceSOL float64) (delete
 		return 0, 0, err
 	}
 	deletedCounts["positions"] = deletedPositions
-	for _, table := range []string{"paper_marks", "token_events", "risk_assessments"} {
+	for _, table := range []string{"paper_marks", "live_marks", "token_events", "risk_assessments"} {
 		result, deleteErr := tx.ExecContext(ctx, `DELETE FROM `+table)
 		if deleteErr != nil {
 			return 0, 0, deleteErr

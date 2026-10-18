@@ -230,7 +230,7 @@ function DashboardPage() {
     else notify({ text: result?.message || 'O back-end não confirmou o pedido.', kind: 'error' });
   }).catch(() => notify({ text: 'Aguardando conexão com o back-end', kind: 'error' }));
   const d = dash.data;
-  const defaultResetBalance = d?.simulationBalanceSol ?? 1;
+  const defaultResetBalance = d?.simulationResetBalanceSol ?? d?.simulationBalanceSol ?? 1;
   const resetTargetBalance = resetBalance.trim() ? Number(resetBalance) : defaultResetBalance;
   const resetPaperSimulation = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -320,10 +320,10 @@ function DashboardPage() {
       {resetOpen && d.mode === 'simulation' && <div className="modal-backdrop" role="presentation"><form className="modal" role="dialog" aria-modal="true" aria-labelledby="reset-paper-title" onSubmit={resetPaperSimulation}>
         <div className="eyebrow">AÇÃO DESTRUTIVA · SOMENTE PAPER</div>
         <h2 id="reset-paper-title" className="display mt-2 text-xl">Limpar operações e resetar</h2>
-        <p className="mt-3 text-sm muted">Isso apaga as operações paper, posições, marcas, eventos de tokens e avaliações de risco. A ação não pode ser desfeita. Se houver operação aguardando reconciliação, o servidor recusará o reset.</p>
+        <p className="mt-3 text-sm muted">Apaga trades, posições abertas, marcas, eventos de tokens e avaliações de risco apenas da base de simulação. Mantém o esquema, migrations e logs de auditoria. Posições abertas não bloqueiam; operações pendentes de reconciliação bloqueiam. O estado do bot é preservado e, se estiver rodando, ele pode abrir novas posições logo após o reset.</p>
         <label className="mt-4 block text-xs muted" htmlFor="reset-paper-balance">Saldo inicial novo em SOL (opcional)</label>
         <input id="reset-paper-balance" className="input mt-1 w-full" type="number" min="0.000000001" step="0.000000001" value={resetBalance} onChange={event => setResetBalance(event.target.value)} placeholder={fmt(defaultResetBalance, 9)} />
-        <p className="mt-2 text-xs muted">Saldo do novo ciclo: {Number.isFinite(resetTargetBalance) && resetTargetBalance > 0 ? fmt(resetTargetBalance, 9) : 'inválido'} SOL. O estado atual do bot será preservado durante o reset.</p>
+        <p className="mt-2 text-xs muted">Saldo paper do novo ciclo: {Number.isFinite(resetTargetBalance) && resetTargetBalance > 0 ? fmt(resetTargetBalance, 9) : 'inválido'} SOL. Se deixar o campo vazio, será usado o SIMULATION_BALANCE_SOL do ambiente.</p>
         {resetError && <p className="mt-3 text-sm negative" role="alert">{resetError}</p>}
         <div className="mt-5 flex justify-end gap-2"><button type="button" className="button" disabled={resetPending} onClick={() => setResetOpen(false)}>Cancelar</button><button type="submit" className="button button-danger" disabled={resetPending}>{resetPending ? 'A resetar…' : 'Confirmar reset'}</button></div>
       </form></div>}

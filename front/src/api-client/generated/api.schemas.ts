@@ -172,6 +172,7 @@ export interface Dashboard {
   feesPaidSol?: number | null;
   virtualEquitySol?: number | null;
   simulationBalanceSol?: number | null;
+  simulationResetBalanceSol?: number | null;
   staleMarks?: {
     total: number;
     flat: number;

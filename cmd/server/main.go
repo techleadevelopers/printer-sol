@@ -63,12 +63,13 @@ func main() {
 	if err := db.Migrate(); err != nil {
 		log.Fatal("migration", logging.Err(err))
 	}
+	simulationBalanceSOL := cfg.SimulationBalanceSOL
 	if cfg.Simulation {
 		run, runErr := db.EnsureSimulationRun(cfg.SimulationBalanceSOL)
 		if runErr != nil {
 			log.Fatal("simulation session", logging.Err(runErr))
 		}
-		cfg.SimulationBalanceSOL = run.BalanceStartSOL
+		simulationBalanceSOL = run.BalanceStartSOL
 	}
 	w, err := wallet.Load(cfg.PrivateKey, cfg.Simulation, cfg.FeeReserveSOL)
 	if err != nil {
@@ -85,7 +86,7 @@ func main() {
 	controller.Start()
 	limits := execution.Limits{MaxTradeSOL: cfg.MaxTradeSOL, MaxExposureSOL: cfg.MaxExposureSOL, MaxDailyLossSOL: cfg.MaxDailyLossSOL, MaxSlippagePct: cfg.MaxSlippagePct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL, SimulationBaseFeeSOL: cfg.SimulationBaseFeeSOL, MaxOpenPositions: cfg.MaxOpenPositions, MaxWaitSeconds: cfg.MaxConfirmationWaitSeconds, MaxAttempts: cfg.MaxSubmissionAttempts, SkipPreflight: cfg.SkipPreflight}
 	prices := pricefeed.New(cfg.SOLUSDPriceURL)
-	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, cfg.SimulationBalanceSOL, controller, bus, limits)
+	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, simulationBalanceSOL, controller, bus, limits)
 	strat := strategy.New(db, time.Duration(cfg.TokenMaxAgeSeconds)*time.Second)
 	strat.SetScreen(screener.RugCheck)
 	monitor := tokenmonitor.New(cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine, cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL, cfg.TakeProfitGrossPct, cfg.StopLossPct, time.Duration(cfg.MaxHoldSeconds)*time.Second, cfg.Simulation, bus, log)

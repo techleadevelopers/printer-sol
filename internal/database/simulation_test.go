@@ -84,6 +84,9 @@ func TestResetSimulationClearsPaperDataAndStartsFreshSession(t *testing.T) {
 	if err = db.RecordPaperMark("reset-mint", 5); err != nil {
 		t.Fatal(err)
 	}
+	if err = db.RecordLiveMark("legacy-live-mark", 10); err != nil {
+		t.Fatal(err)
+	}
 	if err = db.RecordEvent("reset-mint", "creator", "{}", time.Now().UTC(), 10); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +98,7 @@ func TestResetSimulationClearsPaperDataAndStartsFreshSession(t *testing.T) {
 	if err != nil || deletedTrades != 1 || deletedPositions != 1 {
 		t.Fatalf("reset counts trades=%d positions=%d err=%v", deletedTrades, deletedPositions, err)
 	}
-	for _, table := range []string{"transactions", "trades", "positions", "paper_marks", "token_events", "risk_assessments"} {
+	for _, table := range []string{"transactions", "trades", "positions", "paper_marks", "live_marks", "token_events", "risk_assessments"} {
 		var count int
 		if err = db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil || count != 0 {
 			t.Fatalf("%s count=%d err=%v after reset", table, count, err)
