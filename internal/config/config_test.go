@@ -174,7 +174,7 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 		"MAX_SLIPPAGE_PCT", "MAX_PRIORITY_FEE_SOL", "TOKEN_QUEUE_SIZE",
 		"MAX_OPEN_POSITIONS", "MAX_CONFIRMATION_WAIT_SECONDS", "MAX_SUBMISSION_ATTEMPTS",
 		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "ENTRY_DELAY_SECONDS", "MIN_TXNS_BEFORE_BUY",
-		"MIN_VOLUME_BEFORE_BUY", "PRICE_POLL_SECONDS", "TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
+		"MIN_VOLUME_BEFORE_BUY", "MIN_VOLUME_SOL_BEFORE_BUY", "PRICE_POLL_SECONDS", "TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
 		"LIVE_UNLOCK_REQUIRES_PAPER", "SKIP_PREFLIGHT",
 		"TOKEN_MAX_AGE_SECONDS", "TAKE_PROFIT_GROSS_PCT", "STOP_LOSS_PCT", "TRAILING_STOP_PCT", "MAX_HOLD_SECONDS",
 	}
@@ -210,7 +210,7 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 8 || cfg.MinTxnsBeforeBuy != 3 || cfg.MinVolumeBeforeBuy != 5 || cfg.PricePollSeconds != 20 || cfg.TokenMaxAgeSeconds != 30 {
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinTxnsBeforeBuy != 2 || cfg.MinVolumeBeforeBuy != .5 || cfg.PricePollSeconds != 20 || cfg.TokenMaxAgeSeconds != 30 {
 		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f priorityFee=%.9f liveGate=%v skipPreflight=%v entryDelay=%d minTxns=%d minVolume=%.1f pricePoll=%d tokenMaxAge=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.MaxPriorityFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.SkipPreflight, cfg.EntryDelaySeconds, cfg.MinTxnsBeforeBuy, cfg.MinVolumeBeforeBuy, cfg.PricePollSeconds, cfg.TokenMaxAgeSeconds)
 	}
 

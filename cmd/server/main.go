@@ -101,6 +101,7 @@ func main() {
 			PricePollInterval: time.Duration(cfg.PricePollSeconds) * time.Second,
 			Coins:             pumpportal.NewCoinDataClient(),
 			SOLUSD:            prices,
+			BondingCurve:      rpcs,
 		},
 	)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

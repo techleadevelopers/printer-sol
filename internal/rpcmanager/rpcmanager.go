@@ -3,16 +3,21 @@ package rpcmanager
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go.uber.org/zap"
+	"math"
 	"net/http"
-	"solana-sniper-backend/internal/database"
-	"solana-sniper-backend/internal/events"
 	"sync"
 	"time"
+
+	"github.com/gagliardetto/solana-go"
+	"go.uber.org/zap"
+	"solana-sniper-backend/internal/database"
+	"solana-sniper-backend/internal/events"
 )
 
 type Endpoint struct {
@@ -220,6 +225,72 @@ func (m *Manager) Balance(ctx context.Context, address string) (uint64, error) {
 		return 0, e
 	}
 	return r.Value, nil
+}
+
+const pumpFunProgramID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+// BondingCurveMarketCapSOL reads Pump.fun's bonding-curve account and derives
+// market cap from its virtual reserves and token supply.
+func (m *Manager) BondingCurveMarketCapSOL(ctx context.Context, mint string) (float64, error) {
+	mintKey, err := solana.PublicKeyFromBase58(mint)
+	if err != nil {
+		return 0, fmt.Errorf("parse mint public key: %w", err)
+	}
+	programID, err := solana.PublicKeyFromBase58(pumpFunProgramID)
+	if err != nil {
+		return 0, fmt.Errorf("parse Pump.fun program ID: %w", err)
+	}
+	curveAddress, _, err := solana.FindProgramAddress(
+		[][]byte{[]byte("bonding-curve"), mintKey.Bytes()},
+		programID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("derive Pump.fun bonding-curve address: %w", err)
+	}
+	endpoint, err := m.currentURL()
+	if err != nil {
+		return 0, err
+	}
+	var account struct {
+		Value *struct {
+			Owner string   `json:"owner"`
+			Data  []string `json:"data"`
+		} `json:"value"`
+	}
+	if err := m.call(ctx, endpoint, "getAccountInfo", []any{
+		curveAddress.String(),
+		map[string]any{"encoding": "base64", "commitment": "processed"},
+	}, &account); err != nil {
+		return 0, fmt.Errorf("read Pump.fun bonding-curve account: %w", err)
+	}
+	if account.Value == nil || len(account.Value.Data) == 0 {
+		return 0, fmt.Errorf("Pump.fun bonding-curve account is unavailable")
+	}
+	if account.Value.Owner != programID.String() {
+		return 0, fmt.Errorf("bonding-curve account owner does not match Pump.fun program")
+	}
+	data, err := base64.StdEncoding.DecodeString(account.Value.Data[0])
+	if err != nil {
+		return 0, fmt.Errorf("decode Pump.fun bonding-curve account: %w", err)
+	}
+	if len(data) < 49 {
+		return 0, fmt.Errorf("Pump.fun bonding-curve account data is incomplete")
+	}
+	discriminator := sha256.Sum256([]byte("account:BondingCurve"))
+	if !bytes.Equal(data[:8], discriminator[:8]) {
+		return 0, fmt.Errorf("account data is not a Pump.fun bonding curve")
+	}
+	virtualTokenReserves := binary.LittleEndian.Uint64(data[8:16])
+	virtualSolReserves := binary.LittleEndian.Uint64(data[16:24])
+	tokenSupply := binary.LittleEndian.Uint64(data[40:48])
+	if virtualTokenReserves == 0 || virtualSolReserves == 0 || tokenSupply == 0 {
+		return 0, fmt.Errorf("Pump.fun bonding-curve reserves or supply are zero")
+	}
+	marketCapSOL := float64(virtualSolReserves) * float64(tokenSupply) / float64(virtualTokenReserves) / 1e9
+	if marketCapSOL <= 0 || math.IsNaN(marketCapSOL) || math.IsInf(marketCapSOL, 0) {
+		return 0, fmt.Errorf("derived Pump.fun market cap is not positive and finite")
+	}
+	return marketCapSOL, nil
 }
 
 // Execution reads the confirmed transaction receipt and returns the SOL delta

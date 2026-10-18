@@ -49,13 +49,18 @@ type SOLUSDQuoter interface {
 	SOLUSD(context.Context) (float64, error)
 }
 
+type BondingCurveMarketCapSource interface {
+	BondingCurveMarketCapSOL(context.Context, string) (float64, error)
+}
+
 type Settings struct {
-	EntryDelay       time.Duration
-	MinTransactions  int
-	MinVolume        float64
+	EntryDelay        time.Duration
+	MinTransactions   int
+	MinVolume         float64
 	PricePollInterval time.Duration
-	Coins            CoinSource
-	SOLUSD           SOLUSDQuoter
+	Coins             CoinSource
+	SOLUSD            SOLUSDQuoter
+	BondingCurve      BondingCurveMarketCapSource
 }
 
 type candidate struct {
@@ -101,6 +106,7 @@ type Monitor struct {
 	pricePollInterval               time.Duration
 	coins                           CoinSource
 	solUSD                          SOLUSDQuoter
+	bondingCurve                    BondingCurveMarketCapSource
 	coinAPIStatusMu                 sync.Mutex
 	coinAPIFailures                 int
 	coinAPIAlerted                  bool
@@ -206,9 +212,9 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		maxHold = maximumPositionHold
 	}
 	settings := Settings{
-		EntryDelay:        8 * time.Second,
-		MinTransactions:   3,
-		MinVolume:         5,
+		EntryDelay:        5 * time.Second,
+		MinTransactions:   2,
+		MinVolume:         .5,
 		PricePollInterval: 20 * time.Second,
 		Coins:             pumpportal.NewCoinDataClient(),
 	}
@@ -230,6 +236,7 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 			settings.Coins = option.Coins
 		}
 		settings.SOLUSD = option.SOLUSD
+		settings.BondingCurve = option.BondingCurve
 	}
 	if limiter, ok := settings.Coins.(interface{ SetRateLimitBase(time.Duration) }); ok {
 		limiter.SetRateLimitBase(settings.PricePollInterval)
@@ -242,7 +249,8 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		seen: make(map[string]time.Time), candidates: make(map[string]*candidate),
 		entryDelay: settings.EntryDelay, minTransactions: settings.MinTransactions,
 		minVolume: settings.MinVolume, pricePollInterval: settings.PricePollInterval,
-		coins: settings.Coins, solUSD: settings.SOLUSD, bus: b, log: l,
+		coins: settings.Coins, solUSD: settings.SOLUSD, bondingCurve: settings.BondingCurve,
+		bus: b, log: l,
 	}
 }
 func (m *Monitor) SetTrailingStopPct(pct float64) {
@@ -493,7 +501,8 @@ func (m *Monitor) runConnections(ctx context.Context) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		if err := m.connect(ctx); err != nil {
-			m.log.Warn("token websocket disconnected", zap.Error(err))
+			m.log.Warn("token websocket disconnected; reconnect scheduled",
+				zap.Error(err), zap.Duration("retry_in", backoff))
 			select {
 			case <-ctx.Done():
 				return
@@ -535,6 +544,8 @@ func (m *Monitor) connect(ctx context.Context) error {
 		return err
 	}
 	m.connected.Store(true)
+			m.log.Info("PumpPortal websocket connected; subscribed to new-token feed",
+				zap.String("endpoint", u.Host))
 	writerDone := make(chan struct{})
 	defer close(writerDone)
 	go func() {

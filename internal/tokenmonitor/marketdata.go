@@ -145,40 +145,50 @@ func (m *Monitor) finishCandidate(ctx context.Context, mint string, coin pumppor
 	accepted := false
 	reason := ""
 	marketCapSOL := 0.0
+	volumeSOL, hasVolume := m.coinVolumeSOL(ctx, coin)
 	if apiErr == nil {
-		activityAvailable := coin.HasTransactions && coin.HasVolume
+		activityAvailable := coin.HasTransactions && hasVolume
 		if coin.HasTransactions && coin.Transactions < m.minTransactions {
 			reason = "Pump.fun activity below MIN_TXNS_BEFORE_BUY"
 		}
-		if reason == "" && coin.HasVolume && coin.Volume < m.minVolume {
-			reason = "Pump.fun volume below MIN_VOLUME_BEFORE_BUY"
+		if reason == "" && hasVolume && volumeSOL < m.minVolume {
+			reason = "Pump.fun volume below MIN_VOLUME_SOL_BEFORE_BUY"
 		}
-		if reason == "" {
-			if coin.HasMarketCapSOL || coin.HasMarketCapUSD {
-				var valid bool
-				marketCapSOL, valid = m.coinMarketCapSOL(ctx, coin)
-				if !valid {
-					reason = "Pump.fun reported no positive market cap; candidate rejected"
-				}
-			} else {
-				marketCapSOL = state.tradeMarketCapSOL
+		if reason == "" && (coin.HasMarketCapSOL || coin.HasMarketCapUSD) {
+			if hasExplicitZeroMarketCap(coin) {
+				reason = "Pump.fun reported no positive market cap; candidate rejected"
+			} else if value, valid := m.coinMarketCapSOL(ctx, coin); valid {
+				marketCapSOL = value
 			}
 		}
 
 		if reason == "" && activityAvailable {
-			if marketCapSOL <= 0 {
-				reason = "candidate has no positive market cap"
-			} else {
-				accepted = true
-			}
+			accepted = true
 		} else if reason == "" {
 			accepted, reason = m.websocketCandidateFallback(state)
 		}
 	} else {
 		accepted, reason = m.websocketCandidateFallback(state)
-		marketCapSOL = state.tradeMarketCapSOL
 	}
 
+	if accepted && marketCapSOL <= 0 && state.tradeMarketCapSOL > 0 {
+		marketCapSOL = state.tradeMarketCapSOL
+	}
+	if accepted && marketCapSOL <= 0 && !hasExplicitZeroMarketCap(coin) {
+		value, err := m.bondingCurveMarketCapSOL(ctx, mint)
+		if err == nil {
+			marketCapSOL = value
+		} else if m.bondingCurve != nil {
+			m.log.Debug("candidate bonding-curve market-cap fallback failed",
+				zap.String("mint", mint), zap.Error(err))
+		}
+	}
+	if accepted && marketCapSOL <= 0 {
+		accepted = false
+		if reason == "" {
+			reason = "candidate has no positive market cap"
+		}
+	}
 	if !accepted {
 		if reason == "" {
 			reason = "candidate did not meet the minimum activity and positive-price requirements"
@@ -203,10 +213,28 @@ func (m *Monitor) websocketCandidateFallback(state candidateState) (bool, string
 	if state.tradeEvents < fallbackMinimumTradeEvents {
 		return false, "Pump.fun API unavailable or incomplete; fewer than two WebSocket trades in the entry window"
 	}
-	if state.tradeMarketCapSOL <= 0 {
-		return false, "WebSocket fallback has no positive trade market cap"
-	}
 	return true, "WebSocket activity fallback accepted"
+}
+
+func hasExplicitZeroMarketCap(coin pumpportal.CoinSnapshot) bool {
+	if coin.HasMarketCapSOL {
+		return coin.MarketCapSOL <= 0
+	}
+	return coin.HasMarketCapUSD && coin.MarketCapUSD <= 0
+}
+
+func (m *Monitor) bondingCurveMarketCapSOL(ctx context.Context, mint string) (float64, error) {
+	if m.bondingCurve == nil {
+		return 0, fmt.Errorf("bonding-curve market-cap source is not configured")
+	}
+	marketCapSOL, err := m.bondingCurve.BondingCurveMarketCapSOL(ctx, mint)
+	if err != nil {
+		return 0, err
+	}
+	if marketCapSOL <= 0 || math.IsNaN(marketCapSOL) || math.IsInf(marketCapSOL, 0) {
+		return 0, fmt.Errorf("bonding-curve market cap is not positive and finite")
+	}
+	return marketCapSOL, nil
 }
 
 func (m *Monitor) recordCoinAPIResult(err error) {
@@ -229,7 +257,7 @@ func (m *Monitor) recordCoinAPIResult(err error) {
 	}
 
 	message := "polling failing"
-	detail := "Fallback de preço falhando - bot operando com dados do WS apenas"
+	detail := "API pública de cotação indisponível; marcações por WebSocket/RPC são usadas quando disponíveis"
 	m.log.Warn("polling failing: Pump.fun public price feed degraded",
 		zap.Int("consecutiveFailures", failures), zap.Error(err))
 	if m.db != nil {
@@ -263,6 +291,21 @@ func (m *Monitor) rejectCandidate(event Event, reason string) {
 	})
 }
 
+func (m *Monitor) coinVolumeSOL(ctx context.Context, coin pumpportal.CoinSnapshot) (float64, bool) {
+	if coin.HasVolume {
+		return coin.Volume, coin.Volume >= 0 && !math.IsNaN(coin.Volume) && !math.IsInf(coin.Volume, 0)
+	}
+	if !coin.HasVolumeUSD || coin.VolumeUSD < 0 || m.solUSD == nil {
+		return 0, false
+	}
+	solUSD, err := m.solUSD.SOLUSD(ctx)
+	if err != nil || solUSD <= 0 || math.IsNaN(solUSD) || math.IsInf(solUSD, 0) {
+		return 0, false
+	}
+	volumeSOL := coin.VolumeUSD / solUSD
+	return volumeSOL, volumeSOL >= 0 && !math.IsNaN(volumeSOL) && !math.IsInf(volumeSOL, 0)
+}
+
 func (m *Monitor) coinMarketCapSOL(ctx context.Context, coin pumpportal.CoinSnapshot) (float64, bool) {
 	if coin.HasMarketCapSOL {
 		return coin.MarketCapSOL, coin.MarketCapSOL > 0 && !math.IsNaN(coin.MarketCapSOL) && !math.IsInf(coin.MarketCapSOL, 0)
@@ -289,7 +332,7 @@ func (m *Monitor) runPricePoller(ctx context.Context) {
 			m.pollOpenPositionPrices(ctx)
 			nextInterval := m.pricePollInterval
 			if limiter, ok := m.coins.(interface{ RateLimitDelay() time.Duration }); ok {
-				if retryAfter := limiter.RateLimitDelay(); retryAfter > nextInterval {
+				if retryAfter := limiter.RateLimitDelay(); retryAfter > nextInterval && m.bondingCurve == nil {
 					nextInterval = retryAfter
 				}
 			}
@@ -333,6 +376,7 @@ func (m *Monitor) pollOpenPositionPrices(ctx context.Context) {
 func (m *Monitor) refreshOpenPositionPrice(ctx context.Context, mint string, generation uint64) {
 	if m.coins == nil {
 		m.recordCoinAPIResult(fmt.Errorf("Pump.fun coin API client is not configured"))
+		m.refreshBondingCurveMarketCap(ctx, mint, generation)
 		return
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
@@ -341,14 +385,30 @@ func (m *Monitor) refreshOpenPositionPrice(ctx context.Context, mint string, gen
 	if err != nil {
 		m.recordCoinAPIResult(err)
 		m.log.Debug("public market-cap refresh failed", zap.String("mint", mint), zap.Error(err))
+		m.refreshBondingCurveMarketCap(requestCtx, mint, generation)
 		return
 	}
 	marketCapSOL, valid := m.coinMarketCapSOL(requestCtx, coin)
 	if !valid || marketCapSOL <= 0 {
-		m.recordCoinAPIResult(fmt.Errorf("Pump.fun response has no usable positive market cap"))
+		markErr := fmt.Errorf("Pump.fun response has no usable positive market cap")
+		m.recordCoinAPIResult(markErr)
 		m.log.Debug("public market-cap refresh returned no positive mark", zap.String("mint", mint))
+		m.refreshBondingCurveMarketCap(requestCtx, mint, generation)
 		return
 	}
 	m.recordCoinAPIResult(nil)
 	m.markTradeWithSourceAt(generation, requestCtx, mint, marketCapSOL, "pump_fun_public_coin_api")
+}
+
+func (m *Monitor) refreshBondingCurveMarketCap(ctx context.Context, mint string, generation uint64) bool {
+	marketCapSOL, err := m.bondingCurveMarketCapSOL(ctx, mint)
+	if err != nil {
+		if m.bondingCurve != nil {
+			m.log.Debug("bonding-curve market-cap refresh failed",
+				zap.String("mint", mint), zap.Error(err))
+		}
+		return false
+	}
+	m.markTradeWithSourceAt(generation, ctx, mint, marketCapSOL, "pump_fun_bonding_curve_rpc")
+	return true
 }

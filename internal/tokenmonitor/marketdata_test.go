@@ -63,7 +63,7 @@ func TestCandidateGateRequiresBothActivityThresholds(t *testing.T) {
 	}
 
 	monitor.finishCandidate(context.Background(), event.Mint, pumpportal.CoinSnapshot{
-		Transactions: 2, Volume: 100, HasTransactions: true, HasVolume: true,
+		Transactions: 1, Volume: 100, HasTransactions: true, HasVolume: true,
 		HasMarketCapSOL: true, MarketCapSOL: 100,
 	}, nil)
 	if len(monitor.q) != 0 {

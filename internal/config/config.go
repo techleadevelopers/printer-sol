@@ -90,13 +90,19 @@ func Load() (Config, error) {
 	if c.RPCHealthCheckIntervalSeconds, err = intEnv("RPC_HEALTH_CHECK_INTERVAL_SECONDS", 45); err != nil {
 		return c, err
 	}
-	if c.EntryDelaySeconds, err = intEnv("ENTRY_DELAY_SECONDS", 8); err != nil {
+	if c.EntryDelaySeconds, err = intEnv("ENTRY_DELAY_SECONDS", 5); err != nil {
 		return c, err
 	}
-	if c.MinTxnsBeforeBuy, err = intEnv("MIN_TXNS_BEFORE_BUY", 3); err != nil {
+	if c.MinTxnsBeforeBuy, err = intEnv("MIN_TXNS_BEFORE_BUY", 2); err != nil {
 		return c, err
 	}
-	if c.MinVolumeBeforeBuy, err = floatEnv("MIN_VOLUME_BEFORE_BUY", 5); err != nil {
+	minVolumeEnv := "MIN_VOLUME_SOL_BEFORE_BUY"
+	if _, exists := os.LookupEnv(minVolumeEnv); !exists {
+		// Keep reading the previous name so existing deployments can migrate
+		// without accidentally dropping their configured activity threshold.
+		minVolumeEnv = "MIN_VOLUME_BEFORE_BUY"
+	}
+	if c.MinVolumeBeforeBuy, err = floatEnv(minVolumeEnv, .5); err != nil {
 		return c, err
 	}
 	if c.PricePollSeconds, err = intEnv("PRICE_POLL_SECONDS", 20); err != nil {
@@ -163,7 +169,7 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("queue, position, timing, and entry thresholds must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
 	}
 	if math.IsNaN(c.MinVolumeBeforeBuy) || math.IsInf(c.MinVolumeBeforeBuy, 0) || c.MinVolumeBeforeBuy <= 0 {
-		return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY must be a finite number greater than zero")
+		return c, fmt.Errorf("MIN_VOLUME_SOL_BEFORE_BUY must be a finite number greater than zero")
 	}
 	if c.TokenMaxAgeSeconds > 0 && c.TokenMaxAgeSeconds <= c.EntryDelaySeconds {
 		return c, fmt.Errorf("TOKEN_MAX_AGE_SECONDS must be greater than ENTRY_DELAY_SECONDS")
