@@ -410,8 +410,9 @@ func (d *DB) UpdateLiveMark(mint string, marketCapSOL float64) error {
 }
 func (d *DB) PaperMarkStats() (total, flat int, pctFlat float64, err error) {
 	err = d.QueryRow(`SELECT COUNT(*),
-		COALESCE(SUM(CASE WHEN current_market_cap_sol=entry_market_cap_sol THEN 1 ELSE 0 END),0)
-		FROM paper_marks`).Scan(&total, &flat)
+		COALESCE(SUM(CASE WHEN m.current_market_cap_sol=m.entry_market_cap_sol THEN 1 ELSE 0 END),0)
+		FROM paper_marks m
+		JOIN positions p ON p.mint=m.mint AND p.status='open'`).Scan(&total, &flat)
 	if err != nil {
 		return 0, 0, 0, err
 	}

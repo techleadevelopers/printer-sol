@@ -467,6 +467,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 					_ = c.Close()
 					return
 				}
+				m.log.Info("token trade subscription request sent", zap.String("mint", mint))
 			}
 		}
 	}()
@@ -491,8 +492,33 @@ func (m *Monitor) connect(ctx context.Context) error {
 			CreatedTimestamp, Timestamp, BlockTime json.RawMessage
 			MarketCapSol                           float64 `json:"marketCapSol"`
 		}
-		if err = json.Unmarshal(b, &d); err != nil || d.Mint == "" {
-			m.log.Warn("invalid token event", zap.Error(err))
+		if err = json.Unmarshal(b, &d); err != nil {
+			m.log.Warn("invalid PumpPortal websocket JSON",
+				zap.Error(err),
+				zap.String("payload", m.websocketPayloadPreview(b)))
+			continue
+		}
+		if d.Mint == "" {
+			var response struct {
+				Error   json.RawMessage `json:"error"`
+				Message json.RawMessage `json:"message"`
+			}
+			_ = json.Unmarshal(b, &response)
+			switch {
+			case len(response.Error) > 0 && string(response.Error) != "null" && string(response.Error) != `""`:
+				detail := m.websocketPayloadPreview(b)
+				m.log.Warn("PumpPortal websocket returned an error without a mint", zap.String("payload", detail))
+				m.bus.Publish("operational_error", map[string]any{
+					"component": "token_monitor",
+					"message":   "PumpPortal websocket returned an error; no price update was processed",
+					"detail":    detail,
+				})
+			case len(response.Message) > 0 && string(response.Message) != "null":
+				m.log.Info("PumpPortal websocket control response", zap.String("payload", m.websocketPayloadPreview(b)))
+			default:
+				m.log.Debug("ignored PumpPortal websocket frame without a mint",
+					zap.String("payload", m.websocketPayloadPreview(b)))
+			}
 			continue
 		}
 		if m.resetting.Load() {
@@ -545,6 +571,17 @@ func (m *Monitor) consume(ctx context.Context) {
 			})
 		}
 	}
+}
+
+func (m *Monitor) websocketPayloadPreview(raw []byte) string {
+	preview := strings.TrimSpace(string(raw))
+	if m.key != "" {
+		preview = strings.ReplaceAll(preview, m.key, "[redacted]")
+	}
+	if len(preview) > 512 {
+		preview = preview[:512] + "..."
+	}
+	return preview
 }
 
 func (m *Monitor) consumeEvent(ctx context.Context, e Event) {

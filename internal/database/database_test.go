@@ -20,6 +20,12 @@ func TestPaperMarkStatsCountsFlatMarks(t *testing.T) {
 	if err != nil || total != 0 || flat != 0 || pctFlat != 0 {
 		t.Fatalf("empty mark stats = (%d, %d, %.2f), err=%v; want (0, 0, 0)", total, flat, pctFlat, err)
 	}
+	if err = db.OpenPosition("flat-mint", 0.1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenPosition("moving-mint", 0.1); err != nil {
+		t.Fatal(err)
+	}
 	if err = db.RecordPaperMark("flat-mint", 100); err != nil {
 		t.Fatal(err)
 	}
@@ -33,6 +39,13 @@ func TestPaperMarkStatsCountsFlatMarks(t *testing.T) {
 	total, flat, pctFlat, err = db.PaperMarkStats()
 	if err != nil || total != 2 || flat != 1 || pctFlat != 50 {
 		t.Fatalf("mark stats = (%d, %d, %.2f), err=%v; want (2, 1, 50)", total, flat, pctFlat, err)
+	}
+	if _, err = db.ClosePosition("moving-mint"); err != nil {
+		t.Fatal(err)
+	}
+	total, flat, pctFlat, err = db.PaperMarkStats()
+	if err != nil || total != 1 || flat != 1 || pctFlat != 100 {
+		t.Fatalf("open mark stats after close = (%d, %d, %.2f), err=%v; want (1, 1, 100)", total, flat, pctFlat, err)
 	}
 }
 
