@@ -34,37 +34,43 @@ func TestTrailingStopDoesNotArmBeforeTenPercentGain(t *testing.T) {
 	}
 }
 
-func TestSimulationMaxHoldExtendsFlatPositionsOnce(t *testing.T) {
+func TestMaxHoldExtendsFlatPositionsOnceInSimulationAndLive(t *testing.T) {
 	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
-	limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second, Simulation: true}
 
-	if got := ExitReason(position, 1, true, limits, openedAt.Add(90*time.Second)); got != "" {
-		t.Fatalf("flat simulation position should receive one hold extension; got %q", got)
-	}
-	if got := ExitReason(position, 1, true, limits, openedAt.Add(180*time.Second)); got != "max hold time (extended)" {
-		t.Fatalf("flat simulation position should close after the extension; got %q", got)
+	for _, mode := range []string{"simulation", "live"} {
+		t.Run(mode, func(t *testing.T) {
+			limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second}
+			if got := ExitReason(position, 1, true, limits, openedAt.Add(90*time.Second)); got != "" {
+				t.Fatalf("flat position should receive one hold extension; got %q", got)
+			}
+			if got := ExitReason(position, 1, true, limits, openedAt.Add(180*time.Second)); got != "max hold time (extended)" {
+				t.Fatalf("flat position should close after the extension; got %q", got)
+			}
+		})
 	}
 }
 
-func TestSimulationMaxHoldStillExitsWhenOutsideFlatRange(t *testing.T) {
+func TestMaxHoldStillExitsOutsideDeadzone(t *testing.T) {
 	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
-	limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second, Simulation: true}
+	limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second}
 
 	for _, current := range []float64{1.06, 0.89} {
 		if got := ExitReason(position, current, true, limits, openedAt.Add(90*time.Second)); got != "max hold time" {
-			t.Fatalf("time stop should still apply at current value %.2f; got %q", current, got)
+			t.Fatalf("time stop should still apply outside the deadzone at %.2f; got %q", current, got)
 		}
 	}
 }
 
-func TestLiveMaxHoldBehaviorIsUnchanged(t *testing.T) {
+func TestMaxHoldDeadzoneBoundariesExitImmediately(t *testing.T) {
 	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
 	limits := Limits{MaxHold: 90 * time.Second}
 
-	if got := ExitReason(position, 1, true, limits, openedAt.Add(90*time.Second)); got != "max hold time" {
-		t.Fatalf("live time stop should remain unchanged; got %q", got)
+	for _, current := range []float64{1.05, 0.90} {
+		if got := ExitReason(position, current, true, limits, openedAt.Add(90*time.Second)); got != "max hold time" {
+			t.Fatalf("time stop at boundary %.2f should exit immediately; got %q", current, got)
+		}
 	}
 }

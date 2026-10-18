@@ -242,7 +242,7 @@ func TestLivePendingBuyKeepsMarkTrackingUntilConfirmation(t *testing.T) {
 	}
 }
 
-func TestLiveMaxHoldClosesExpiredPositionWithoutFurtherPriceUpdates(t *testing.T) {
+func TestLiveMaxHoldUsesExtensionWithoutFurtherPriceUpdates(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "live-max-hold-no-feed.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -254,15 +254,22 @@ func TestLiveMaxHoldClosesExpiredPositionWithoutFurtherPriceUpdates(t *testing.T
 	if err = db.OpenPosition("stale-live-mint", 0.05); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-6*time.Minute), "stale-live-mint"); err != nil {
+	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-11*time.Minute), "stale-live-mint"); err != nil {
 		t.Fatal(err)
 	}
 
 	entry := &recordingEntrier{}
 	monitor := New("", "", 8, db, nil, entry, 0, 0, 0, 50, 30, 10*time.Minute, false, events.New(), zap.NewNop())
 	monitor.expireOpenPositions(context.Background())
+	if entry.liveExitCalls != 0 {
+		t.Fatalf("live position inside the extension window should remain open, got %d sells", entry.liveExitCalls)
+	}
+	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-21*time.Minute), "stale-live-mint"); err != nil {
+		t.Fatal(err)
+	}
+	monitor.expireOpenPositions(context.Background())
 	if entry.liveExitCalls != 1 {
-		t.Fatalf("expired live position without feed updates should submit one sell, got %d", entry.liveExitCalls)
+		t.Fatalf("live position past the extension should submit one sell, got %d", entry.liveExitCalls)
 	}
 
 	if err = db.InsertTrade(database.Trade{ID: "pending-max-hold-sell", Mint: "stale-live-mint", Side: "sell", Quantity: "100", Requested: 100, State: "submitted"}); err != nil {
@@ -380,7 +387,7 @@ func TestSimulationExitUsesConfiguredMaxHold(t *testing.T) {
 	}
 }
 
-func TestSimulationMaxHoldClosesWithoutPriceUpdatesAfterExtendedWindow(t *testing.T) {
+func TestSimulationMaxHoldUsesExtensionWithoutPriceUpdates(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "paper-max-hold-no-feed.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -392,7 +399,7 @@ func TestSimulationMaxHoldClosesWithoutPriceUpdatesAfterExtendedWindow(t *testin
 	if err = db.OpenSimulationPosition("stale-paper-mint", 0.05); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-11*time.Minute), "stale-paper-mint"); err != nil {
+	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-6*time.Minute), "stale-paper-mint"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -405,8 +412,19 @@ func TestSimulationMaxHoldClosesWithoutPriceUpdatesAfterExtendedWindow(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	if open != 1 {
+		t.Fatalf("simulation position should remain open during the extension: %d", open)
+	}
+	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-11*time.Minute), "stale-paper-mint"); err != nil {
+		t.Fatal(err)
+	}
+	monitor.expireOpenPositions(context.Background())
+	open, err = db.OpenPositionCount()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if open != 0 {
-		t.Fatalf("simulation position remained open past the extended maximum: %d", open)
+		t.Fatalf("simulation position remained open past the extension: %d", open)
 	}
 	var side, state string
 	var pnl float64

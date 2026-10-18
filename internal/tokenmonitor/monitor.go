@@ -75,6 +75,12 @@ func (m *Monitor) SetTrailingStopPct(pct float64) {
 		m.trailingStop = pct
 	}
 }
+func (m *Monitor) MaxHoldSeconds() int {
+	if m == nil {
+		return 0
+	}
+	return int(m.maxHold / time.Second)
+}
 func (m *Monitor) SetAsyncRugCheckAfterEntry(enabled bool) { m.asyncRiskScreen = enabled }
 func (m *Monitor) Run(ctx context.Context) {
 	// The selected database is mode-isolated, so restoring its open positions
@@ -232,8 +238,8 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 			m.log.Warn("read last position mark; using safe timed-exit fallback", zap.String("mint", mint), zap.Error(err))
 			returnPct = 0
 		} else if !known {
-			// A timed-out paper position with no recorded price is closed at
-			// its entry value; live exits sell the full confirmed token balance.
+			// Unknown marks use a neutral value; both modes wait through the same
+			// extension window before a forced time-based close.
 			returnPct = 0
 		}
 		failedExit, failedExitErr := m.db.HasFailedSellForMint(mint)
@@ -250,10 +256,7 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 		case known:
 			reason = m.positionExitReason(mint, returnPct, openedAt, now)
 		case holdExpired:
-			switch {
-			case !m.simulation:
-				reason = "max hold time"
-			case now.Sub(openedAt)-m.maxHold >= m.maxHold:
+			if now.Sub(openedAt)-m.maxHold >= m.maxHold {
 				reason = "max hold time (extended)"
 			}
 		}
@@ -561,7 +564,7 @@ func (m *Monitor) positionExitReason(mint string, returnPct float64, openedAt, n
 		positions.Position{Mint: mint, CostSOL: cost, PeakSOL: peakValue, OpenedAt: openedAt},
 		currentValue,
 		true,
-		positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, TrailingStopPct: m.trailingStop, MaxHold: m.maxHold, Simulation: m.simulation},
+		positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, TrailingStopPct: m.trailingStop, MaxHold: m.maxHold},
 		now,
 	)
 }

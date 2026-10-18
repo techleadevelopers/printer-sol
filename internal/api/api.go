@@ -581,7 +581,13 @@ func (s *Server) rpcsList(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		write(w, 200, map[string]any{"simulation": s.cfg.Simulation, "liveTradingEnabled": s.cfg.EnableLiveTrading, "limits": s.engine.Limits()})
+		write(w, 200, map[string]any{
+			"simulation":             s.cfg.Simulation,
+			"liveTradingEnabled":     s.cfg.EnableLiveTrading,
+			"maxHoldSeconds":         s.cfg.MaxHoldSeconds,
+			"effectiveMaxHoldSeconds": s.monitor.MaxHoldSeconds(),
+			"limits":                 s.engine.Limits(),
+		})
 		return
 	}
 	if r.Method != "POST" {

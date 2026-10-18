@@ -1,3 +1,6 @@
+// TODO(auth): Clerk routes below are intentionally unmounted because the Go API
+// validates the master-password HMAC bearer token, not Clerk tokens. Revisit
+// only as part of a coordinated API authentication migration.
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { ClerkProvider, Show, SignIn, SignUp, useAuth, useClerk } from '@clerk/react';
 import { publishableKeyFromHost } from '@clerk/react/internal';
@@ -22,14 +25,14 @@ import {
   YAxis,
 } from 'recharts';
 import {
-  getGetConfigQueryKey, getGetDashboardQueryKey, getGetHealthQueryKey, getGetLogsQueryKey,
+  getGetDashboardQueryKey, getGetHealthQueryKey, getGetLogsQueryKey,
   getGetPositionsQueryKey, getGetRpcsQueryKey, getGetTokensQueryKey, getGetTradesQueryKey,
   getGetWalletQueryKey, useGetConfig, useGetDashboard, useGetHealth, useGetLogs,
   useGetPositions, useGetRpcs, useGetTokens, useGetTrades, useGetWallet,
-  usePauseBot, useRequestPositionSell, useResumeBot, useSaveConfig, useSelectRpc,
+  usePauseBot, useRequestPositionSell, useResumeBot, useSelectRpc,
   useStartBot, useStopBot, useTestRpc, setAuthTokenGetter,
   type GetLogsParams, type GetPositionsParams, type GetTokensParams, type GetTradesParams,
-  type RpcEndpoint, type StrategyConfigInput,
+  type RpcEndpoint,
 } from '@/api-client';
 import { Link, Redirect, Route, Router as WouterRouter, Switch, useLocation } from 'wouter';
 import { apiBaseUrl, apiConnectionLabel, hasConfiguredApiBase } from '@/services/api';
@@ -409,62 +412,32 @@ function RpcsPage() {
 }
 function redactUrl(value: string) { try { const url = new URL(value); return `${url.protocol}//${url.host}${url.pathname}${url.search ? '?…' : ''}`; } catch { return 'Indisponível'; } }
 
-const strategyFields: { key: keyof StrategyConfigInput; label: string; unit: string; min: number; step: string }[] = [
-  { key: 'maxCapitalPerTradeSol', label: 'Capital máximo por operação', unit: 'SOL', min: 0, step: 'any' },
-  { key: 'profitTargetPercent', label: 'Alvo de lucro', unit: '%', min: 0, step: 'any' },
-  { key: 'maxLossPercent', label: 'Perda máxima', unit: '%', min: 0, step: 'any' },
-  { key: 'maxSlippagePercent', label: 'Slippage máximo', unit: '%', min: 0, step: 'any' },
-  { key: 'priorityFeeSol', label: 'Taxa prioritária', unit: 'SOL', min: 0, step: 'any' },
-  { key: 'maxConcurrentPositions', label: 'Posições simultâneas', unit: 'posições', min: 1, step: '1' },
-  { key: 'maxHoldMinutes', label: 'Tempo máximo de retenção', unit: 'min', min: 1, step: '1' },
-  { key: 'dailyLossLimitSol', label: 'Limite de perda diária', unit: 'SOL', min: 0, step: 'any' },
-  { key: 'minFeeReserveSol', label: 'Reserva mínima para taxas', unit: 'SOL', min: 0, step: 'any' },
-];
+type RuntimeConfigView = {
+  simulation: boolean;
+  liveTradingEnabled: boolean;
+  maxHoldSeconds: number;
+  effectiveMaxHoldSeconds: number;
+};
+
 function StrategyPage() {
   const q = useGetConfig({ query: { refetchInterval: 30000 } });
-  const save = useSaveConfig();
-  const qc = useQueryClient();
-  const [values, setValues] = useState<Record<string, string>>({});
-  const [mode, setMode] = useState<StrategyConfigInput['mode']>('unknown');
-  const [entry, setEntry] = useState('{}'), [exit, setExit] = useState('{}');
-  const initialized = useRef(false);
-  useEffect(() => {
-    if (q.data && !initialized.current) {
-      initialized.current = true;
-      const next: Record<string, string> = {};
-      strategyFields.forEach(f => { const value = q.data?.[f.key]; next[f.key] = value == null ? '' : String(value); });
-      setValues(next); setEntry(JSON.stringify(q.data.entryCriteria, null, 2)); setExit(JSON.stringify(q.data.exitCriteria, null, 2)); setMode(q.data.mode);
-    }
-  }, [q.data]);
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
-    if (save.isPending) return;
-    try {
-      const parsed: Record<string, number> = {};
-      for (const f of strategyFields) {
-        const raw = values[f.key];
-        if (raw === '' || !Number.isFinite(Number(raw)) || Number(raw) < f.min) throw new Error(`Verifique: ${f.label}.`);
-        parsed[f.key] = Number(raw);
-      }
-      if (parsed.maxSlippagePercent > 100) throw new Error('Slippage máximo não pode exceder 100%.');
-      const entryCriteria = JSON.parse(entry), exitCriteria = JSON.parse(exit);
-      if (!entryCriteria || typeof entryCriteria !== 'object' || Array.isArray(entryCriteria) || !exitCriteria || typeof exitCriteria !== 'object' || Array.isArray(exitCriteria)) throw new Error('Critérios devem ser objetos JSON.');
-      if (mode === 'unknown') throw new Error('Selecione um modo de operação antes de guardar.');
-      const confirmation = mode === 'real' && q.data?.mode !== 'real' ? 'Confirma a alteração para modo real e o envio da configuração ao back-end?' : 'Confirma o envio da configuração para validação pelo back-end?';
-      if (!window.confirm(confirmation)) return;
-      const payload = { ...parsed, entryCriteria, exitCriteria, mode } as StrategyConfigInput;
-      save.mutate({ data: payload }, { onSuccess: response => { notify({ text: 'Configuração validada e guardada pelo back-end.', kind: 'success' }); void qc.invalidateQueries({ queryKey: getGetConfigQueryKey() }); setValues(Object.fromEntries(strategyFields.map(f => [f.key, response[f.key] == null ? '' : String(response[f.key])]))); setMode(response.mode); }, onError: () => notify({ text: 'Aguardando conexão com o back-end', kind: 'error' }) });
-    } catch (error) { notify({ text: error instanceof Error ? error.message : 'Configuração inválida.', kind: 'error' }); }
-  };
-  return <DataPageFrame description="Os parâmetros são validados e aplicados exclusivamente pelo serviço.">
+  const config = q.data as unknown as RuntimeConfigView | undefined;
+  return <DataPageFrame description="Parâmetros efetivos reportados pelo serviço. Esta tela é somente leitura.">
     <QueryState loading={q.isLoading} error={q.isError} onRetry={() => void q.refetch()} />
-    {!q.isLoading && !q.isError && q.data && <form className="space-y-4" onSubmit={submit}>
-      <section className="panel"><PanelTitle title="Limites operacionais" aside={<span className="text-xs muted">Modo atual: {mode}</span>} /><div className="grid gap-4 p-4 sm:grid-cols-2 lg:grid-cols-3">{strategyFields.map(f => <label className="text-xs muted" key={f.key}>{f.label}<div className="relative mt-1"><input type="number" min={f.min} max={f.key === 'maxSlippagePercent' ? 100 : undefined} step={f.step} required className="input pr-16 mono" value={values[f.key] ?? ''} onChange={e => setValues(s => ({ ...s, [f.key]: e.target.value }))} data-testid={`input-strategy-${f.key}`} /><span className="absolute right-3 top-2.5 text-[10px] muted">{f.unit}</span></div></label>)}</div></section>
-      <section className="panel p-4"><label className="block max-w-sm text-xs muted">Modo de operação<select className="select mt-2" value={mode} onChange={e => setMode(e.target.value as StrategyConfigInput['mode'])} data-testid="select-strategy-mode"><option value="unknown" disabled>Indisponível</option><option value="simulation">Simulação</option><option value="real">Real — confirmação necessária</option></select></label><p className="mb-0 mt-2 text-xs muted">A configuração não garante lucro; o back-end valida todos os valores antes de aceitar.</p></section>
-      <div className="grid gap-4 lg:grid-cols-2"><section className="panel"><PanelTitle title="Critérios de entrada" /><div className="p-4"><textarea className="input mono min-h-40 resize-y text-xs" value={entry} onChange={e => setEntry(e.target.value)} aria-label="Critérios de entrada em JSON" /></div></section><section className="panel"><PanelTitle title="Critérios de saída" /><div className="p-4"><textarea className="input mono min-h-40 resize-y text-xs" value={exit} onChange={e => setExit(e.target.value)} aria-label="Critérios de saída em JSON" /></div></section></div>
-      <div className="flex flex-wrap items-center justify-between gap-3"><span className="text-xs muted">Atualização aceite: {fmtDate(q.data.updatedAt)}</span><button className="button button-primary" type="submit" disabled={save.isPending}>{save.isPending ? 'A validar…' : 'Guardar configuração'} <Check size={15} /></button></div>
-      {save.isError && <p className="negative text-sm">Configuração não confirmada. Aguardando conexão com o back-end</p>}
-    </form>}
+    {!q.isLoading && !q.isError && config && <section className="panel">
+      <PanelTitle title="Tempo máximo de retenção" aside={<StatusTag value={config.simulation ? 'simulation' : config.liveTradingEnabled ? 'live' : 'live disabled'} positive={['simulation', 'live']} warning={['live disabled']} />} />
+      <div className="grid gap-4 p-4 sm:grid-cols-2">
+        <div className="rounded-lg border border-border/70 p-4">
+          <div className="eyebrow">MAX_HOLD_SECONDS · CONFIGURADO</div>
+          <div className="display mt-2 text-2xl">{config.maxHoldSeconds == null ? 'Indisponível' : `${fmt(config.maxHoldSeconds, 0)} s`}</div>
+        </div>
+        <div className="rounded-lg border border-border/70 p-4">
+          <div className="eyebrow">LIMITE EFETIVO NO MONITOR</div>
+          <div className="display mt-2 text-2xl">{config.effectiveMaxHoldSeconds == null ? 'Indisponível' : `${fmt(config.effectiveMaxHoldSeconds, 0)} s`}</div>
+        </div>
+      </div>
+      <p className="mb-0 px-4 pb-4 text-xs muted">Somente leitura. Para alterar, ajuste MAX_HOLD_SECONDS no ambiente do serviço e reinicie o backend.</p>
+    </section>}
   </DataPageFrame>;
 }
 
