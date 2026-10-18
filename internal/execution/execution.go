@@ -230,14 +230,26 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		if l.MaxPriorityFeeSOL > 0 && r.PriorityFee > l.MaxPriorityFeeSOL {
 			return "", fmt.Errorf("maximum priority fee exceeded")
 		}
-		if n, err := e.db.OpenPositionCount(); err != nil {
+		open, err := e.db.OpenPositionCount()
+		if err != nil {
 			return "", err
-		} else if l.MaxOpenPositions > 0 && n >= l.MaxOpenPositions {
+		}
+		pending, err := e.db.PendingBuyCount()
+		if err != nil {
+			return "", err
+		}
+		if l.MaxOpenPositions > 0 && open+pending >= l.MaxOpenPositions {
 			return "", fmt.Errorf("maximum simultaneous positions reached")
 		}
-		if exposure, err := e.db.OpenExposureSOL(); err != nil {
+		exposure, err := e.db.OpenExposureSOL()
+		if err != nil {
 			return "", err
-		} else if l.MaxExposureSOL > 0 && exposure+r.Amount > l.MaxExposureSOL {
+		}
+		pendingExposure, err := e.db.PendingBuyExposureSOL()
+		if err != nil {
+			return "", err
+		}
+		if l.MaxExposureSOL > 0 && exposure+pendingExposure+r.Amount > l.MaxExposureSOL {
 			return "", fmt.Errorf("maximum exposure exceeded")
 		}
 		if loss, err := e.db.DailyRealizedLossSOL(); err != nil {
@@ -317,6 +329,10 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		_ = e.db.UpdateTradeState(id, "failed", "", false)
 		return id, fmt.Errorf("unsafe transaction: %w", err)
 	}
+	if err = e.validatePreparedTransaction(tx); err != nil {
+		_ = e.db.UpdateTradeState(id, "failed", "", false)
+		return id, fmt.Errorf("unsafe prepared transaction: %w", err)
+	}
 	if !tx.IsSigner(e.wallet.PublicKey()) {
 		_ = e.db.UpdateTradeState(id, "failed", "", false)
 		return id, fmt.Errorf("prepared transaction does not require operational wallet")
@@ -363,10 +379,29 @@ func (e *Engine) confirm(id, sig string, r Request) {
 			switch state {
 			case "confirmed", "finalized":
 				_ = e.db.UpdateTradeState(id, state, sig, true)
+				execution, fee, executionErr := e.rpcs.Execution(ctx, sig, e.wallet.Address())
+				if executionErr != nil {
+					_ = e.db.UpdateTradeState(id, "unknown", sig, false)
+					e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed transaction lacks verified execution data"})
+					return
+				}
 				if r.Side == "buy" {
-					_ = e.db.OpenPosition(r.Mint, r.Amount)
+					if execution >= 0 { // a buy must debit the operational wallet
+						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
+						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "buy confirmation did not debit operational wallet"})
+						return
+					}
+					cost := -execution
+					_ = e.db.SetTradeExecution(id, cost, fee, 0)
+					_ = e.db.OpenPosition(r.Mint, cost)
 				} else {
-					_, _ = e.db.ClosePosition(r.Mint)
+					cost, costErr := e.db.ClosePosition(r.Mint)
+					if costErr != nil || execution < 0 {
+						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
+						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "sell confirmation lacks valid wallet credit"})
+						return
+					}
+					_ = e.db.SetTradeExecution(id, execution, fee, execution-cost)
 				}
 				e.release(r.Mint)
 				e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "signature": sig, "state": state})
@@ -388,4 +423,34 @@ func (e *Engine) confirm(id, sig string, r Request) {
 		case <-tick.C:
 		}
 	}
+}
+
+// validatePreparedTransaction is deliberately conservative: PumpPortal may
+// construct the transaction, but only the configured wallet may authorize it
+// and that wallet must be the fee payer. Address-table transactions are
+// rejected until their tables are resolved and inspected locally.
+func (e *Engine) validatePreparedTransaction(tx *solana.Transaction) error {
+	if len(tx.Message.AccountKeys) == 0 || tx.Message.AccountKeys[0] != e.wallet.PublicKey() {
+		return fmt.Errorf("operational wallet is not the fee payer")
+	}
+	if tx.Message.Header.NumRequiredSignatures != 1 || len(tx.Signatures) != 1 {
+		return fmt.Errorf("transaction must require exactly one signer")
+	}
+	if len(tx.Message.AddressTableLookups) != 0 {
+		return fmt.Errorf("address lookup transactions are not permitted without local lookup resolution")
+	}
+	if tx.Message.RecentBlockhash.IsZero() || len(tx.Message.Instructions) == 0 {
+		return fmt.Errorf("missing recent blockhash or instructions")
+	}
+	for _, ix := range tx.Message.Instructions {
+		if int(ix.ProgramIDIndex) >= len(tx.Message.AccountKeys) || len(ix.Data) == 0 {
+			return fmt.Errorf("malformed instruction")
+		}
+		for _, account := range ix.Accounts {
+			if int(account) >= len(tx.Message.AccountKeys) {
+				return fmt.Errorf("instruction account index out of range")
+			}
+		}
+	}
+	return nil
 }

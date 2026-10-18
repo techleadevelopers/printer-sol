@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"solana-sniper-backend/internal/database"
 	"solana-sniper-backend/internal/events"
+	"solana-sniper-backend/internal/positions"
 	"solana-sniper-backend/internal/strategy"
 	"strconv"
 	"strings"
@@ -42,7 +43,8 @@ type Monitor struct {
 	log                             *zap.Logger
 	entry                           Entrier
 	tradeUSD, slippage, priorityFee float64
-	takeProfit                      float64
+	takeProfit, stopLoss            float64
+	maxHold                         time.Duration
 	simulation                      bool
 	subscriptions                   chan string
 	tracked                         sync.Map
@@ -50,8 +52,8 @@ type Monitor struct {
 	connected                       atomic.Bool
 }
 
-func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit float64, simulation bool, b *events.Bus, l *zap.Logger) *Monitor {
-	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, simulation: simulation, subscriptions: make(chan string, size), bus: b, log: l}
+func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit, stopLoss float64, maxHold time.Duration, simulation bool, b *events.Bus, l *zap.Logger) *Monitor {
+	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, stopLoss: stopLoss, maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size), bus: b, log: l}
 }
 func (m *Monitor) Run(ctx context.Context) {
 	// Tracked mints are in-memory subscriptions. Restore them after a restart
@@ -252,22 +254,27 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 	if err != nil || !known {
 		return
 	}
-	m.bus.Publish("take_profit_mark_updated", map[string]any{"mint": mint, "marketCapSol": marketCapSOL, "returnPct": returnPct, "takeProfitPct": m.takeProfit, "simulation": m.simulation})
-	if returnPct < m.takeProfit {
+	openedAt, ok, err := m.db.PositionOpenedAt(mint)
+	if err != nil || !ok {
+		return
+	}
+	reason := positions.ExitReason(positions.Position{Mint: mint, CostSOL: 1, OpenedAt: openedAt}, 1+returnPct/100, true, positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, MaxHold: m.maxHold}, time.Now().UTC())
+	m.bus.Publish("position_mark_updated", map[string]any{"mint": mint, "marketCapSol": marketCapSOL, "returnPct": returnPct, "takeProfitPct": m.takeProfit, "stopLossPct": m.stopLoss, "simulation": m.simulation})
+	if reason == "" {
 		return
 	}
 	var id string
 	if m.simulation {
-		id, err = m.entry.ClosePaperPosition(ctx, mint, returnPct, "take profit reached in simulation")
+		id, err = m.entry.ClosePaperPosition(ctx, mint, returnPct, reason+" reached in simulation")
 	} else {
-		id, err = m.entry.CloseLivePosition(ctx, mint, m.slippage, m.priorityFee, "take profit reached in live operation")
+		id, err = m.entry.CloseLivePosition(ctx, mint, m.slippage, m.priorityFee, reason+" reached in live operation")
 	}
 	if err != nil {
 		m.log.Warn("paper take-profit exit", zap.String("mint", mint), zap.Error(err))
 		return
 	}
 	m.tracked.Delete(mint)
-	m.bus.Publish("take_profit_triggered", map[string]any{"mint": mint, "tradeId": id, "returnPct": returnPct, "simulation": m.simulation})
+	m.bus.Publish("exit_triggered", map[string]any{"mint": mint, "tradeId": id, "reason": reason, "returnPct": returnPct, "simulation": m.simulation})
 }
 
 // timestampFromEvent accepts the timestamp variants emitted by PumpPortal. A

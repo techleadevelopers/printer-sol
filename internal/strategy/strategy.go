@@ -11,9 +11,12 @@ import (
 // and operational limits remain enforced by the execution engine immediately
 // before an entry is created.
 type Strategy struct {
-	db                     *database.DB
+	db     *database.DB
 	maxAge time.Duration
+	screen func(context.Context, string) (string, error)
 }
+
+func (s *Strategy) SetScreen(screen func(context.Context, string) (string, error)) { s.screen = screen }
 
 func New(db *database.DB, maxAge time.Duration) *Strategy {
 	return &Strategy{db: db, maxAge: maxAge}
@@ -31,6 +34,13 @@ func (s *Strategy) Evaluate(ctx context.Context, mint string, receivedAt time.Ti
 	}
 	if active {
 		return false, "existing unreconciled position"
+	}
+	if s.screen != nil {
+		reason, err := s.screen(ctx, mint)
+		if err != nil {
+			return false, err.Error()
+		}
+		return true, reason
 	}
 	return true, "fresh PumpPortal token accepted by entry filters"
 }

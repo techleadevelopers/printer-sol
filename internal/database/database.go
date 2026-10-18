@@ -298,6 +298,24 @@ func (d *DB) OpenPositionCount() (int, error) {
 	e := d.QueryRow(`SELECT COUNT(*) FROM positions WHERE status='open'`).Scan(&n)
 	return n, e
 }
+func (d *DB) PendingBuyCount() (int, error) {
+	var n int
+	e := d.QueryRow(`SELECT COUNT(*) FROM trades WHERE side='buy' AND state IN ('prepared','signed','submitted','pending','unknown')`).Scan(&n)
+	return n, e
+}
+func (d *DB) PendingBuyExposureSOL() (float64, error) {
+	var n sql.NullFloat64
+	e := d.QueryRow(`SELECT COALESCE(SUM(requested_value_sol),0) FROM trades WHERE side='buy' AND state IN ('prepared','signed','submitted','pending','unknown')`).Scan(&n)
+	return n.Float64, e
+}
+func (d *DB) PositionOpenedAt(mint string) (time.Time, bool, error) {
+	var opened time.Time
+	e := d.QueryRow(d.bind(`SELECT opened_at FROM positions WHERE mint=? AND status='open'`), mint).Scan(&opened)
+	if e == sql.ErrNoRows {
+		return time.Time{}, false, nil
+	}
+	return opened, e == nil, e
+}
 func (d *DB) UnknownTradeCount() (int, error) {
 	var n int
 	query := `SELECT COUNT(*) FROM trades WHERE state='unknown' OR reconciliation_needed=1`

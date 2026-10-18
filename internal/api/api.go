@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 	"net/http"
+	"os"
 	"solana-sniper-backend/internal/bot"
 	"solana-sniper-backend/internal/config"
 	"solana-sniper-backend/internal/database"
@@ -322,6 +323,39 @@ func (s *Server) emergency(w http.ResponseWriter, r *http.Request) {
 	}
 	s.controller.EmergencyStop()
 	write(w, 200, map[string]any{"state": s.controller.State(), "positionsRetained": true})
+}
+
+// cors handles browser preflight before routes perform method or auth checks.
+// Origins are explicit: credentials are never combined with a wildcard origin.
+func cors(next http.Handler) http.Handler {
+	allowed := map[string]struct{}{
+		"https://solana-sniper-bot-dashboard.vercel.app": {},
+		"http://localhost:5173":                          {},
+	}
+	for _, origin := range strings.Split(os.Getenv("CORS_ALLOWED_ORIGINS"), ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			allowed[origin] = struct{}{}
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if _, ok := allowed[origin]; ok {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions {
+			if _, ok := allowed[origin]; !ok {
+				fail(w, http.StatusForbidden, "origin_not_allowed", "origin is not allowed")
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 func (s *Server) rpcTest(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {

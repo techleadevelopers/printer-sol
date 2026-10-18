@@ -16,11 +16,11 @@ import (
 )
 
 type Endpoint struct {
-	URL       string `json:"url"`
-	Healthy   bool   `json:"healthy"`
-	LatencyMS int64  `json:"latencyMs"`
-	LastError string `json:"lastError,omitempty"`
-	HTTPStatus int `json:"httpStatus,omitempty"`
+	URL        string `json:"url"`
+	Healthy    bool   `json:"healthy"`
+	LatencyMS  int64  `json:"latencyMs"`
+	LastError  string `json:"lastError,omitempty"`
+	HTTPStatus int    `json:"httpStatus,omitempty"`
 }
 type Manager struct {
 	mu        sync.RWMutex
@@ -153,11 +153,15 @@ func (m *Manager) call(ctx context.Context, url, method string, params, result a
 	}
 	return nil
 }
+
 type httpError struct{ status int }
+
 func (e *httpError) Error() string { return fmt.Sprintf("RPC HTTP %d", e.status) }
 func httpStatus(err error) int {
 	var target *httpError
-	if errors.As(err, &target) { return target.status }
+	if errors.As(err, &target) {
+		return target.status
+	}
 	return 0
 }
 func (m *Manager) Send(ctx context.Context, raw []byte) (string, error) {

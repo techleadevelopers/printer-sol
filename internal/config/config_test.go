@@ -59,6 +59,26 @@ func TestLiveTradingRefusesLocalSimulationLedger(t *testing.T) {
 	}
 }
 
+func TestLiveTradingRequiresStopLossAndMaxHold(t *testing.T) {
+	keys := []string{"SIMULATION", "ENABLE_LIVE_TRADING", "BOT_PRIVATE_KEY", "KEY_PROVIDER_REF", "WALLET_PUBLIC_ADDRESS", "PUMPPORTAL_API_KEY", "ADMIN_PASSWORD", "SIMULATION_DATABASE_URL", "REAL_DATABASE_URL", "STOP_LOSS_PCT", "MAX_HOLD_SECONDS"}
+	old := map[string]string{}
+	for _, k := range keys { old[k] = os.Getenv(k) }
+	defer func() { for _, k := range keys { _ = os.Setenv(k, old[k]) } }()
+	_ = os.Setenv("SIMULATION", "false")
+	_ = os.Setenv("ENABLE_LIVE_TRADING", "true")
+	_ = os.Setenv("BOT_PRIVATE_KEY", "test-key")
+	_ = os.Setenv("KEY_PROVIDER_REF", "test-provider")
+	_ = os.Setenv("WALLET_PUBLIC_ADDRESS", "test-wallet")
+	_ = os.Setenv("PUMPPORTAL_API_KEY", "test-key")
+	_ = os.Setenv("ADMIN_PASSWORD", "test-master-password")
+	_ = os.Setenv("SIMULATION_DATABASE_URL", "postgresql://sim.example/db")
+	_ = os.Setenv("REAL_DATABASE_URL", "postgresql://real.example/db")
+	_ = os.Setenv("STOP_LOSS_PCT", "0")
+	_ = os.Setenv("MAX_HOLD_SECONDS", "0")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "STOP_LOSS_PCT") { t.Fatalf("expected exit-control error, got %v", err) }
+}
+
 func TestValidateURLRejectsWrongSchemeAndRelativeURL(t *testing.T) {
 	if err := validateURL("https://rpc.example", "http", "https"); err != nil {
 		t.Fatalf("expected valid HTTPS URL: %v", err)

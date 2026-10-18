@@ -12,8 +12,8 @@ import (
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
 	Simulation, EnableLiveTrading                                                                                                                                                                           bool
-	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct                                                      float64
-	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds                                                                  int
+	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct                                         float64
+	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
 	RPCEndpoints                                                                                                                                                                                            []string
 }
 
@@ -91,6 +91,12 @@ func Load() (Config, error) {
 	if c.TakeProfitGrossPct, err = floatEnv("TAKE_PROFIT_GROSS_PCT", 70); err != nil {
 		return c, err
 	}
+	if c.StopLossPct, err = floatEnv("STOP_LOSS_PCT", 0); err != nil {
+		return c, err
+	}
+	if c.MaxHoldSeconds, err = intEnv("MAX_HOLD_SECONDS", 0); err != nil {
+		return c, err
+	}
 	if strings.TrimSpace(c.HTTPAddr) == "" || (c.DatabaseURL == "" && strings.TrimSpace(c.DatabasePath) == "") || strings.TrimSpace(c.PumpPortalURL) == "" || strings.TrimSpace(c.PumpPortalWS) == "" || len(c.RPCEndpoints) == 0 {
 		return c, fmt.Errorf("HTTP_ADDR, DATABASE_URL (or DATABASE_PATH locally), PumpPortal URLs and at least one RPC endpoint are required")
 	}
@@ -114,16 +120,19 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("RPC_ENDPOINTS: %w", err)
 		}
 	}
-	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 {
+	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 {
 		return c, fmt.Errorf("queue, position, attempt, wait and RPC health-check interval limits must be positive; token age cannot be negative")
 	}
-	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.TakeProfitGrossPct} {
+	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.TakeProfitGrossPct, c.StopLossPct} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}
 	}
-	if !c.Simulation && (!c.EnableLiveTrading || c.PrivateKey == "" || c.KeyProviderRef == "" || c.WalletPublicAddress == "") {
-		return c, fmt.Errorf("live trading requires ENABLE_LIVE_TRADING=true, BOT_PRIVATE_KEY via KEY_PROVIDER_REF and WALLET_PUBLIC_ADDRESS")
+	if !c.Simulation && (!c.EnableLiveTrading || c.PrivateKey == "" || c.KeyProviderRef == "" || c.WalletPublicAddress == "" || c.PumpPortalKey == "") {
+		return c, fmt.Errorf("live trading requires ENABLE_LIVE_TRADING=true, BOT_PRIVATE_KEY via KEY_PROVIDER_REF, WALLET_PUBLIC_ADDRESS and PUMPPORTAL_API_KEY")
+	}
+	if !c.Simulation && (c.StopLossPct <= 0 || c.MaxHoldSeconds <= 0) {
+		return c, fmt.Errorf("live trading requires STOP_LOSS_PCT > 0 and MAX_HOLD_SECONDS > 0")
 	}
 	if c.Simulation && c.EnableLiveTrading {
 		return c, fmt.Errorf("SIMULATION=true and ENABLE_LIVE_TRADING=true cannot be enabled together")

@@ -2,7 +2,7 @@
 .env
 .env.*
 !.env.example
-
+.gocache
 # Local SQLite data and its journal/WAL files.
 data/
 *.db
