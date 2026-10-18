@@ -1,0 +1,690 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: |
+    Front-end contract for the independently hosted Solana Sniper Bot Go API.
+    Nullable fields mean unavailable/unknown. The browser never signs trades
+    or receives private keys.
+servers:
+  - url: /api
+    description: Go API base path; configurable with VITE_API_BASE_URL.
+tags:
+  - name: health
+  - name: dashboard
+  - name: tokens
+  - name: positions
+  - name: trades
+  - name: rpcs
+  - name: config
+  - name: wallet
+  - name: logs
+  - name: bot
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Check the workspace API server
+      responses:
+        "200":
+          description: Workspace API process health
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /health:
+    get:
+      operationId: getHealth
+      tags: [health]
+      summary: Get API and event monitor health
+      responses:
+        "200":
+          description: Health state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /dashboard:
+    get:
+      operationId: getDashboard
+      tags: [dashboard]
+      summary: Get current dashboard aggregates
+      responses:
+        "200":
+          description: Backend-provided dashboard data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dashboard"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /tokens:
+    get:
+      operationId: getTokens
+      tags: [tokens]
+      summary: List detected tokens
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/TokenStatus"
+        - name: mint
+          in: query
+          schema: { type: string }
+        - name: detectedFrom
+          in: query
+          schema: { type: string, format: date-time }
+        - name: detectedTo
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: Token page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPage"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /positions:
+    get:
+      operationId: getPositions
+      tags: [positions]
+      summary: List open and historical positions
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: status
+          in: query
+          schema: { type: string, enum: [open, closing, closed, failed] }
+      responses:
+        "200":
+          description: Position page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PositionPage"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /positions/{positionId}/sell:
+    post:
+      operationId: requestPositionSell
+      tags: [positions]
+      summary: Submit a manual sale request to the backend
+      parameters:
+        - name: positionId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SellRequest"
+      responses:
+        "202":
+          description: Request accepted for backend processing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /trades:
+    get:
+      operationId: getTrades
+      tags: [trades]
+      summary: List trade history
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: mint
+          in: query
+          schema: { type: string }
+        - name: result
+          in: query
+          schema: { type: string, enum: [positive, negative, break_even, unknown] }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: Trade page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradePage"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /rpcs:
+    get:
+      operationId: getRpcs
+      tags: [rpcs]
+      summary: Get configured RPC endpoints and observed metrics
+      responses:
+        "200":
+          description: RPC status list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RpcEndpoint"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /rpcs/test:
+    post:
+      operationId: testRpc
+      tags: [rpcs]
+      summary: Ask the backend to test an RPC endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RpcTestRequest"
+      responses:
+        "202":
+          description: Test request accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /rpcs/select:
+    post:
+      operationId: selectRpc
+      tags: [rpcs]
+      summary: Select or deactivate an RPC endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RpcSelection"
+      responses:
+        "200":
+          description: Selection accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /config:
+    get:
+      operationId: getConfig
+      tags: [config]
+      summary: Get accepted strategy configuration
+      responses:
+        "200":
+          description: Current strategy configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StrategyConfig"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      operationId: saveConfig
+      tags: [config]
+      summary: Submit strategy settings for backend validation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StrategyConfigInput"
+      responses:
+        "200":
+          description: Configuration accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StrategyConfig"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /wallet:
+    get:
+      operationId: getWallet
+      tags: [wallet]
+      summary: Get public operational wallet state only
+      description: Response must never contain a private key, seed phrase, or credential.
+      responses:
+        "200":
+          description: Public wallet information
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Wallet"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /logs:
+    get:
+      operationId: getLogs
+      tags: [logs]
+      summary: List diagnostic and audit events
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: category
+          in: query
+          schema: { type: string }
+        - name: severity
+          in: query
+          schema: { type: string, enum: [debug, info, warning, error, critical] }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: Log page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogPage"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /bot/start:
+    post:
+      operationId: startBot
+      tags: [bot]
+      summary: Request bot start
+      responses:
+        "202":
+          description: Start request accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotActionResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /bot/stop:
+    post:
+      operationId: stopBot
+      tags: [bot]
+      summary: Stop new operations without closing existing positions
+      responses:
+        "202":
+          description: Stop request accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotActionResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /bot/pause:
+    post:
+      operationId: pauseBot
+      tags: [bot]
+      summary: Pause new purchases
+      responses:
+        "202":
+          description: Pause request accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotActionResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /bot/resume:
+    post:
+      operationId: resumeBot
+      tags: [bot]
+      summary: Resume the strategy
+      responses:
+        "202":
+          description: Resume request accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotActionResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /bot/mode:
+    post:
+      operationId: setBotMode
+      tags: [bot]
+      summary: Request simulation or real operating mode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotModeRequest"
+      responses:
+        "200":
+          description: Mode request result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotActionResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+components:
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+  responses:
+    BadRequest:
+      description: Invalid input
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    Conflict:
+      description: Action conflicts with current backend state
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    ServiceUnavailable:
+      description: API or required dependency unavailable
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status, eventMonitorStatus, checkedAt]
+      properties:
+        status: { type: string, enum: [ok, degraded, unavailable] }
+        eventMonitorStatus: { type: string, enum: [connected, disconnected, unavailable, unknown] }
+        checkedAt: { type: string, format: date-time }
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        message: { type: ["string", "null"] }
+        code: { type: ["string", "null"] }
+    BotStatus:
+      type: string
+      enum: [stopped, starting, running, paused, stopping, error, unknown]
+    BotMode:
+      type: string
+      enum: [simulation, real, unknown]
+    BotActionResult:
+      type: object
+      required: [accepted, botStatus, mode]
+      properties:
+        accepted: { type: boolean }
+        botStatus: { $ref: "#/components/schemas/BotStatus" }
+        mode: { $ref: "#/components/schemas/BotMode" }
+        message: { type: ["string", "null"] }
+    Dashboard:
+      type: object
+      required: [botStatus, mode, walletBalanceSol, walletBalanceLow, feesReserveSol, detectedTokens, analyzedTokens, tradesCount, openPositions, realizedPnlSol, estimatedOpenPnlSol, netPnlSol, costsSol, cumulativeResult, tradesByPeriod, balanceHistory, recentTrades]
+      properties:
+        botStatus: { $ref: "#/components/schemas/BotStatus" }
+        mode: { $ref: "#/components/schemas/BotMode" }
+        walletBalanceSol: { type: ["number", "null"] }
+        walletBalanceLow: { type: ["boolean", "null"], description: Backend-calculated low balance warning; do not infer a threshold in the browser. }
+        feesReserveSol: { type: ["number", "null"] }
+        detectedTokens: { type: ["integer", "null"] }
+        analyzedTokens: { type: ["integer", "null"] }
+        tradesCount: { type: ["integer", "null"] }
+        openPositions: { type: ["integer", "null"] }
+        realizedPnlSol: { type: ["number", "null"] }
+        estimatedOpenPnlSol: { type: ["number", "null"] }
+        netPnlSol: { type: ["number", "null"] }
+        costsSol: { type: ["number", "null"] }
+        cumulativeResult:
+          type: array
+          items: { $ref: "#/components/schemas/TimeValue" }
+        tradesByPeriod:
+          type: array
+          items: { $ref: "#/components/schemas/TradePeriod" }
+        balanceHistory:
+          type: array
+          items: { $ref: "#/components/schemas/TimeValue" }
+        recentTrades:
+          type: array
+          items: { $ref: "#/components/schemas/Trade" }
+    TimeValue:
+      type: object
+      required: [timestamp, value]
+      properties:
+        timestamp: { type: string, format: date-time }
+        value: { type: ["number", "null"] }
+    TradePeriod:
+      type: object
+      required: [period, total, positive, negative]
+      properties:
+        period: { type: string }
+        total: { type: ["integer", "null"] }
+        positive: { type: ["integer", "null"] }
+        negative: { type: ["integer", "null"] }
+    TokenStatus:
+      type: string
+      enum: [detected, analyzing, approved, rejected, buy_submitted, buy_confirmed, buy_failed, position_open, sell_submitted, sell_confirmed, unknown]
+    Token:
+      type: object
+      required: [id, detectedAt, name, symbol, mint, creatorWallet, analysisStatus, liquiditySol, tradeCount, riskResult, decisionReason, operationStatus]
+      properties:
+        id: { type: string }
+        detectedAt: { type: string, format: date-time }
+        name: { type: ["string", "null"] }
+        symbol: { type: ["string", "null"] }
+        mint: { type: string }
+        creatorWallet: { type: ["string", "null"] }
+        analysisStatus: { $ref: "#/components/schemas/TokenStatus" }
+        liquiditySol: { type: ["number", "null"] }
+        tradeCount: { type: ["integer", "null"] }
+        riskResult: { type: ["string", "null"] }
+        decisionReason: { type: ["string", "null"] }
+        operationStatus: { $ref: "#/components/schemas/TokenStatus" }
+    TokenPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Token" }
+        nextCursor: { type: ["string", "null"] }
+    Position:
+      type: object
+      required: [id, tokenName, symbol, mint, quantity, averageEntryPriceSol, buyValueSol, costsSol, estimatedValueSol, estimatedPnlSol, realizedPnlSol, openedAt, status, sellStatus]
+      properties:
+        id: { type: string }
+        tokenName: { type: ["string", "null"] }
+        symbol: { type: ["string", "null"] }
+        mint: { type: string }
+        quantity: { type: ["number", "null"] }
+        averageEntryPriceSol: { type: ["number", "null"] }
+        buyValueSol: { type: ["number", "null"] }
+        costsSol: { type: ["number", "null"] }
+        estimatedValueSol: { type: ["number", "null"] }
+        estimatedPnlSol: { type: ["number", "null"] }
+        realizedPnlSol: { type: ["number", "null"] }
+        openedAt: { type: ["string", "null"], format: date-time }
+        status: { type: string, enum: [open, closing, closed, failed, unknown] }
+        sellStatus: { type: string, enum: [not_requested, submitted, confirmed, failed, unknown] }
+    PositionPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Position" }
+        nextCursor: { type: ["string", "null"] }
+    SellRequest:
+      type: object
+      properties:
+        reason: { type: ["string", "null"] }
+    Trade:
+      type: object
+      required: [id, timestamp, tokenName, symbol, mint, side, quantity, buyValueSol, sellValueSol, feesSol, slippage, grossPnlSol, netPnlSol, transactionId, signature, status]
+      properties:
+        id: { type: string }
+        timestamp: { type: string, format: date-time }
+        tokenName: { type: ["string", "null"] }
+        symbol: { type: ["string", "null"] }
+        mint: { type: string }
+        side: { type: string, enum: [buy, sell] }
+        quantity: { type: ["number", "null"] }
+        buyValueSol: { type: ["number", "null"] }
+        sellValueSol: { type: ["number", "null"] }
+        feesSol: { type: ["number", "null"] }
+        slippage: { type: ["number", "null"] }
+        grossPnlSol: { type: ["number", "null"] }
+        netPnlSol: { type: ["number", "null"] }
+        transactionId: { type: ["string", "null"] }
+        signature: { type: ["string", "null"] }
+        status: { type: string, enum: [pending, submitted, confirmed, failed, unknown] }
+    TradePage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Trade" }
+        nextCursor: { type: ["string", "null"] }
+    RpcEndpoint:
+      type: object
+      required: [id, label, url, status, latencyMs, successRate, failureCount, lastTestAt, rateLimitErrors, readStatus, sendTestStatus, confirmationTestStatus, role]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        url: { type: string, description: Credentials must be redacted by the backend. }
+        status: { type: string, enum: [healthy, degraded, unavailable, untested, disabled, unknown] }
+        latencyMs: { type: ["number", "null"] }
+        successRate: { type: ["number", "null"] }
+        failureCount: { type: ["integer", "null"] }
+        lastTestAt: { type: ["string", "null"], format: date-time }
+        rateLimitErrors: { type: ["integer", "null"] }
+        readStatus: { type: string, enum: [passed, failed, untested, unavailable, unknown] }
+        sendTestStatus: { type: string, enum: [passed, failed, untested, unavailable, unknown] }
+        confirmationTestStatus: { type: string, enum: [passed, failed, untested, unavailable, unknown] }
+        role: { type: string, enum: [primary, backup, disabled, candidate, unknown] }
+    RpcTestRequest:
+      type: object
+      required: [endpointId]
+      properties:
+        endpointId: { type: string }
+        testType: { type: string, enum: [read, send, confirmation], default: read }
+    RpcSelection:
+      type: object
+      required: [endpointId, role]
+      properties:
+        endpointId: { type: string }
+        role: { type: string, enum: [primary, backup, disabled] }
+    ActionResult:
+      type: object
+      required: [accepted]
+      properties:
+        accepted: { type: boolean }
+        message: { type: ["string", "null"] }
+        requestId: { type: ["string", "null"] }
+    StrategyConfig:
+      type: object
+      required: [maxCapitalPerTradeSol, profitTargetPercent, maxLossPercent, maxSlippagePercent, priorityFeeSol, maxConcurrentPositions, maxHoldMinutes, dailyLossLimitSol, minFeeReserveSol, entryCriteria, exitCriteria, mode, updatedAt]
+      properties:
+        maxCapitalPerTradeSol: { type: ["number", "null"] }
+        profitTargetPercent: { type: ["number", "null"] }
+        maxLossPercent: { type: ["number", "null"] }
+        maxSlippagePercent: { type: ["number", "null"] }
+        priorityFeeSol: { type: ["number", "null"] }
+        maxConcurrentPositions: { type: ["integer", "null"] }
+        maxHoldMinutes: { type: ["integer", "null"] }
+        dailyLossLimitSol: { type: ["number", "null"] }
+        minFeeReserveSol: { type: ["number", "null"] }
+        entryCriteria: { type: object, additionalProperties: true }
+        exitCriteria: { type: object, additionalProperties: true }
+        mode: { $ref: "#/components/schemas/BotMode" }
+        updatedAt: { type: ["string", "null"], format: date-time }
+    StrategyConfigInput:
+      type: object
+      required: [maxCapitalPerTradeSol, profitTargetPercent, maxLossPercent, maxSlippagePercent, priorityFeeSol, maxConcurrentPositions, maxHoldMinutes, dailyLossLimitSol, minFeeReserveSol, entryCriteria, exitCriteria, mode]
+      properties:
+        maxCapitalPerTradeSol: { type: number, minimum: 0 }
+        profitTargetPercent: { type: number, minimum: 0 }
+        maxLossPercent: { type: number, minimum: 0 }
+        maxSlippagePercent: { type: number, minimum: 0, maximum: 100 }
+        priorityFeeSol: { type: number, minimum: 0 }
+        maxConcurrentPositions: { type: integer, minimum: 1 }
+        maxHoldMinutes: { type: integer, minimum: 1 }
+        dailyLossLimitSol: { type: number, minimum: 0 }
+        minFeeReserveSol: { type: number, minimum: 0 }
+        entryCriteria: { type: object, additionalProperties: true }
+        exitCriteria: { type: object, additionalProperties: true }
+        mode: { $ref: "#/components/schemas/BotMode" }
+    BotModeRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode: { $ref: "#/components/schemas/BotMode" }
+    Wallet:
+      type: object
+      required: [publicAddress, balanceSol, feesReserveSol, tokenHoldings, syncStatus, updatedAt]
+      properties:
+        publicAddress: { type: ["string", "null"] }
+        balanceSol: { type: ["number", "null"] }
+        feesReserveSol: { type: ["number", "null"] }
+        tokenHoldings:
+          type: array
+          items: { $ref: "#/components/schemas/WalletToken" }
+        syncStatus: { type: string, enum: [synced, syncing, stale, unavailable, unknown] }
+        updatedAt: { type: ["string", "null"], format: date-time }
+    WalletToken:
+      type: object
+      required: [mint, symbol, quantity]
+      properties:
+        mint: { type: string }
+        symbol: { type: ["string", "null"] }
+        quantity: { type: ["number", "null"] }
+    LogEntry:
+      type: object
+      required: [id, timestamp, category, severity, message]
+      properties:
+        id: { type: string }
+        timestamp: { type: string, format: date-time }
+        category: { type: string }
+        severity: { type: string, enum: [debug, info, warning, error, critical] }
+        message: { type: string }
+        details: { type: ["object", "null"], additionalProperties: true }
+    LogPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/LogEntry" }
+        nextCursor: { type: ["string", "null"] }
+
