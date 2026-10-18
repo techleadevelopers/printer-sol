@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -31,6 +32,30 @@ func TestLiveTradingRequiresSafetyConfiguration(t *testing.T) {
 	_ = os.Setenv("ADMIN_PASSWORD", "test-master-password")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected live trading validation error")
+	}
+}
+
+func TestLiveTradingRefusesLocalSimulationLedger(t *testing.T) {
+	keys := []string{"SIMULATION", "ENABLE_LIVE_TRADING", "BOT_PRIVATE_KEY", "KEY_PROVIDER_REF", "WALLET_PUBLIC_ADDRESS", "ADMIN_PASSWORD", "DATABASE_URL", "SIMULATION_DATABASE_URL", "REAL_DATABASE_URL", "DATABASE_PATH"}
+	old := map[string]string{}
+	for _, k := range keys {
+		old[k] = os.Getenv(k)
+		_ = os.Unsetenv(k)
+	}
+	defer func() {
+		for _, k := range keys {
+			_ = os.Setenv(k, old[k])
+		}
+	}()
+	_ = os.Setenv("SIMULATION", "false")
+	_ = os.Setenv("ENABLE_LIVE_TRADING", "true")
+	_ = os.Setenv("BOT_PRIVATE_KEY", "test-key")
+	_ = os.Setenv("KEY_PROVIDER_REF", "test-provider")
+	_ = os.Setenv("WALLET_PUBLIC_ADDRESS", "test-wallet")
+	_ = os.Setenv("ADMIN_PASSWORD", "test-master-password")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "separate SIMULATION_DATABASE_URL and REAL_DATABASE_URL") {
+		t.Fatalf("expected isolated-ledger error, got %v", err)
 	}
 }
 

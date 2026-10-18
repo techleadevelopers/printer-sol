@@ -177,6 +177,9 @@ func (d *DB) ListTokens() (*sql.Rows, error) {
 		ORDER BY e.id DESC LIMIT 200`), true)
 }
 func (d *DB) OpenSimulationPosition(mint string, amount float64) error {
+	return d.OpenPosition(mint, amount)
+}
+func (d *DB) OpenPosition(mint string, amount float64) error {
 	now := time.Now().UTC()
 	query := `INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,updated_at=excluded.updated_at`
@@ -184,23 +187,41 @@ func (d *DB) OpenSimulationPosition(mint string, amount float64) error {
 	return e
 }
 func (d *DB) RecordPaperMark(mint string, marketCapSOL float64) error {
+	return d.recordMark("paper_marks", mint, marketCapSOL)
+}
+func (d *DB) RecordLiveMark(mint string, marketCapSOL float64) error {
+	return d.recordMark("live_marks", mint, marketCapSOL)
+}
+func (d *DB) recordMark(table, mint string, marketCapSOL float64) error {
 	if marketCapSOL <= 0 {
 		return nil
 	}
 	now := time.Now().UTC()
-	_, e := d.Exec(d.bind(`INSERT INTO paper_marks(mint,entry_market_cap_sol,current_market_cap_sol,updated_at) VALUES(?,?,?,?) ON CONFLICT(mint) DO NOTHING`), mint, marketCapSOL, marketCapSOL, now)
+	_, e := d.Exec(d.bind(`INSERT INTO `+table+`(mint,entry_market_cap_sol,current_market_cap_sol,updated_at) VALUES(?,?,?,?) ON CONFLICT(mint) DO NOTHING`), mint, marketCapSOL, marketCapSOL, now)
 	return e
 }
 func (d *DB) UpdatePaperMark(mint string, marketCapSOL float64) error {
+	return d.updateMark("paper_marks", mint, marketCapSOL)
+}
+func (d *DB) UpdateLiveMark(mint string, marketCapSOL float64) error {
+	return d.updateMark("live_marks", mint, marketCapSOL)
+}
+func (d *DB) updateMark(table, mint string, marketCapSOL float64) error {
 	if marketCapSOL <= 0 {
 		return nil
 	}
-	_, e := d.Exec(d.bind(`UPDATE paper_marks SET current_market_cap_sol=?,updated_at=? WHERE mint=?`), marketCapSOL, time.Now().UTC(), mint)
+	_, e := d.Exec(d.bind(`UPDATE `+table+` SET current_market_cap_sol=?,updated_at=? WHERE mint=?`), marketCapSOL, time.Now().UTC(), mint)
 	return e
 }
 func (d *DB) PaperReturnPct(mint string) (float64, bool, error) {
+	return d.markReturnPct("paper_marks", mint)
+}
+func (d *DB) LiveReturnPct(mint string) (float64, bool, error) {
+	return d.markReturnPct("live_marks", mint)
+}
+func (d *DB) markReturnPct(table, mint string) (float64, bool, error) {
 	var entry, current float64
-	e := d.QueryRow(d.bind(`SELECT entry_market_cap_sol,current_market_cap_sol FROM paper_marks WHERE mint=?`), mint).Scan(&entry, &current)
+	e := d.QueryRow(d.bind(`SELECT entry_market_cap_sol,current_market_cap_sol FROM `+table+` WHERE mint=?`), mint).Scan(&entry, &current)
 	if e == sql.ErrNoRows {
 		return 0, false, nil
 	}
@@ -218,6 +239,9 @@ func (d *DB) PositionCost(mint string) (float64, error) {
 	return cost, e
 }
 func (d *DB) CloseSimulationPosition(mint string, value float64) (float64, error) {
+	return d.ClosePosition(mint)
+}
+func (d *DB) ClosePosition(mint string) (float64, error) {
 	tx, e := d.Begin()
 	if e != nil {
 		return 0, e

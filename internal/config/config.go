@@ -10,21 +10,41 @@ import (
 )
 
 type Config struct {
-	HTTPAddr, DatabaseURL, DatabasePath, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
-	Simulation, EnableLiveTrading                                                                                                   bool
-	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct float64
-	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds int
-	RPCEndpoints                                                                                                                    []string
+	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
+	Simulation, EnableLiveTrading                                                                                                                                                                           bool
+	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct                                                      float64
+	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds                                                                  int
+	RPCEndpoints                                                                                                                                                                                            []string
 }
 
 func Load() (Config, error) {
-	c := Config{HTTPAddr: env("HTTP_ADDR", ":8080"), DatabaseURL: strings.TrimSpace(os.Getenv("DATABASE_URL")), DatabasePath: env("DATABASE_PATH", "./data/sniper.db"), PrivateKey: os.Getenv("BOT_PRIVATE_KEY"), KeyProviderRef: os.Getenv("KEY_PROVIDER_REF"), WalletPublicAddress: os.Getenv("WALLET_PUBLIC_ADDRESS"), PumpPortalKey: os.Getenv("PUMPPORTAL_API_KEY"), AdminPassword: os.Getenv("ADMIN_PASSWORD"), PumpPortalURL: env("PUMPPORTAL_URL", "https://pumpportal.fun/api/trade-local"), PumpPortalWS: env("PUMPPORTAL_WS", "wss://pumpportal.fun/api/data"), SOLUSDPriceURL: env("SOL_USD_PRICE_URL", "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"), RPCEndpoints: splitEndpoints(env("RPC_ENDPOINTS", "https://api.mainnet.solana.com,https://solana-rpc.publicnode.com"))}
+	c := Config{HTTPAddr: env("HTTP_ADDR", ":8080"), DatabaseURL: strings.TrimSpace(os.Getenv("DATABASE_URL")), DatabasePath: env("DATABASE_PATH", "./data/sniper.db"), SimulationDatabaseURL: strings.TrimSpace(os.Getenv("SIMULATION_DATABASE_URL")), RealDatabaseURL: strings.TrimSpace(os.Getenv("REAL_DATABASE_URL")), PrivateKey: os.Getenv("BOT_PRIVATE_KEY"), KeyProviderRef: os.Getenv("KEY_PROVIDER_REF"), WalletPublicAddress: os.Getenv("WALLET_PUBLIC_ADDRESS"), PumpPortalKey: os.Getenv("PUMPPORTAL_API_KEY"), AdminPassword: os.Getenv("ADMIN_PASSWORD"), PumpPortalURL: env("PUMPPORTAL_URL", "https://pumpportal.fun/api/trade-local"), PumpPortalWS: env("PUMPPORTAL_WS", "wss://pumpportal.fun/api/data"), SOLUSDPriceURL: env("SOL_USD_PRICE_URL", "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"), RPCEndpoints: splitEndpoints(env("RPC_ENDPOINTS", "https://api.mainnet.solana.com,https://solana-rpc.publicnode.com"))}
 	var err error
 	if c.Simulation, err = boolEnv("SIMULATION", true); err != nil {
 		return c, err
 	}
 	if c.EnableLiveTrading, err = boolEnv("ENABLE_LIVE_TRADING", false); err != nil {
 		return c, err
+	}
+	if c.SimulationDatabaseURL != "" || c.RealDatabaseURL != "" {
+		if c.SimulationDatabaseURL == "" || c.RealDatabaseURL == "" {
+			return c, fmt.Errorf("SIMULATION_DATABASE_URL and REAL_DATABASE_URL must both be set")
+		}
+		if c.SimulationDatabaseURL == c.RealDatabaseURL {
+			return c, fmt.Errorf("simulation and real databases must be different")
+		}
+		c.DatabaseURL = c.RealDatabaseURL
+		if c.Simulation {
+			c.DatabaseURL = c.SimulationDatabaseURL
+		}
+		c.DatabasePath = ""
+	} else if c.DatabaseURL != "" {
+		return c, fmt.Errorf("DATABASE_URL cannot be shared between simulation and real modes; configure SIMULATION_DATABASE_URL and REAL_DATABASE_URL")
+	} else if !c.Simulation {
+		// A local SQLite fallback is convenient for paper trading, but it must
+		// never become the live ledger: it could contain simulated positions,
+		// P&L, and trade history from a previous run.
+		return c, fmt.Errorf("live trading requires separate SIMULATION_DATABASE_URL and REAL_DATABASE_URL; DATABASE_PATH is simulation-only")
 	}
 	if c.MaxTradeSOL, err = floatEnv("MAX_TRADE_SOL", .05); err != nil {
 		return c, err

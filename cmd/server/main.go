@@ -16,8 +16,8 @@ import (
 	"solana-sniper-backend/internal/events"
 	"solana-sniper-backend/internal/execution"
 	"solana-sniper-backend/internal/logging"
-	"solana-sniper-backend/internal/pumpportal"
 	"solana-sniper-backend/internal/pricefeed"
+	"solana-sniper-backend/internal/pumpportal"
 	"solana-sniper-backend/internal/rpcmanager"
 	"solana-sniper-backend/internal/strategy"
 	"solana-sniper-backend/internal/tokenmonitor"
@@ -60,7 +60,7 @@ func main() {
 	prices := pricefeed.New(cfg.SOLUSDPriceURL)
 	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, cfg.SimulationBalanceSOL, controller, bus, limits)
 	strat := strategy.New(db, time.Duration(cfg.TokenMaxAgeSeconds)*time.Second)
-	monitor := tokenmonitor.New(cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine, cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL, cfg.TakeProfitGrossPct, bus, log)
+	monitor := tokenmonitor.New(cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine, cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL, cfg.TakeProfitGrossPct, cfg.Simulation, bus, log)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	startupRPC, startupCancel := context.WithTimeout(ctx, 12*time.Second)

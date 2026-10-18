@@ -8,8 +8,8 @@ import (
 	"solana-sniper-backend/internal/bot"
 	"solana-sniper-backend/internal/database"
 	"solana-sniper-backend/internal/events"
-	"solana-sniper-backend/internal/pumpportal"
 	"solana-sniper-backend/internal/pricefeed"
+	"solana-sniper-backend/internal/pumpportal"
 	"solana-sniper-backend/internal/rpcmanager"
 	"solana-sniper-backend/internal/wallet"
 	"sync"
@@ -22,33 +22,34 @@ type Request struct {
 	DenominatedInSOL      bool
 	Slippage, PriorityFee float64
 	Pool, Reason          string
+	SellAll               bool
 }
 type Limits struct {
 	MaxTradeSOL, MaxExposureSOL, MaxDailyLossSOL, MaxSlippagePct, MaxPriorityFeeSOL, FeeReserveSOL float64
 	MaxOpenPositions, MaxWaitSeconds, MaxAttempts                                                  int
 }
 type Engine struct {
-	db         *database.DB
-	wallet     *wallet.Wallet
-	portal     *pumpportal.Client
-	rpcs       *rpcmanager.Manager
-	prices     pricefeed.Provider
-	log        *zap.Logger
-	simulation bool
+	db                *database.DB
+	wallet            *wallet.Wallet
+	portal            *pumpportal.Client
+	rpcs              *rpcmanager.Manager
+	prices            pricefeed.Provider
+	log               *zap.Logger
+	simulation        bool
 	simulationBalance uint64
-	controller *bot.Controller
-	bus        *events.Bus
-	mu         sync.RWMutex
-	limits     Limits
-	reserved   map[string]uint64
+	controller        *bot.Controller
+	bus               *events.Bus
+	mu                sync.RWMutex
+	limits            Limits
+	reserved          map[string]uint64
 }
 
 func New(db *database.DB, w *wallet.Wallet, p *pumpportal.Client, r *rpcmanager.Manager, prices pricefeed.Provider, l *zap.Logger, sim bool, simulationBalanceSOL float64, c *bot.Controller, b *events.Bus, limits Limits) *Engine {
 	balance, _ := wallet.SOLToLamports(simulationBalanceSOL)
 	return &Engine{db: db, wallet: w, portal: p, rpcs: r, prices: prices, log: l, simulation: sim, simulationBalance: balance, controller: c, bus: b, limits: limits, reserved: make(map[string]uint64)}
 }
-func (e *Engine) Limits() Limits     { e.mu.RLock(); defer e.mu.RUnlock(); return e.limits }
-func (e *Engine) SetLimits(l Limits) { e.mu.Lock(); e.limits = l; e.mu.Unlock() }
+func (e *Engine) Limits() Limits                { e.mu.RLock(); defer e.mu.RUnlock(); return e.limits }
+func (e *Engine) SetLimits(l Limits)            { e.mu.Lock(); e.limits = l; e.mu.Unlock() }
 func (e *Engine) SimulationBalanceSOL() float64 { return float64(e.simulationBalance) / 1e9 }
 func (e *Engine) emit(kind string, data any) {
 	if e.bus != nil {
@@ -97,15 +98,33 @@ func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage,
 	}
 	return id, nil
 }
+
 // ClosePaperPosition records a virtual sale at the live market-marked value.
 // It is intentionally unavailable outside simulation mode.
 func (e *Engine) ClosePaperPosition(ctx context.Context, mint string, returnPct float64, reason string) (string, error) {
-	if !e.simulation { return "", fmt.Errorf("paper exits are only available in simulation") }
+	if !e.simulation {
+		return "", fmt.Errorf("paper exits are only available in simulation")
+	}
 	cost, err := e.db.PositionCost(mint)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	value := cost * (1 + returnPct/100)
-	if value <= 0 { return "", fmt.Errorf("invalid paper exit value") }
+	if value <= 0 {
+		return "", fmt.Errorf("invalid paper exit value")
+	}
 	return e.Execute(ctx, Request{Mint: mint, Side: "sell", Amount: value, DenominatedInSOL: true, Reason: reason})
+}
+
+// CloseLivePosition sells the full balance of a confirmed live position.
+func (e *Engine) CloseLivePosition(ctx context.Context, mint string, slippage, priorityFee float64, reason string) (string, error) {
+	if e.simulation {
+		return "", fmt.Errorf("live exits are unavailable in simulation")
+	}
+	if _, err := e.db.PositionCost(mint); err != nil {
+		return "", fmt.Errorf("live position is not confirmed: %w", err)
+	}
+	return e.Execute(ctx, Request{Mint: mint, Side: "sell", Amount: 100, DenominatedInSOL: false, Slippage: slippage, PriorityFee: priorityFee, Pool: "auto", Reason: reason, SellAll: true})
 }
 
 func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error {
@@ -131,9 +150,13 @@ func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error 
 		reserved += v
 	}
 	exposure, err := e.db.OpenExposureSOL()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	openCost, err := wallet.SOLToLamports(exposure)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	if balance < reserve+openCost+reserved+needed {
 		return fmt.Errorf("insufficient free wallet balance after fee reserve and pending entries")
 	}
@@ -265,14 +288,22 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 			}
 		} else {
 			cost, err := e.db.CloseSimulationPosition(r.Mint, r.Amount)
-			if err != nil { return id, fmt.Errorf("close simulated position: %w", err) }
-			if err = e.db.SetTradePnl(id, r.Amount, r.Amount-cost); err != nil { return id, fmt.Errorf("record simulated profit: %w", err) }
+			if err != nil {
+				return id, fmt.Errorf("close simulated position: %w", err)
+			}
+			if err = e.db.SetTradePnl(id, r.Amount, r.Amount-cost); err != nil {
+				return id, fmt.Errorf("record simulated profit: %w", err)
+			}
 		}
 		e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "simulation": true})
 		e.emit("position_updated", map[string]any{"mint": r.Mint, "sourceTradeId": id, "action": r.Side, "state": "simulated"})
 		return id, nil
 	}
-	txBytes, err := e.portal.Prepare(ctx, pumpportal.Request{PublicKey: e.wallet.Address(), Action: r.Side, Mint: r.Mint, Amount: r.Amount, DenominatedInSOL: fmt.Sprint(r.DenominatedInSOL), Slippage: r.Slippage, PriorityFee: r.PriorityFee, Pool: r.Pool})
+	amount := any(r.Amount)
+	if r.SellAll {
+		amount = "100%"
+	}
+	txBytes, err := e.portal.Prepare(ctx, pumpportal.Request{PublicKey: e.wallet.Address(), Action: r.Side, Mint: r.Mint, Amount: amount, DenominatedInSOL: fmt.Sprint(r.DenominatedInSOL), Slippage: r.Slippage, PriorityFee: r.PriorityFee, Pool: r.Pool})
 	if err != nil {
 		_ = e.db.UpdateTradeState(id, "failed", "", false)
 		return id, err
@@ -314,10 +345,10 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	}
 	_ = e.db.UpdateTradeState(id, "submitted", signature, false)
 	e.emit(r.Side+"_sent", map[string]any{"tradeId": id, "mint": r.Mint, "signature": signature})
-	go e.confirm(id, signature, r.Side, r.Mint)
+	go e.confirm(id, signature, r)
 	return id, nil
 }
-func (e *Engine) confirm(id, sig, side, mint string) {
+func (e *Engine) confirm(id, sig string, r Request) {
 	wait := e.Limits().MaxWaitSeconds
 	if wait < 1 {
 		wait = 45
@@ -332,14 +363,19 @@ func (e *Engine) confirm(id, sig, side, mint string) {
 			switch state {
 			case "confirmed", "finalized":
 				_ = e.db.UpdateTradeState(id, state, sig, true)
-				e.release(mint)
-				e.emit(side+"_confirmed", map[string]any{"tradeId": id, "mint": mint, "signature": sig, "state": state})
-				e.emit("position_updated", map[string]any{"mint": mint, "sourceTradeId": id, "action": side, "state": state})
+				if r.Side == "buy" {
+					_ = e.db.OpenPosition(r.Mint, r.Amount)
+				} else {
+					_, _ = e.db.ClosePosition(r.Mint)
+				}
+				e.release(r.Mint)
+				e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "signature": sig, "state": state})
+				e.emit("position_updated", map[string]any{"mint": r.Mint, "sourceTradeId": id, "action": r.Side, "state": state})
 				return
 			case "failed":
 				_ = e.db.UpdateTradeState(id, "failed", sig, true)
-				e.release(mint)
-				e.emit(side+"_failed", map[string]any{"tradeId": id, "mint": mint, "signature": sig})
+				e.release(r.Mint)
+				e.emit(r.Side+"_failed", map[string]any{"tradeId": id, "mint": r.Mint, "signature": sig})
 				return
 			}
 			_ = e.db.UpdateTradeState(id, "pending", sig, false)

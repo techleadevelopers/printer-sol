@@ -69,7 +69,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	monitorState := "disconnected"
-	if s.monitor != nil && s.monitor.Connected() { monitorState = "connected" }
+	if s.monitor != nil && s.monitor.Connected() {
+		monitorState = "connected"
+	}
 	write(w, 200, map[string]any{"status": "ok", "eventMonitorStatus": monitorState, "checkedAt": time.Now().UTC()})
 }
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -77,12 +79,14 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	positions, _ := s.db.OpenPositionCount()
-	exposure, _ := s.db.OpenExposureSOL()
 	detected, _ := s.db.TokenEventCount()
-	openPnl, _ := s.db.PaperOpenPnlSOL()
+	openPnl := 0.0
+	if s.cfg.Simulation {
+		openPnl, _ = s.db.PaperOpenPnlSOL()
+	}
 	realizedPnl, _ := s.db.RealizedPnlSOL()
 	trades := s.tradeItems()
-	balance := s.balanceSOL(exposure)
+	balance := s.balanceSOL(openPnl)
 	now := time.Now().UTC()
 	write(w, 200, map[string]any{"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance, "walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "detectedTokens": detected, "analyzedTokens": detected, "tradesCount": len(trades), "openPositions": positions, "realizedPnlSol": realizedPnl, "estimatedOpenPnlSol": openPnl, "netPnlSol": realizedPnl, "costsSol": 0.0, "cumulativeResult": []map[string]any{{"timestamp": now, "value": realizedPnl}}, "tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": len(trades), "positive": 0, "negative": 0}}, "balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades})
 }
@@ -123,8 +127,10 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 		if rows.Scan(&mint, &q, &cost, &status, &opened, &updated, &entryMarketCap, &currentMarketCap) == nil {
 			quantity, _ := strconv.ParseFloat(q, 64)
 			value := cost
-			if entryMarketCap > 0 && currentMarketCap > 0 { value = cost * currentMarketCap / entryMarketCap }
-			out = append(out, map[string]any{"id": mint, "tokenName": nil, "symbol": nil, "mint": mint, "quantity": quantity, "averageEntryPriceSol": cost, "buyValueSol": cost, "costsSol": 0.0, "estimatedValueSol": value, "estimatedPnlSol": value-cost, "realizedPnlSol": nil, "openedAt": opened, "status": status, "sellStatus": "not_requested"})
+			if entryMarketCap > 0 && currentMarketCap > 0 {
+				value = cost * currentMarketCap / entryMarketCap
+			}
+			out = append(out, map[string]any{"id": mint, "tokenName": nil, "symbol": nil, "mint": mint, "quantity": quantity, "averageEntryPriceSol": cost, "buyValueSol": cost, "costsSol": 0.0, "estimatedValueSol": value, "estimatedPnlSol": value - cost, "realizedPnlSol": nil, "openedAt": opened, "status": status, "sellStatus": "not_requested"})
 		}
 	}
 	write(w, 200, map[string]any{"items": out})
@@ -137,44 +143,70 @@ func (s *Server) trades(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) tradeItems() []map[string]any {
 	rows, err := s.db.ListTrades()
-	if err != nil { return []map[string]any{} }
+	if err != nil {
+		return []map[string]any{}
+	}
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
 		var id, mint, side, quantityText, signature, state, createdAt string
 		var requested, executed, fees, slippage float64
 		var realized sql.NullFloat64
-		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &fees, &slippage, &signature, &state, &createdAt, &realized); err != nil { continue }
+		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &fees, &slippage, &signature, &state, &createdAt, &realized); err != nil {
+			continue
+		}
 		quantity, _ := strconv.ParseFloat(quantityText, 64)
 		status := state
-		if state == "simulated" || state == "finalized" { status = "confirmed" }
-		if status != "pending" && status != "submitted" && status != "confirmed" && status != "failed" { status = "unknown" }
+		if state == "simulated" || state == "finalized" {
+			status = "confirmed"
+		}
+		if status != "pending" && status != "submitted" && status != "confirmed" && status != "failed" {
+			status = "unknown"
+		}
 		item := map[string]any{"id": id, "timestamp": createdAt, "tokenName": nil, "symbol": nil, "mint": mint, "side": side, "quantity": quantity, "buyValueSol": nil, "sellValueSol": nil, "feesSol": fees, "slippage": slippage, "grossPnlSol": nil, "netPnlSol": nil, "transactionId": nil, "signature": nil, "status": status}
-		if side == "buy" { item["buyValueSol"] = requested } else { item["sellValueSol"] = requested }
-		if realized.Valid { item["grossPnlSol"] = realized.Float64; item["netPnlSol"] = realized.Float64-fees }
-		if signature != "" { item["transactionId"] = signature; item["signature"] = signature }
+		if side == "buy" {
+			item["buyValueSol"] = requested
+		} else {
+			item["sellValueSol"] = requested
+		}
+		if realized.Valid {
+			item["grossPnlSol"] = realized.Float64
+			item["netPnlSol"] = realized.Float64 - fees
+		}
+		if signature != "" {
+			item["transactionId"] = signature
+			item["signature"] = signature
+		}
 		items = append(items, item)
 	}
 	return items
 }
 func (s *Server) mode() string {
-	if s.cfg.Simulation { return "simulation" }
+	if s.cfg.Simulation {
+		return "simulation"
+	}
 	return "real"
 }
-func (s *Server) balanceSOL(exposure float64) float64 {
+func (s *Server) balanceSOL(openPnl float64) float64 {
 	if s.cfg.Simulation {
 		realized, _ := s.db.RealizedPnlSOL()
-		// This is total paper equity, not the free buying power. Open positions
-		// remain part of the virtual portfolio, so a 1 SOL simulation starts at
-		// 1 SOL on the dashboard even after entries have been opened.
-		balance := s.engine.SimulationBalanceSOL() + realized
-		if balance < 0 { return 0 }
+		// Paper equity carries forward across restarts: initial virtual capital
+		// plus persisted realized P&L and the live mark-to-market of open paper
+		// positions. The starting balance is never reapplied per trade.
+		balance := s.engine.SimulationBalanceSOL() + realized + openPnl
+		if balance < 0 {
+			return 0
+		}
 		return balance
 	}
-	if s.wallet.Address() == "" || !s.rpcs.Available() { return 0 }
+	if s.wallet.Address() == "" || !s.rpcs.Available() {
+		return 0
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if lamports, err := s.rpcs.Balance(ctx, s.wallet.Address()); err == nil { return float64(lamports) / 1e9 }
+	if lamports, err := s.rpcs.Balance(ctx, s.wallet.Address()); err == nil {
+		return float64(lamports) / 1e9
+	}
 	return 0
 }
 func (s *Server) rpcsList(w http.ResponseWriter, r *http.Request) {
@@ -214,7 +246,10 @@ func (s *Server) walletInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result := map[string]any{"publicAddress": s.wallet.Address(), "balanceSol": nil, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "tokenHoldings": []any{}, "syncStatus": "synced", "updatedAt": time.Now().UTC()}
-	if s.cfg.Simulation { result["publicAddress"] = nil; result["balanceSol"] = s.balanceSOL(0) }
+	if s.cfg.Simulation {
+		result["publicAddress"] = nil
+		result["balanceSol"] = s.balanceSOL(0)
+	}
 	if s.wallet.Address() != "" && s.rpcs.Available() {
 		ctx, c := context.WithTimeout(r.Context(), 5*time.Second)
 		defer c()
@@ -236,9 +271,15 @@ func (s *Server) admin(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	if !method(w, r, "POST") { return }
-	var body struct { Password string `json:"password"` }
-	if !decode(w, r, &body) { return }
+	if !method(w, r, "POST") {
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
 	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(s.cfg.AdminPassword)) != 1 {
 		fail(w, http.StatusUnauthorized, "invalid_credentials", "invalid master password")
 		return

@@ -31,6 +31,7 @@ type Event struct {
 type Entrier interface {
 	BuyNewTokenUSD(context.Context, string, float64, float64, float64, string, string) (string, error)
 	ClosePaperPosition(context.Context, string, float64, string) (string, error)
+	CloseLivePosition(context.Context, string, float64, float64, string) (string, error)
 }
 type Monitor struct {
 	ws, key                         string
@@ -42,19 +43,27 @@ type Monitor struct {
 	entry                           Entrier
 	tradeUSD, slippage, priorityFee float64
 	takeProfit                      float64
+	simulation                      bool
 	subscriptions                   chan string
 	tracked                         sync.Map
 	seen                            sync.Map
 	connected                       atomic.Bool
 }
 
-func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit float64, b *events.Bus, l *zap.Logger) *Monitor {
-	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, subscriptions: make(chan string, size), bus: b, log: l}
+func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit float64, simulation bool, b *events.Bus, l *zap.Logger) *Monitor {
+	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, simulation: simulation, subscriptions: make(chan string, size), bus: b, log: l}
 }
 func (m *Monitor) Run(ctx context.Context) {
 	// Tracked mints are in-memory subscriptions. Restore them after a restart
 	// so persisted simulation positions keep receiving live price marks and can
 	// be closed when their take-profit is reached.
+	if !m.simulation {
+		// Paper marks and their virtual take-profit exits must never be restored
+		// or processed by a live worker.
+		go m.consume(ctx)
+		m.runConnections(ctx)
+		return
+	}
 	if mints, err := m.db.OpenPositionMints(); err != nil {
 		m.log.Warn("restore simulated positions", zap.Error(err))
 	} else {
@@ -66,6 +75,9 @@ func (m *Monitor) Run(ctx context.Context) {
 		}
 	}
 	go m.consume(ctx)
+	m.runConnections(ctx)
+}
+func (m *Monitor) runConnections(ctx context.Context) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		if err := m.connect(ctx); err != nil {
@@ -191,8 +203,12 @@ func (m *Monitor) consume(ctx context.Context) {
 			if assessmentErr := m.db.RecordAssessment(e.Mint, true, reason); assessmentErr != nil {
 				m.log.Warn("record entered-token assessment", zap.Error(assessmentErr))
 			}
-			if err := m.db.RecordPaperMark(e.Mint, e.MarketCapSOL); err != nil {
-				m.log.Warn("record paper mark", zap.Error(err))
+			if m.simulation {
+				if err := m.db.RecordPaperMark(e.Mint, e.MarketCapSOL); err != nil {
+					m.log.Warn("record paper mark", zap.Error(err))
+				}
+			} else if err := m.db.RecordLiveMark(e.Mint, e.MarketCapSOL); err != nil {
+				m.log.Warn("record live mark", zap.Error(err))
 			}
 			m.tracked.Store(e.Mint, struct{}{})
 			select {
@@ -201,37 +217,57 @@ func (m *Monitor) consume(ctx context.Context) {
 				m.log.Warn("token trade subscription queue full", zap.String("mint", e.Mint))
 			}
 			m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
-			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": true})
+			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": m.simulation})
 		}
 	}
 }
 
 func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float64) {
-	// Some creation events omit marketCapSol. In that case the first live trade
-	// establishes the paper entry mark rather than fabricating a price.
-	if err := m.db.RecordPaperMark(mint, marketCapSOL); err != nil {
-		m.log.Warn("record missing paper mark", zap.Error(err))
+	var err error
+	if m.simulation {
+		err = m.db.RecordPaperMark(mint, marketCapSOL)
+	} else {
+		err = m.db.RecordLiveMark(mint, marketCapSOL)
+	}
+	if err != nil {
+		m.log.Warn("record take-profit mark", zap.Error(err))
 		return
 	}
-	if err := m.db.UpdatePaperMark(mint, marketCapSOL); err != nil {
-		m.log.Warn("update paper mark", zap.Error(err))
+	if m.simulation {
+		err = m.db.UpdatePaperMark(mint, marketCapSOL)
+	} else {
+		err = m.db.UpdateLiveMark(mint, marketCapSOL)
+	}
+	if err != nil {
+		m.log.Warn("update take-profit mark", zap.Error(err))
 		return
 	}
-	returnPct, known, err := m.db.PaperReturnPct(mint)
+	var returnPct float64
+	var known bool
+	if m.simulation {
+		returnPct, known, err = m.db.PaperReturnPct(mint)
+	} else {
+		returnPct, known, err = m.db.LiveReturnPct(mint)
+	}
 	if err != nil || !known {
 		return
 	}
-	m.bus.Publish("paper_mark_updated", map[string]any{"mint": mint, "marketCapSol": marketCapSOL, "returnPct": returnPct, "takeProfitPct": m.takeProfit})
+	m.bus.Publish("take_profit_mark_updated", map[string]any{"mint": mint, "marketCapSol": marketCapSOL, "returnPct": returnPct, "takeProfitPct": m.takeProfit, "simulation": m.simulation})
 	if returnPct < m.takeProfit {
 		return
 	}
-	id, err := m.entry.ClosePaperPosition(ctx, mint, returnPct, "take profit reached in simulation")
+	var id string
+	if m.simulation {
+		id, err = m.entry.ClosePaperPosition(ctx, mint, returnPct, "take profit reached in simulation")
+	} else {
+		id, err = m.entry.CloseLivePosition(ctx, mint, m.slippage, m.priorityFee, "take profit reached in live operation")
+	}
 	if err != nil {
 		m.log.Warn("paper take-profit exit", zap.String("mint", mint), zap.Error(err))
 		return
 	}
 	m.tracked.Delete(mint)
-	m.bus.Publish("paper_take_profit", map[string]any{"mint": mint, "tradeId": id, "returnPct": returnPct})
+	m.bus.Publish("take_profit_triggered", map[string]any{"mint": mint, "tradeId": id, "returnPct": returnPct, "simulation": m.simulation})
 }
 
 // timestampFromEvent accepts the timestamp variants emitted by PumpPortal. A
