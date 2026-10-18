@@ -50,9 +50,14 @@ type Monitor struct {
 	tracked                         sync.Map
 	seen                            sync.Map
 	connected                       atomic.Bool
+	exitMu                          sync.Mutex
 }
 
 func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit, stopLoss float64, maxHold time.Duration, simulation bool, b *events.Bus, l *zap.Logger) *Monitor {
+	const maximumPositionHold = 5 * time.Minute
+	if maxHold <= 0 || maxHold > maximumPositionHold {
+		maxHold = maximumPositionHold
+	}
 	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, stopLoss: stopLoss, maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size), bus: b, log: l}
 }
 func (m *Monitor) Run(ctx context.Context) {
@@ -60,7 +65,67 @@ func (m *Monitor) Run(ctx context.Context) {
 	// keeps live and paper marks separate while resuming exits after a restart.
 	m.restoreOpenPositions()
 	go m.consume(ctx)
+	go m.runMaxHoldChecker(ctx)
 	m.runConnections(ctx)
+}
+
+func (m *Monitor) runMaxHoldChecker(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	if ctx.Err() != nil {
+		return
+	}
+	m.expireOpenPositions(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.expireOpenPositions(ctx)
+		}
+	}
+}
+
+func (m *Monitor) expireOpenPositions(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	mints, err := m.db.OpenPositionMints()
+	if err != nil {
+		m.log.Warn("scan positions for max-hold exits", zap.Error(err))
+		return
+	}
+	now := time.Now().UTC()
+	for _, mint := range mints {
+		if ctx.Err() != nil {
+			return
+		}
+		openedAt, open, err := m.db.PositionOpenedAt(mint)
+		if err != nil {
+			m.log.Warn("read position age", zap.String("mint", mint), zap.Error(err))
+			continue
+		}
+		if !open || now.Sub(openedAt) < m.maxHold {
+			continue
+		}
+
+		var returnPct float64
+		var known bool
+		if m.simulation {
+			returnPct, known, err = m.db.PaperReturnPct(mint)
+		} else {
+			returnPct, known, err = m.db.LiveReturnPct(mint)
+		}
+		if err != nil {
+			m.log.Warn("read last position mark; using safe timed-exit fallback", zap.String("mint", mint), zap.Error(err))
+			returnPct = 0
+		} else if !known {
+			// A timed-out paper position with no recorded price is closed at
+			// its entry value; live exits sell the full confirmed token balance.
+			returnPct = 0
+		}
+		m.submitExit(ctx, mint, returnPct, "max hold time")
+	}
 }
 
 func (m *Monitor) restoreOpenPositions() {
@@ -189,6 +254,12 @@ func (m *Monitor) consume(ctx context.Context) {
 				m.log.Warn("record event", zap.Error(err))
 				m.bus.Publish("operational_error", map[string]string{"component": "database", "message": "unable to record token"})
 			}
+			if e.MarketCapSOL <= 0 {
+				reason := "missing creation market cap for take-profit baseline"
+				_ = m.db.RecordAssessment(e.Mint, false, reason)
+				m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
+				continue
+			}
 			ok, reason := m.strategy.Evaluate(ctx, e.Mint, e.Created)
 			m.log.Info("token evaluated", zap.String("mint", e.Mint), zap.Bool("eligible", ok), zap.String("reason", reason), zap.Int64("latency_ms", latency))
 			if !ok || m.entry == nil {
@@ -255,25 +326,47 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 	if err != nil || !known {
 		return
 	}
-	if !m.simulation {
-		active, activeErr := m.db.ActiveForMint(mint)
-		if activeErr != nil || active {
-			return
-		}
-	}
 	openedAt, ok, err := m.db.PositionOpenedAt(mint)
 	if err != nil {
 		return
 	}
 	if !ok {
-		if !m.simulation {
-			m.tracked.Delete(mint)
-		}
+		m.tracked.Delete(mint)
 		return
 	}
 	reason := positions.ExitReason(positions.Position{Mint: mint, CostSOL: 1, OpenedAt: openedAt}, 1+returnPct/100, true, positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, MaxHold: m.maxHold}, time.Now().UTC())
 	m.bus.Publish("position_mark_updated", map[string]any{"mint": mint, "marketCapSol": marketCapSOL, "returnPct": returnPct, "takeProfitPct": m.takeProfit, "stopLossPct": m.stopLoss, "simulation": m.simulation})
 	if reason == "" {
+		return
+	}
+	m.submitExit(ctx, mint, returnPct, reason)
+}
+
+func (m *Monitor) submitExit(ctx context.Context, mint string, returnPct float64, reason string) {
+	m.exitMu.Lock()
+	defer m.exitMu.Unlock()
+
+	_, open, err := m.db.PositionOpenedAt(mint)
+	if err != nil {
+		m.log.Warn("check position before exit", zap.String("mint", mint), zap.Error(err))
+		return
+	}
+	if !open {
+		m.tracked.Delete(mint)
+		return
+	}
+	if !m.simulation {
+		active, activeErr := m.db.ActiveForMint(mint)
+		if activeErr != nil {
+			m.log.Warn("check pending live exit", zap.String("mint", mint), zap.Error(activeErr))
+			return
+		}
+		if active {
+			return
+		}
+	}
+	if m.entry == nil {
+		m.log.Warn("cannot close position: entry engine unavailable", zap.String("mint", mint))
 		return
 	}
 	var id string

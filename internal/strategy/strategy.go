@@ -19,6 +19,10 @@ type Strategy struct {
 func (s *Strategy) SetScreen(screen func(context.Context, string) (string, error)) { s.screen = screen }
 
 func New(db *database.DB, maxAge time.Duration) *Strategy {
+	const maximumEntryAge = 5 * time.Minute
+	if maxAge <= 0 || maxAge > maximumEntryAge {
+		maxAge = maximumEntryAge
+	}
 	return &Strategy{db: db, maxAge: maxAge}
 }
 func (s *Strategy) Evaluate(ctx context.Context, mint string, createdAt time.Time) (bool, string) {
@@ -41,6 +45,13 @@ func (s *Strategy) Evaluate(ctx context.Context, mint string, createdAt time.Tim
 	}
 	if active {
 		return false, "existing unreconciled position"
+	}
+	purchased, e := s.db.HasPurchaseForMint(mint)
+	if e != nil {
+		return false, "database unavailable"
+	}
+	if purchased {
+		return false, "mint already has a recorded buy attempt"
 	}
 	if s.screen != nil {
 		reason, err := s.screen(ctx, mint)
