@@ -1,6 +1,6 @@
 import { setBaseUrl } from '@/api-client';
 
-export const apiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim().replace(/\/$/, '') || 'https://quantum-sniper-sol-production.up.railway.app';
+export const apiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim().replace(/\/$/, '') || '';
 const configuredBase = apiBaseUrl;
 setBaseUrl(apiBaseUrl);
 

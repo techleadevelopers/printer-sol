@@ -1,0 +1,160 @@
+BOT
+running
+MODO
+simulation
+Pausar novas compras
+Parar novas operações
+Parar interrompe novas operações; não fecha posições existentes.
+
+Tokens detetados
+32 726
+Tokens analisados
+31 485
+Operações
+675
+Posições abertas
+5
+Património virtual
+0,736SOL
+Reserva de taxas
+0,01SOL
+P&L realizado
+-0,014SOL
+P&L estimado · aberto
+0SOL
+Estimativa, não resultado realizado
+Histórico do saldo
+SOL · API
+18/10/2026, 13:11
+18/10/2026, 13:15
+Resultado acumulado
+Líquido
+-0,019SOL
+Custos
+0,019SOL
+OPERAÇÕES POR PERÍODO
+2026-10-18
+0/9de 335
+Evolução do resultado líquido
+SOL · API
+18/10/2026
+18/10/2026
+18/10/2026
+18/10/2026
+18/10/2026
+-0.016
+-0.012
+-0.008
+-0.004
+0
+Operações por período
+CONTAGEM · API
+2026-10-18
+0
+85
+170
+255
+340
+Distribuição dos resultados
+OPERAÇÕES · API
+● Positivas
+0
+● Negativas
+9
+Histórico do saldo
+SOL · API
+18/10/2026
+18/10/2026
+18/10/2026
+18/10/2026
+18/10/2026
+0
+0.25
+0.5
+0.75
+1
+Saúde dos serviços
+API
+ok
+Monitor de eventos
+connected
+Verificado
+18/10/2026, 13:15
+Monitor de eventos
+Ligado
+Aguardando conexão com o back-end
+
+Operações recentes
+[Ver histórico](https://solana-sniper-bot-dashboard.vercel.app/user-portal/trades) 
+Data	Token / Mint	Lado	Quantidade	Valor SOL	Taxas	Slippage	Resultado bruto	Resultado líquido	Estado	Explorer / ID
+18/10/2026, 13:14	
+Token sem nome
+4ryAF…Npump
+Compra	0,049	0,049	0,001	20%	Em aberto	Em aberto	
+confirmed	
+—
+18/10/2026, 13:14	
+Token sem nome
+3K9E9…KkPTy
+Compra	0,049	0,049	0,001	20%	Em aberto	Em aberto	
+confirmed	
+—
+18/10/2026, 13:13	
+Token sem nome
+GuHo1…gpump
+Compra	0,049	0,049	0,001	20%	Em aberto	Em aberto	
+confirmed	
+—
+18/10/2026, 13:13	
+Token sem nome
+CP3p6…v9XBF
+Venda	0,049	0,049	0,001	0%	0	-0,002	
+confirmed	
+—
+18/10/2026, 13:13	
+Token sem nome
+GqF9a…Zpump
+Venda	0,049	0,049	0,001	0%	0	-0,002	
+confirmed	
+—
+18/10/2026, 13:13	
+Token sem nome
+F6vkZ…Z7VyZ
+Compra	0,049	0,049	0,001	20%	Em aberto	Em aberto	
+confirmed	
+—
+18/10/2026, 13:13	
+Token sem nome
+AZWt7…s8Z43
+Compra	0,049	0,049	0,001	20%	Em aberto	Em aberto	
+confirmed	
+—
+18/10/2026, 13:13	
+Token sem nome
+EndSR…Tpump
+Venda	0,049	0,049	0,001	0%	0	-0,002	
+confirmed	
+—
+18/10/2026, 13:13	
+Token sem nome
+8FsZu…n3GnG
+Venda	0,049	0,049	0,001	0%	0	-0,002	
+confirmed	
+—
+18/10/2026, 13:13	
+Token sem nome
+FvFmq…2pump
+Venda	0,049	0,049	0,001	0%	0	-0,002	
+confirmed	
+—
+18/10/2026, 13:11	
+Token sem nome
+CP3p6…v9XBF
+Compra	0,049	0,049	0,001	20%	Em aberto	Em aberto	
+confirmed	
+—
+18/10/2026, 13:11	
+Token sem nome
+GqF9a…Zpump
+Compra	0,049	0,049	0,001	20%	Em aberto	Em aberto	
+confirmed
