@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"github.com/gorilla/websocket"
@@ -89,6 +90,11 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load detected token count")
 		return
 	}
+	analyzed, err := s.db.RiskAssessmentCount()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load token analysis count")
+		return
+	}
 	openPnl, err := s.db.OpenPnlSOL(s.cfg.Simulation)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load estimated open P&L")
@@ -107,6 +113,11 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	costs, err := s.db.TradeCostsSOL()
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load transaction costs")
+		return
+	}
+	performance, err := s.db.Performance()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load realized trade performance")
 		return
 	}
 	trades, err := s.tradeItems()
@@ -141,14 +152,27 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	totalEstimatedPnl := realizedPnl + openPnl
+	var winRate any
+	if performance.ClosedTrades > 0 {
+		winRate = performance.WinRatePct
+	}
 	dashboard := map[string]any{
 		"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance,
 		"walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL,
-		"detectedTokens": detected, "analyzedTokens": detected, "tradesCount": tradeCount, "openPositions": positions,
+		"detectedTokens": detected, "analyzedTokens": analyzed, "tradesCount": tradeCount, "openPositions": positions,
 		"realizedPnlSol": realizedPnl, "estimatedOpenPnlSol": openPnl, "totalEstimatedPnlSol": totalEstimatedPnl,
 		"netPnlSol": totalEstimatedPnl, "estimatedOpenPnlComplete": unmarkedPositions == 0,
 		"unmarkedOpenPositions": unmarkedPositions, "costsSol": costs,
 		"openPnlBasis": "pumpportal_market_cap_ratio_estimate",
+		"performance": map[string]any{
+			"closedTrades": performance.ClosedTrades, "winners": performance.Winners,
+			"losers": performance.Losers, "winRatePct": winRate,
+			"avgWinSol": performance.AvgWinSOL, "avgLossSol": performance.AvgLossSOL,
+			"avgHoldSeconds": performance.AvgHoldSeconds, "feesPaidSol": performance.FeesSOL,
+			"netRealizedPnlSol": performance.NetRealizedPnlSOL,
+			"grossRealizedPnlSol": performance.NetRealizedPnlSOL + performance.FeesSOL,
+			"grossPnlBasis": "net realized PnL plus recorded fees for closed positions",
+		},
 		"cumulativeResult": cumulativeResult,
 		"tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": periodTotal, "positive": positive, "negative": negative}},
 		"balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades,
@@ -400,8 +424,8 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &l) {
 		return
 	}
-	if l.MaxTradeSOL < 0 || l.MaxExposureSOL < 0 || l.MaxDailyLossSOL < 0 || l.MaxSlippagePct < 0 || l.MaxPriorityFeeSOL < 0 || l.FeeReserveSOL < 0 || l.MaxOpenPositions < 1 || l.MaxWaitSeconds < 1 || l.MaxAttempts < 1 {
-		fail(w, 400, "invalid_config", "limits must be non-negative and counts positive")
+	if l.MaxTradeSOL < 0 || l.MaxExposureSOL < 0 || l.MaxDailyLossSOL < 0 || l.MaxSlippagePct < 0 || l.MaxPriorityFeeSOL < 0 || l.FeeReserveSOL < 0 || l.MaxOpenPositions < 1 || l.MaxWaitSeconds < 1 || l.MaxAttempts < 1 || l.MaxAttempts > 6 {
+		fail(w, 400, "invalid_config", "limits must be non-negative; counts positive and submission attempts between 1 and 6")
 		return
 	}
 	s.engine.SetLimits(l)
@@ -455,13 +479,47 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]string{"token": s.sessionToken()})
 }
 func (s *Server) authorized(r *http.Request) bool {
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	return token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.sessionToken())) == 1
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, "Bearer ") {
+		return false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	return s.validSessionToken(token, time.Now().UTC())
 }
 func (s *Server) sessionToken() string {
+	return s.sessionTokenAt(time.Now().UTC())
+}
+func (s *Server) sessionTokenAt(now time.Time) string {
+	payload := strconv.FormatInt(now.UTC().Unix(), 10)
 	mac := hmac.New(sha256.New, []byte(s.cfg.AdminPassword))
-	_, _ = mac.Write([]byte("solana-sniper-admin-session-v1"))
-	return hex.EncodeToString(mac.Sum(nil))
+	_, _ = mac.Write([]byte("solana-sniper-admin-session-v2:" + payload))
+	token := payload + "." + hex.EncodeToString(mac.Sum(nil))
+	return base64.RawURLEncoding.EncodeToString([]byte(token))
+}
+func (s *Server) validSessionToken(token string, now time.Time) bool {
+	if token == "" || len(token) > 256 {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(string(decoded), ".")
+	if len(parts) != 2 {
+		return false
+	}
+	issuedAt, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return false
+	}
+	age := now.UTC().Unix() - issuedAt
+	if age < -30 || age > int64(time.Hour/time.Second) {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(s.cfg.AdminPassword))
+	_, _ = mac.Write([]byte("solana-sniper-admin-session-v2:" + parts[0]))
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expected)) == 1
 }
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
@@ -495,15 +553,7 @@ func (s *Server) emergency(w http.ResponseWriter, r *http.Request) {
 // cors handles browser preflight before routes perform method or auth checks.
 // Origins are explicit: credentials are never combined with a wildcard origin.
 func corsPolicy(next http.Handler) http.Handler {
-	allowed := map[string]struct{}{
-		"https://solana-sniper-bot-dashboard.vercel.app": {},
-		"http://localhost:5173":                          {},
-	}
-	for _, origin := range strings.Split(os.Getenv("CORS_ALLOWED_ORIGINS"), ",") {
-		if origin = strings.TrimSpace(origin); origin != "" {
-			allowed[origin] = struct{}{}
-		}
-	}
+	allowed := configuredOrigins()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if _, ok := allowed[origin]; ok {
@@ -523,6 +573,22 @@ func corsPolicy(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+func configuredOrigins() map[string]struct{} {
+	allowed := map[string]struct{}{
+		"https://solana-sniper-bot-dashboard.vercel.app": {},
+		"http://localhost:5173":                          {},
+	}
+	for _, origin := range strings.Split(os.Getenv("CORS_ALLOWED_ORIGINS"), ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			allowed[origin] = struct{}{}
+		}
+	}
+	return allowed
+}
+func (s *Server) originAllowed(origin string) bool {
+	_, ok := configuredOrigins()[origin]
+	return ok
 }
 func (s *Server) rpcTest(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
@@ -559,14 +625,32 @@ func (s *Server) rpcSelect(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, map[string]any{"selected": v.URL})
 }
 
-var up = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-
 func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
-	c, e := up.Upgrade(w, r, nil)
+	origin := r.Header.Get("Origin")
+	if origin != "" && !s.originAllowed(origin) {
+		fail(w, http.StatusForbidden, "origin_not_allowed", "origin is not allowed")
+		return
+	}
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		return origin == "" || s.originAllowed(origin)
+	}}
+	c, e := upgrader.Upgrade(w, r, nil)
 	if e != nil {
 		return
 	}
 	defer c.Close()
+	c.SetReadLimit(8192)
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	messageType, authMessage, e := c.ReadMessage()
+	var auth struct {
+		Type  string `json:"type"`
+		Token string `json:"token"`
+	}
+	if e != nil || messageType != websocket.TextMessage || json.Unmarshal(authMessage, &auth) != nil || auth.Type != "auth" || !s.validSessionToken(auth.Token, time.Now().UTC()) {
+		_ = c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "authentication required"), time.Now().Add(time.Second))
+		return
+	}
 	sub, unsubscribe := s.bus.Subscribe()
 	defer unsubscribe()
 	_ = c.SetReadDeadline(time.Now().Add(70 * time.Second))
@@ -620,16 +704,4 @@ func fail(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "message": message}})
-}
-func cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(204)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
 }

@@ -383,7 +383,7 @@ func (d *DB) recordMark(table, mint string, marketCapSOL float64) error {
 		return nil
 	}
 	now := time.Now().UTC()
-	_, e := d.Exec(d.bind(`INSERT INTO `+table+`(mint,entry_market_cap_sol,current_market_cap_sol,updated_at) VALUES(?,?,?,?) ON CONFLICT(mint) DO NOTHING`), mint, marketCapSOL, marketCapSOL, now)
+	_, e := d.Exec(d.bind(`INSERT INTO `+table+`(mint,entry_market_cap_sol,current_market_cap_sol,peak_market_cap_sol,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(mint) DO NOTHING`), mint, marketCapSOL, marketCapSOL, marketCapSOL, now)
 	return e
 }
 func (d *DB) UpdatePaperMark(mint string, marketCapSOL float64) error {
@@ -396,7 +396,7 @@ func (d *DB) updateMark(table, mint string, marketCapSOL float64) error {
 	if marketCapSOL <= 0 {
 		return nil
 	}
-	_, e := d.Exec(d.bind(`UPDATE `+table+` SET current_market_cap_sol=?,updated_at=? WHERE mint=?`), marketCapSOL, time.Now().UTC(), mint)
+	_, e := d.Exec(d.bind(`UPDATE `+table+` SET current_market_cap_sol=?,peak_market_cap_sol=CASE WHEN ?>peak_market_cap_sol THEN ? ELSE peak_market_cap_sol END,updated_at=? WHERE mint=?`), marketCapSOL, marketCapSOL, marketCapSOL, time.Now().UTC(), mint)
 	return e
 }
 func (d *DB) PaperReturnPct(mint string) (float64, bool, error) {
@@ -404,6 +404,12 @@ func (d *DB) PaperReturnPct(mint string) (float64, bool, error) {
 }
 func (d *DB) LiveReturnPct(mint string) (float64, bool, error) {
 	return d.markReturnPct("live_marks", mint)
+}
+func (d *DB) PaperPeakReturnPct(mint string) (float64, bool, error) {
+	return d.markPeakReturnPct("paper_marks", mint)
+}
+func (d *DB) LivePeakReturnPct(mint string) (float64, bool, error) {
+	return d.markPeakReturnPct("live_marks", mint)
 }
 func (d *DB) markReturnPct(table, mint string) (float64, bool, error) {
 	var entry, current float64
@@ -418,6 +424,20 @@ func (d *DB) markReturnPct(table, mint string) (float64, bool, error) {
 		return 0, false, nil
 	}
 	return (current - entry) / entry * 100, true, nil
+}
+func (d *DB) markPeakReturnPct(table, mint string) (float64, bool, error) {
+	var entry, peak float64
+	e := d.QueryRow(d.bind(`SELECT entry_market_cap_sol,peak_market_cap_sol FROM `+table+` WHERE mint=?`), mint).Scan(&entry, &peak)
+	if e == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if e != nil {
+		return 0, false, e
+	}
+	if entry <= 0 || peak <= 0 {
+		return 0, false, nil
+	}
+	return (peak - entry) / entry * 100, true, nil
 }
 func (d *DB) PositionCost(mint string) (float64, error) {
 	var cost float64
@@ -491,11 +511,54 @@ func (d *DB) TradeCount() (int, error) {
 	err := d.QueryRow(`SELECT COUNT(*) FROM trades`).Scan(&count)
 	return count, err
 }
+type PerformanceStats struct {
+	ClosedTrades, Winners, Losers int
+	WinRatePct, AvgWinSOL, AvgLossSOL, AvgHoldSeconds, FeesSOL, NetRealizedPnlSOL float64
+}
+
+func (d *DB) Performance() (PerformanceStats, error) {
+	var stats PerformanceStats
+	err := d.QueryRow(`SELECT
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN realized_pnl_sol>0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN realized_pnl_sol<0 THEN 1 ELSE 0 END),0),
+		COALESCE(AVG(CASE WHEN realized_pnl_sol>0 THEN realized_pnl_sol END),0),
+		COALESCE(AVG(CASE WHEN realized_pnl_sol<0 THEN realized_pnl_sol END),0),
+		COALESCE(SUM(realized_pnl_sol),0)
+		FROM trades WHERE side='sell' AND realized_pnl_sol IS NOT NULL`).Scan(
+		&stats.ClosedTrades, &stats.Winners, &stats.Losers, &stats.AvgWinSOL, &stats.AvgLossSOL, &stats.NetRealizedPnlSOL)
+	if err != nil {
+		return stats, err
+	}
+	err = d.QueryRow(`SELECT COALESCE(SUM(t.fees_sol),0)
+		FROM trades t
+		WHERE t.state IN ('simulated','confirmed','finalized')
+		AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')`).Scan(&stats.FeesSOL)
+	if err != nil {
+		return stats, err
+	}
+	holdQuery := `SELECT COALESCE(AVG((julianday(updated_at)-julianday(opened_at))*86400),0) FROM positions WHERE status='closed'`
+	if d.postgres {
+		holdQuery = `SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (updated_at-opened_at))),0) FROM positions WHERE status='closed'`
+	}
+	if err = d.QueryRow(holdQuery).Scan(&stats.AvgHoldSeconds); err != nil {
+		return stats, err
+	}
+	if stats.ClosedTrades > 0 {
+		stats.WinRatePct = float64(stats.Winners) * 100 / float64(stats.ClosedTrades)
+	}
+	return stats, nil
+}
+func (d *DB) RiskAssessmentCount() (int, error) {
+	var count int
+	err := d.QueryRow(`SELECT COUNT(*) FROM risk_assessments`).Scan(&count)
+	return count, err
+}
 func (d *DB) TradePeriodStats(start, end time.Time) (total, positive, negative int, err error) {
 	err = d.QueryRow(d.bind(`SELECT COUNT(*),
 		COALESCE(SUM(CASE WHEN realized_pnl_sol>0 THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN realized_pnl_sol<0 THEN 1 ELSE 0 END),0)
-		FROM trades WHERE created_at>=? AND created_at<?`), start, end).Scan(&total, &positive, &negative)
+		FROM trades WHERE side='sell' AND realized_pnl_sol IS NOT NULL AND confirmed_at>=? AND confirmed_at<?`), start, end).Scan(&total, &positive, &negative)
 	return
 }
 func (d *DB) RealizedPnlHistory() (*sql.Rows, error) {
@@ -589,7 +652,9 @@ func (d *DB) OpenExposureSOL() (float64, error) {
 }
 func (d *DB) DailyRealizedLossSOL() (float64, error) {
 	var n sql.NullFloat64
-	e := d.QueryRow(d.bind(`SELECT COALESCE(SUM(CASE WHEN realized_pnl_sol < 0 THEN -realized_pnl_sol ELSE 0 END),0) FROM trades WHERE confirmed_at >= ?`), time.Now().UTC().Truncate(24*time.Hour)).Scan(&n)
+	now := time.Now().UTC()
+	utcDayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	e := d.QueryRow(d.bind(`SELECT COALESCE(SUM(CASE WHEN realized_pnl_sol < 0 THEN -realized_pnl_sol ELSE 0 END),0) FROM trades WHERE confirmed_at >= ?`), utcDayStart).Scan(&n)
 	return n.Float64, e
 }
 func (d *DB) ReconciliationRequired() (bool, error) { n, e := d.UnknownTradeCount(); return n > 0, e }

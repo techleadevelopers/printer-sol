@@ -4,17 +4,17 @@ Backend Go conservador para observação de novos tokens, controles de risco e e
 
 ## Segurança e modo de execução
 
-O padrão é `SIMULATION=true`. Neste modo o serviço registra a negociação simulada, mas não assina nem envia bytes de transação.
+O padrão é `SIMULATION=true`. Neste modo o serviço registra a negociação simulada, mas não assina nem envia bytes de transação. O perfil de exemplo usa ordem de US$ 3, taxa prioritária máxima de 0,0015 SOL, take-profit bruto de 50%, stop-loss de 25%, trailing stop de 12% armado após ganho de 10% sobre o custo e limite de posição de 90 segundos. São parâmetros de operação, não promessa de lucro: preço, taxas, slippage, liquidez e execução podem causar perdas.
 
-A simulação calcula saídas virtuais a partir das atualizações de preço por token do PumpPortal. Por isso, `PUMPPORTAL_API_KEY` também é obrigatória em simulação; o PumpPortal exige uma carteira vinculada com pelo menos 0,02 SOL para essa assinatura. O padrão de stop-loss da simulação é 30% e o take-profit é 70%; ambos podem ser ajustados por configuração. A banca exibida como saldo disponível desconta o capital alocado em posições abertas e incorpora resultados realizados após cada saída.
+A simulação calcula saídas virtuais a partir das atualizações de preço por token do PumpPortal. Por isso, `PUMPPORTAL_API_KEY` também é obrigatória em simulação; o PumpPortal exige uma carteira vinculada com pelo menos 0,02 SOL para essa assinatura. A cotação SOL/USD validada é reutilizada por até 30 segundos; se expirar e a atualização falhar, novas entradas são bloqueadas. A banca exibida como saldo disponível desconta o capital alocado em posições abertas e incorpora resultados realizados após cada saída.
 
-Para ativar execução real é necessário, simultaneamente: `SIMULATION=false`, `ENABLE_LIVE_TRADING=true`, `BOT_PRIVATE_KEY` carregada somente no ambiente de execução, `KEY_PROVIDER_REF`, `WALLET_PUBLIC_ADDRESS`, um RPC saudável e saldo suficiente além da reserva de taxas. `ADMIN_PASSWORD` é obrigatória para acessar o console. A chave privada nunca é salva no banco, devolvida por HTTP/WebSocket ou registrada em logs.
+Para ativar execução real é necessário, simultaneamente: `SIMULATION=false`, `ENABLE_LIVE_TRADING=true`, um `TRADE_USD` escolhido explicitamente, `BOT_PRIVATE_KEY` carregada somente no ambiente de execução, `KEY_PROVIDER_REF`, `WALLET_PUBLIC_ADDRESS`, um RPC saudável e saldo suficiente além da reserva de taxas. `ADMIN_PASSWORD` é obrigatória para acessar o console. A chave privada nunca é salva no banco, devolvida por HTTP/WebSocket ou registrada em logs.
 
 Copie os nomes de variáveis de `.env.example` para o secret manager/deployment. Não versione um `.env` real.
 
 ## Execução contínua
 
-Requer Go 1.22+ para execução local, ou Docker para build/deploy:
+Requer Go 1.24+ para execução local, ou Docker para build/deploy:
 
 ```sh
 docker build -t solana-sniper-backend .
@@ -23,7 +23,7 @@ docker run --env-file /run/secrets/sniper.env -p 8080:8080 solana-sniper-backend
 
 Em produção, configure `DATABASE_URL` com a URL PostgreSQL fornecida pelo Railway. `DATABASE_PATH`/SQLite permanece apenas como fallback local; o container não requer volume. Use secret manager para credenciais, reinicialização supervisionada (Compose/Kubernetes/systemd), logs centralizados e monitoramento de `/api/health`. O processo trata `SIGINT` e `SIGTERM` com desligamento gracioso; o monitor e o gerenciador de RPC tentam recuperar conexões.
 
-Na inicialização, migrações são aplicadas, RPCs são verificados e negociações pendentes são reconciliadas antes de o monitor iniciar. Uma transação sem resultado conhecido bloqueia novas compras até reconciliação. Posições já persistidas contam para os limites antes de qualquer entrada. Parar o bot nunca significa vender todas as posições.
+Na inicialização, migrações são aplicadas, RPCs são verificados e negociações pendentes são reconciliadas antes de o monitor iniciar. Uma transação sem resultado conhecido bloqueia novas compras até reconciliação. Posições já persistidas contam para os limites antes de qualquer entrada. `MAX_SUBMISSION_ATTEMPTS` controla as retransmissões do mesmo payload assinado no RPC (mesma assinatura); o preflight permanece habilitado. Parar o bot nunca significa vender todas as posições.
 
 Ambientes de desenvolvimento não devem ser presumidos como processos 24/7: configure armazenamento, saúde, reinício, limites de recursos e rotação de segredos no ambiente de implantação.
 
@@ -48,7 +48,9 @@ Autenticação: `POST /api/auth/login` recebe `{ "password": "..." }` e retorna 
 
 `POST /api/rpcs/test` e `/api/rpcs/select` recebem `{ "url": "https://..." }`. Configuração recebe os campos de `execution.Limits` em JSON. O painel deve tratar `401`, `409` e `422` como bloqueios operacionais, não como sucesso.
 
-`WS /ws/events` entrega envelopes `{ "type": string, "data": object, "at": RFC3339 }`. Eventos incluem `token_detected`, `token_approved`, `token_rejected`, `buy_sent`, `buy_confirmed`, `buy_failed`, `sell_sent`, `sell_confirmed`, `sell_failed`, `position_updated`, `position_mark_updated`, `rpc_changed`, `risk_alert`, `bot_paused` e `operational_error`. `position_mark_updated` inclui market cap atual, variação percentual, P&L/valor estimados em SOL e horário da marca. O cliente deve reconectar ao receber close/timeout; cada nova sessão recebe `connection_ready`. O servidor usa ping/pong e remove clientes desconectados.
+`WS /ws/events` exige que o cliente envie primeiro `{ "type": "auth", "token": "<session-token>" }` dentro de cinco segundos do upgrade. Tokens HMAC de sessão expiram após uma hora. Depois da autenticação, a rota entrega envelopes `{ "type": string, "data": object, "at": RFC3339 }`. Eventos incluem `token_detected`, `token_approved`, `token_rejected`, `buy_sent`, `buy_confirmed`, `buy_failed`, `sell_sent`, `sell_confirmed`, `sell_failed`, `position_updated`, `position_mark_updated`, `rpc_changed`, `risk_alert`, `bot_paused` e `operational_error`. `position_mark_updated` inclui market cap atual, variação percentual, P&L/valor estimados em SOL e horário da marca. O cliente deve reconectar ao receber close/timeout; cada nova sessão recebe `connection_ready`. O servidor usa ping/pong e remove clientes desconectados.
+
+O dashboard informa contagens de avaliações efetivamente registradas e estatísticas de saídas confirmadas. O P&L aberto continua sendo estimado pela razão entre market caps; não representa o valor garantido de uma venda.
 
 ## Banco e testes
 

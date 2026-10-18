@@ -12,7 +12,7 @@ import (
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
 	Simulation, EnableLiveTrading                                                                                                                                                                           bool
-	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct                                         float64
+	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
 	RPCEndpoints                                                                                                                                                                                            []string
 }
@@ -46,40 +46,46 @@ func Load() (Config, error) {
 		// P&L, and trade history from a previous run.
 		return c, fmt.Errorf("live trading requires separate SIMULATION_DATABASE_URL and REAL_DATABASE_URL; DATABASE_PATH is simulation-only")
 	}
-	if c.MaxTradeSOL, err = floatEnv("MAX_TRADE_SOL", .05); err != nil {
+	if c.MaxTradeSOL, err = floatEnv("MAX_TRADE_SOL", .035); err != nil {
 		return c, err
 	}
-	if c.MaxDailyLossSOL, err = floatEnv("MAX_DAILY_LOSS_SOL", .2); err != nil {
+	if c.MaxDailyLossSOL, err = floatEnv("MAX_DAILY_LOSS_SOL", .15); err != nil {
 		return c, err
 	}
-	if c.FeeReserveSOL, err = floatEnv("FEE_RESERVE_SOL", .01); err != nil {
+	if c.FeeReserveSOL, err = floatEnv("FEE_RESERVE_SOL", .02); err != nil {
 		return c, err
 	}
-	if c.MaxExposureSOL, err = floatEnv("MAX_EXPOSURE_SOL", .2); err != nil {
+	if c.MaxExposureSOL, err = floatEnv("MAX_EXPOSURE_SOL", .5); err != nil {
 		return c, err
 	}
-	if c.MaxSlippagePct, err = floatEnv("MAX_SLIPPAGE_PCT", 10); err != nil {
+	if c.MaxSlippagePct, err = floatEnv("MAX_SLIPPAGE_PCT", 15); err != nil {
 		return c, err
 	}
-	if c.MaxPriorityFeeSOL, err = floatEnv("MAX_PRIORITY_FEE_SOL", .01); err != nil {
+	if c.MaxPriorityFeeSOL, err = floatEnv("MAX_PRIORITY_FEE_SOL", .0015); err != nil {
 		return c, err
 	}
 	if c.TokenQueueSize, err = intEnv("TOKEN_QUEUE_SIZE", 1024); err != nil {
 		return c, err
 	}
-	if c.MaxOpenPositions, err = intEnv("MAX_OPEN_POSITIONS", 3); err != nil {
+	if c.MaxOpenPositions, err = intEnv("MAX_OPEN_POSITIONS", 20); err != nil {
 		return c, err
 	}
-	if c.MaxConfirmationWaitSeconds, err = intEnv("MAX_CONFIRMATION_WAIT_SECONDS", 45); err != nil {
+	if c.MaxConfirmationWaitSeconds, err = intEnv("MAX_CONFIRMATION_WAIT_SECONDS", 12); err != nil {
 		return c, err
 	}
-	if c.MaxSubmissionAttempts, err = intEnv("MAX_SUBMISSION_ATTEMPTS", 1); err != nil {
+	if c.MaxSubmissionAttempts, err = intEnv("MAX_SUBMISSION_ATTEMPTS", 3); err != nil {
 		return c, err
 	}
 	if c.RPCHealthCheckIntervalSeconds, err = intEnv("RPC_HEALTH_CHECK_INTERVAL_SECONDS", 45); err != nil {
 		return c, err
 	}
-	if c.TradeUSD, err = floatEnv("TRADE_USD", 1); err != nil {
+	tradeUSDDefault := 3.0
+	if !c.Simulation {
+		// Live notional must be an explicit operator decision. Do not silently
+		// carry the paper-trading default into a real wallet.
+		tradeUSDDefault = 0
+	}
+	if c.TradeUSD, err = floatEnv("TRADE_USD", tradeUSDDefault); err != nil {
 		return c, err
 	}
 	if c.SimulationBalanceSOL, err = floatEnv("SIMULATION_BALANCE_SOL", 1); err != nil {
@@ -88,19 +94,20 @@ func Load() (Config, error) {
 	if c.TokenMaxAgeSeconds, err = intEnv("TOKEN_MAX_AGE_SECONDS", 5); err != nil {
 		return c, err
 	}
-	if c.TakeProfitGrossPct, err = floatEnv("TAKE_PROFIT_GROSS_PCT", 70); err != nil {
+	if c.TakeProfitGrossPct, err = floatEnv("TAKE_PROFIT_GROSS_PCT", 50); err != nil {
 		return c, err
 	}
 	stopLossDefault := 0.0
 	if c.Simulation {
-		// Match the documented paper-trading stop while keeping live mode
-		// fail-closed when its stop-loss is not explicitly configured.
-		stopLossDefault = 30
+		stopLossDefault = 25
 	}
 	if c.StopLossPct, err = floatEnv("STOP_LOSS_PCT", stopLossDefault); err != nil {
 		return c, err
 	}
-	if c.MaxHoldSeconds, err = intEnv("MAX_HOLD_SECONDS", 0); err != nil {
+	if c.MaxHoldSeconds, err = intEnv("MAX_HOLD_SECONDS", 90); err != nil {
+		return c, err
+	}
+	if c.TrailingStopPct, err = floatEnv("TRAILING_STOP_PCT", 12); err != nil {
 		return c, err
 	}
 	if strings.TrimSpace(c.HTTPAddr) == "" || (c.DatabaseURL == "" && strings.TrimSpace(c.DatabasePath) == "") || strings.TrimSpace(c.PumpPortalURL) == "" || strings.TrimSpace(c.PumpPortalWS) == "" || len(c.RPCEndpoints) == 0 {
@@ -126,13 +133,13 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("RPC_ENDPOINTS: %w", err)
 		}
 	}
-	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 {
-		return c, fmt.Errorf("queue, position, attempt, wait and RPC health-check interval limits must be positive; token age cannot be negative")
+	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 {
+		return c, fmt.Errorf("queue, position, wait and RPC health-check limits must be positive; submission attempts must be 1-6 and token age cannot be negative")
 	}
 	if !c.Simulation && c.TokenMaxAgeSeconds == 0 {
 		return c, fmt.Errorf("live trading requires TOKEN_MAX_AGE_SECONDS > 0")
 	}
-	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.TakeProfitGrossPct, c.StopLossPct} {
+	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}
@@ -140,14 +147,20 @@ func Load() (Config, error) {
 	if !c.Simulation && (!c.EnableLiveTrading || c.PrivateKey == "" || c.KeyProviderRef == "" || c.WalletPublicAddress == "" || c.PumpPortalKey == "") {
 		return c, fmt.Errorf("live trading requires ENABLE_LIVE_TRADING=true, BOT_PRIVATE_KEY via KEY_PROVIDER_REF, WALLET_PUBLIC_ADDRESS and PUMPPORTAL_API_KEY")
 	}
+	if !c.Simulation && c.TradeUSD <= 0 {
+		return c, fmt.Errorf("live trading requires an explicit TRADE_USD greater than zero")
+	}
 	if c.Simulation && strings.TrimSpace(c.PumpPortalKey) == "" {
 		return c, fmt.Errorf("simulation requires PUMPPORTAL_API_KEY to receive token price updates for virtual exits")
 	}
 	if !c.Simulation && (c.StopLossPct <= 0 || c.MaxHoldSeconds <= 0) {
 		return c, fmt.Errorf("live trading requires STOP_LOSS_PCT > 0 and MAX_HOLD_SECONDS > 0")
 	}
-	if c.Simulation && (c.StopLossPct <= 0 || c.TakeProfitGrossPct <= 0) {
-		return c, fmt.Errorf("simulation requires STOP_LOSS_PCT > 0 and TAKE_PROFIT_GROSS_PCT > 0 for virtual exits")
+	if c.Simulation && (c.StopLossPct <= 0 || c.TakeProfitGrossPct <= 0 || c.TrailingStopPct <= 0) {
+		return c, fmt.Errorf("simulation requires STOP_LOSS_PCT, TAKE_PROFIT_GROSS_PCT and TRAILING_STOP_PCT to be positive")
+	}
+	if !c.Simulation && c.TrailingStopPct <= 0 {
+		return c, fmt.Errorf("live trading requires TRAILING_STOP_PCT > 0")
 	}
 	if c.Simulation && c.EnableLiveTrading {
 		return c, fmt.Errorf("SIMULATION=true and ENABLE_LIVE_TRADING=true cannot be enabled together")

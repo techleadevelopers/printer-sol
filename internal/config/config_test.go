@@ -88,7 +88,7 @@ func TestLiveTradingRefusesLocalSimulationLedger(t *testing.T) {
 }
 
 func TestLiveTradingRequiresStopLossAndMaxHold(t *testing.T) {
-	keys := []string{"SIMULATION", "ENABLE_LIVE_TRADING", "BOT_PRIVATE_KEY", "KEY_PROVIDER_REF", "WALLET_PUBLIC_ADDRESS", "PUMPPORTAL_API_KEY", "ADMIN_PASSWORD", "SIMULATION_DATABASE_URL", "REAL_DATABASE_URL", "STOP_LOSS_PCT", "MAX_HOLD_SECONDS"}
+	keys := []string{"SIMULATION", "ENABLE_LIVE_TRADING", "BOT_PRIVATE_KEY", "KEY_PROVIDER_REF", "WALLET_PUBLIC_ADDRESS", "PUMPPORTAL_API_KEY", "ADMIN_PASSWORD", "SIMULATION_DATABASE_URL", "REAL_DATABASE_URL", "TRADE_USD", "STOP_LOSS_PCT", "MAX_HOLD_SECONDS"}
 	old := map[string]string{}
 	for _, k := range keys {
 		old[k] = os.Getenv(k)
@@ -107,6 +107,7 @@ func TestLiveTradingRequiresStopLossAndMaxHold(t *testing.T) {
 	_ = os.Setenv("ADMIN_PASSWORD", "test-master-password")
 	_ = os.Setenv("SIMULATION_DATABASE_URL", "postgresql://sim.example/db")
 	_ = os.Setenv("REAL_DATABASE_URL", "postgresql://real.example/db")
+	_ = os.Setenv("TRADE_USD", "25")
 	_ = os.Setenv("STOP_LOSS_PCT", "0")
 	_ = os.Setenv("MAX_HOLD_SECONDS", "0")
 	_, err := Load()
@@ -115,7 +116,7 @@ func TestLiveTradingRequiresStopLossAndMaxHold(t *testing.T) {
 	}
 }
 
-func TestSimulationRequiresPriceFeedAndDefaultsBothExitTargets(t *testing.T) {
+func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	keys := []string{
 		"HTTP_ADDR", "DATABASE_URL", "DATABASE_PATH", "SIMULATION_DATABASE_URL",
 		"REAL_DATABASE_URL", "BOT_PRIVATE_KEY", "KEY_PROVIDER_REF", "WALLET_PUBLIC_ADDRESS",
@@ -125,7 +126,7 @@ func TestSimulationRequiresPriceFeedAndDefaultsBothExitTargets(t *testing.T) {
 		"MAX_SLIPPAGE_PCT", "MAX_PRIORITY_FEE_SOL", "TOKEN_QUEUE_SIZE",
 		"MAX_OPEN_POSITIONS", "MAX_CONFIRMATION_WAIT_SECONDS", "MAX_SUBMISSION_ATTEMPTS",
 		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "TRADE_USD", "SIMULATION_BALANCE_SOL",
-		"TOKEN_MAX_AGE_SECONDS", "TAKE_PROFIT_GROSS_PCT", "STOP_LOSS_PCT", "MAX_HOLD_SECONDS",
+		"TOKEN_MAX_AGE_SECONDS", "TAKE_PROFIT_GROSS_PCT", "STOP_LOSS_PCT", "TRAILING_STOP_PCT", "MAX_HOLD_SECONDS",
 	}
 	type previousValue struct {
 		value string
@@ -159,8 +160,8 @@ func TestSimulationRequiresPriceFeedAndDefaultsBothExitTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StopLossPct != 30 || cfg.TakeProfitGrossPct != 70 {
-		t.Fatalf("unexpected simulation exit defaults: stop=%.1f take=%.1f", cfg.StopLossPct, cfg.TakeProfitGrossPct)
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxSubmissionAttempts != 3 {
+		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f attempts=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxSubmissionAttempts)
 	}
 
 	_ = os.Setenv("STOP_LOSS_PCT", "0")

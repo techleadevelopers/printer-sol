@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/gagliardetto/solana-go"
 	"go.uber.org/zap"
 	"solana-sniper-backend/internal/bot"
@@ -13,8 +16,6 @@ import (
 	"solana-sniper-backend/internal/pumpportal"
 	"solana-sniper-backend/internal/rpcmanager"
 	"solana-sniper-backend/internal/wallet"
-	"sync"
-	"time"
 )
 
 type Request struct {
@@ -40,6 +41,7 @@ type Engine struct {
 	simulationBalance uint64
 	controller        *bot.Controller
 	bus               *events.Bus
+	rootCtx           context.Context
 	mu                sync.RWMutex
 	limits            Limits
 	reserved          map[string]uint64
@@ -47,10 +49,17 @@ type Engine struct {
 
 func New(db *database.DB, w *wallet.Wallet, p *pumpportal.Client, r *rpcmanager.Manager, prices pricefeed.Provider, l *zap.Logger, sim bool, simulationBalanceSOL float64, c *bot.Controller, b *events.Bus, limits Limits) *Engine {
 	balance, _ := wallet.SOLToLamports(simulationBalanceSOL)
-	return &Engine{db: db, wallet: w, portal: p, rpcs: r, prices: prices, log: l, simulation: sim, simulationBalance: balance, controller: c, bus: b, limits: limits, reserved: make(map[string]uint64)}
+	return &Engine{db: db, wallet: w, portal: p, rpcs: r, prices: prices, log: l, simulation: sim, simulationBalance: balance, controller: c, bus: b, rootCtx: context.Background(), limits: limits, reserved: make(map[string]uint64)}
 }
 func (e *Engine) Limits() Limits                { e.mu.RLock(); defer e.mu.RUnlock(); return e.limits }
 func (e *Engine) SetLimits(l Limits)            { e.mu.Lock(); e.limits = l; e.mu.Unlock() }
+func (e *Engine) SetRootContext(ctx context.Context) {
+	if ctx != nil {
+		e.mu.Lock()
+		e.rootCtx = ctx
+		e.mu.Unlock()
+	}
+}
 func (e *Engine) SimulationBalanceSOL() float64 { return float64(e.simulationBalance) / 1e9 }
 func (e *Engine) emit(kind string, data any) {
 	if e.bus != nil {
@@ -88,10 +97,9 @@ func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage,
 	}
 	id, err := e.Execute(ctx, Request{Mint: mint, Side: "buy", Amount: amount, DenominatedInSOL: true, Slippage: slippage, PriorityFee: priorityFee, Pool: pool, Reason: reason})
 	if err != nil {
-		active, activeErr := e.db.ActiveForMint(mint)
-		if activeErr != nil || !active {
-			e.release(mint)
-		}
+		// A persisted submitted/unknown trade blocks all new buys until
+		// reconciliation; retaining this in-memory reservation would only leak.
+		e.release(mint)
 		return id, err
 	}
 	if e.simulation {
@@ -272,9 +280,15 @@ func (e *Engine) reconcileRows(ctx context.Context, rows *sql.Rows) error {
 			if finalizeErr != nil {
 				_ = e.db.UpdateTradeState(trade.id, "unknown", trade.signature, false)
 				e.emit("risk_alert", map[string]any{"tradeId": trade.id, "reason": finalizeErr.Error()})
+			} else {
+				e.release(trade.mint)
 			}
 		case "failed":
-			_ = e.db.UpdateTradeState(trade.id, "failed", trade.signature, true)
+			if updateErr := e.db.UpdateTradeState(trade.id, "failed", trade.signature, true); updateErr == nil {
+				e.release(trade.mint)
+			} else {
+				e.emit("risk_alert", map[string]any{"tradeId": trade.id, "reason": "failed transaction state could not be persisted"})
+			}
 		default:
 			_ = e.db.UpdateTradeState(trade.id, "unknown", trade.signature, false)
 		}
@@ -422,7 +436,11 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	}
 	signature := tx.Signatures[0].String()
 	_ = e.db.UpdateTradeState(id, "signed", signature, false)
-	submitted, err := e.rpcs.Send(ctx, raw)
+	attempts := e.Limits().MaxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	submitted, err := e.rpcs.SendWithMaxRetries(ctx, raw, attempts-1)
 	if err != nil {
 		_ = e.db.UpdateTradeState(id, "unknown", signature, false)
 		e.emit(r.Side+"_failed", map[string]any{"tradeId": id, "mint": r.Mint, "reason": "submission outcome unknown"})
@@ -439,11 +457,18 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	return id, nil
 }
 func (e *Engine) confirm(id, sig string, r Request) {
+	defer e.release(r.Mint)
 	wait := e.Limits().MaxWaitSeconds
 	if wait < 1 {
-		wait = 45
+		wait = 12
 	}
-	ctx, c := context.WithTimeout(context.Background(), time.Duration(wait)*time.Second)
+	e.mu.RLock()
+	rootCtx := e.rootCtx
+	e.mu.RUnlock()
+	if rootCtx == nil {
+		rootCtx = context.Background()
+	}
+	ctx, c := context.WithTimeout(rootCtx, time.Duration(wait)*time.Second)
 	defer c()
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
@@ -482,13 +507,14 @@ func (e *Engine) confirm(id, sig string, r Request) {
 						return
 					}
 				}
-				e.release(r.Mint)
 				e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "signature": sig, "state": state})
 				e.emit("position_updated", map[string]any{"mint": r.Mint, "sourceTradeId": id, "action": r.Side, "state": state})
 				return
 			case "failed":
-				_ = e.db.UpdateTradeState(id, "failed", sig, true)
-				e.release(r.Mint)
+				if updateErr := e.db.UpdateTradeState(id, "failed", sig, true); updateErr != nil {
+					e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "failed transaction state could not be persisted"})
+					return
+				}
 				e.emit(r.Side+"_failed", map[string]any{"tradeId": id, "mint": r.Mint, "signature": sig})
 				return
 			}

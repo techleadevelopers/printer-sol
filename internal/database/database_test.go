@@ -163,6 +163,65 @@ func TestOpenPnlAndPriceCoverageFollowSimulationMode(t *testing.T) {
 	}
 }
 
+func TestPositionPeakMarkSurvivesRetracement(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "position-peak.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordPaperMark("peak-mint", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdatePaperMark("peak-mint", 160); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdatePaperMark("peak-mint", 130); err != nil {
+		t.Fatal(err)
+	}
+	peakReturn, known, err := db.PaperPeakReturnPct("peak-mint")
+	if err != nil || !known || peakReturn != 60 {
+		t.Fatalf("peak return = %.2f, known=%v, err=%v; want 60%%", peakReturn, known, err)
+	}
+	currentReturn, known, err := db.PaperReturnPct("peak-mint")
+	if err != nil || !known || currentReturn != 30 {
+		t.Fatalf("current return = %.2f, known=%v, err=%v; want 30%%", currentReturn, known, err)
+	}
+}
+
+func TestPerformanceUsesClosedPositionResults(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "performance.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.InsertTrade(Trade{ID: "buy", Mint: "performance-mint", Side: "buy", Quantity: "0.1", Requested: 0.1, State: "prepared"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.FinalizeSimulationBuy("buy", "performance-mint", 0.1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.InsertTrade(Trade{ID: "sell", Mint: "performance-mint", Side: "sell", Quantity: "0.15", Requested: 0.15, State: "prepared"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.FinalizeSimulationSell("sell", "performance-mint", 0.15); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := db.Performance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.ClosedTrades != 1 || stats.Winners != 1 || stats.Losers != 0 || stats.WinRatePct != 100 || stats.NetRealizedPnlSOL < 0.049999999 || stats.NetRealizedPnlSOL > 0.050000001 {
+		t.Fatalf("unexpected performance stats: %+v", stats)
+	}
+}
+
 func TestUnknownTradesIncludesOnlyResolvableSignatures(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "unknown-trades.db"))
 	if err != nil {

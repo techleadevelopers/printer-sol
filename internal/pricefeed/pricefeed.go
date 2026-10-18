@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -19,15 +20,28 @@ type Provider interface {
 type HTTP struct {
 	url    string
 	client *http.Client
+	mu     sync.Mutex
+	lastAt time.Time
+	lastV  float64
+	ttl    time.Duration
 }
 
 func New(url string) *HTTP {
-	return &HTTP{url: url, client: &http.Client{Timeout: 5 * time.Second}}
+	return &HTTP{url: url, client: &http.Client{Timeout: 5 * time.Second}, ttl: 30 * time.Second}
 }
 
-// SOLUSD returns only a response obtained for this request. It deliberately
-// does not cache a price: a failed or stale quote must block new entries.
+// SOLUSD uses a recent validated quote for at most 30 seconds to avoid
+// serializing every entry behind the price HTTP request. Once it expires, a
+// failed refresh still blocks entries; expired values are never served stale.
 func (h *HTTP) SOLUSD(ctx context.Context) (float64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lastV > 0 && time.Since(h.lastAt) < h.ttl {
+		return h.lastV, nil
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.url, nil)
 	if err != nil {
 		return 0, err
@@ -51,5 +65,7 @@ func (h *HTTP) SOLUSD(ctx context.Context) (float64, error) {
 	if payload.Solana.USD <= 0 || math.IsNaN(payload.Solana.USD) || math.IsInf(payload.Solana.USD, 0) {
 		return 0, fmt.Errorf("invalid SOL/USD price")
 	}
+	h.lastV = payload.Solana.USD
+	h.lastAt = time.Now()
 	return payload.Solana.USD, nil
 }

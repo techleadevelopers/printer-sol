@@ -47,11 +47,13 @@ type Monitor struct {
 	entry                           Entrier
 	tradeUSD, slippage, priorityFee float64
 	takeProfit, stopLoss            float64
+	trailingStop                    float64
 	maxHold                         time.Duration
 	simulation                      bool
 	subscriptions                   chan string
 	tracked                         sync.Map
-	seen                            sync.Map
+	seenMu                          sync.Mutex
+	seen                            map[string]time.Time
 	connected                       atomic.Bool
 	exitMu                          sync.Mutex
 	exitRetryAfter                  sync.Map
@@ -65,7 +67,12 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 	if maxHold <= 0 || maxHold > maximumPositionHold {
 		maxHold = maximumPositionHold
 	}
-	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, stopLoss: stopLoss, maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size), bus: b, log: l}
+	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15, maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size), seen: make(map[string]time.Time), bus: b, log: l}
+}
+func (m *Monitor) SetTrailingStopPct(pct float64) {
+	if pct > 0 {
+		m.trailingStop = pct
+	}
 }
 func (m *Monitor) Run(ctx context.Context) {
 	// The selected database is mode-isolated, so restoring its open positions
@@ -73,7 +80,48 @@ func (m *Monitor) Run(ctx context.Context) {
 	m.restoreOpenPositions()
 	go m.consume(ctx)
 	go m.runMaxHoldChecker(ctx)
+	go m.runSeenJanitor(ctx)
 	m.runConnections(ctx)
+}
+
+func (m *Monitor) runSeenJanitor(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			m.pruneSeen(now)
+		}
+	}
+}
+
+func (m *Monitor) pruneSeen(now time.Time) {
+	cutoff := now.Add(-30 * time.Minute)
+	m.seenMu.Lock()
+	for mint, seenAt := range m.seen {
+		if seenAt.Before(cutoff) {
+			delete(m.seen, mint)
+		}
+	}
+	m.seenMu.Unlock()
+}
+
+func (m *Monitor) rememberMint(mint string, now time.Time) bool {
+	m.seenMu.Lock()
+	defer m.seenMu.Unlock()
+	if seenAt, exists := m.seen[mint]; exists && now.Sub(seenAt) < 30*time.Minute {
+		return false
+	}
+	m.seen[mint] = now
+	return true
+}
+
+func (m *Monitor) forgetMint(mint string) {
+	m.seenMu.Lock()
+	delete(m.seen, mint)
+	m.seenMu.Unlock()
 }
 
 func (m *Monitor) runMaxHoldChecker(ctx context.Context) {
@@ -131,6 +179,20 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 			}
 		}
 	}
+	m.tracked.Range(func(key, _ any) bool {
+		mint, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if _, open := openMints[mint]; open {
+			return true
+		}
+		active, activeErr := m.db.ActiveForMint(mint)
+		if activeErr == nil && !active {
+			m.tracked.Delete(mint)
+		}
+		return true
+	})
 	m.exitRetryAfter.Range(func(key, _ any) bool {
 		mint, ok := key.(string)
 		if ok {
@@ -182,13 +244,7 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 		case failedExitErr == nil && failedExit:
 			reason = "retry failed exit"
 		case known:
-			reason = positions.ExitReason(
-				positions.Position{Mint: mint, CostSOL: 1, OpenedAt: openedAt},
-				1+returnPct/100,
-				true,
-				positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, MaxHold: m.maxHold},
-				now,
-			)
+			reason = m.positionExitReason(mint, returnPct, openedAt, now)
 		case holdExpired:
 			reason = "max hold time"
 		}
@@ -302,7 +358,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 			created = received
 		}
 		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
-		if _, loaded := m.seen.LoadOrStore(e.Mint, true); loaded {
+		if !m.rememberMint(e.Mint, received) {
 			continue
 		}
 		m.bus.Publish("token_detected", map[string]any{"mint": e.Mint, "creator": e.Creator, "receivedAt": e.Received.UTC()})
@@ -311,7 +367,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 		default:
 			m.log.Warn("token queue full", zap.String("mint", e.Mint))
 			m.bus.Publish("operational_error", map[string]string{"component": "token_monitor", "message": "token queue full"})
-			m.seen.Delete(e.Mint)
+			m.forgetMint(e.Mint)
 		}
 	}
 }
@@ -412,7 +468,7 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 		m.tracked.Delete(mint)
 		return
 	}
-	reason := positions.ExitReason(positions.Position{Mint: mint, CostSOL: 1, OpenedAt: openedAt}, 1+returnPct/100, true, positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, MaxHold: m.maxHold}, time.Now().UTC())
+	reason := m.positionExitReason(mint, returnPct, openedAt, time.Now().UTC())
 	var estimatedPnl, estimatedValue any
 	if cost, costErr := m.db.PositionCost(mint); costErr == nil && cost > 0 {
 		estimatedPnl = cost * returnPct / 100
@@ -429,12 +485,35 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 		"markAvailable": true, "markUpdatedAt": time.Now().UTC(),
 		"markSource": "pumpportal_market_cap", "tokenPriceAvailable": false,
 		"pnlBasis": "market_cap_ratio_estimate", "takeProfitPct": m.takeProfit,
-		"stopLossPct": m.stopLoss, "simulation": m.simulation,
+		"stopLossPct": m.stopLoss, "trailingStopPct": m.trailingStop, "simulation": m.simulation,
 	})
 	if reason == "" {
 		return
 	}
 	m.submitExit(ctx, mint, returnPct, reason)
+}
+
+func (m *Monitor) positionExitReason(mint string, returnPct float64, openedAt, now time.Time) string {
+	cost, err := m.db.PositionCost(mint)
+	if err != nil || cost <= 0 {
+		return ""
+	}
+	peakReturnPct, peakKnown, peakErr := m.db.PaperPeakReturnPct(mint)
+	if !m.simulation {
+		peakReturnPct, peakKnown, peakErr = m.db.LivePeakReturnPct(mint)
+	}
+	peakValue := cost * (1 + returnPct/100)
+	if peakErr == nil && peakKnown && peakReturnPct > returnPct {
+		peakValue = cost * (1 + peakReturnPct/100)
+	}
+	currentValue := cost * (1 + returnPct/100)
+	return positions.ExitReason(
+		positions.Position{Mint: mint, CostSOL: cost, PeakSOL: peakValue, OpenedAt: openedAt},
+		currentValue,
+		true,
+		positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, TrailingStopPct: m.trailingStop, MaxHold: m.maxHold},
+		now,
+	)
 }
 
 func (m *Monitor) submitExit(ctx context.Context, mint string, returnPct float64, reason string) {

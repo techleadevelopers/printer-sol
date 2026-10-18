@@ -20,6 +20,20 @@ type recordingEntrier struct {
 	buyCalls      int
 }
 
+func TestSeenMintIsDeduplicatedOnlyWithinRetentionWindow(t *testing.T) {
+	monitor := &Monitor{seen: make(map[string]time.Time)}
+	first := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	if !monitor.rememberMint("mint", first) {
+		t.Fatal("first observation was treated as a duplicate")
+	}
+	if monitor.rememberMint("mint", first.Add(29*time.Minute)) {
+		t.Fatal("duplicate inside retention window was accepted")
+	}
+	if !monitor.rememberMint("mint", first.Add(31*time.Minute)) {
+		t.Fatal("mint was not eligible for memory cleanup after retention")
+	}
+}
+
 func (e *recordingEntrier) BuyNewTokenUSD(context.Context, string, float64, float64, float64, string, string) (string, error) {
 	e.buyCalls++
 	return "", nil

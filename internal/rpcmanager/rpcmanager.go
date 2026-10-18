@@ -165,12 +165,25 @@ func httpStatus(err error) int {
 	return 0
 }
 func (m *Manager) Send(ctx context.Context, raw []byte) (string, error) {
+	return m.SendWithMaxRetries(ctx, raw, 0)
+}
+
+// SendWithMaxRetries asks the RPC node to rebroadcast the same signed payload.
+// It never constructs or signs a replacement transaction, so retries retain
+// the original signature and are idempotent with respect to duplicate buys.
+func (m *Manager) SendWithMaxRetries(ctx context.Context, raw []byte, maxRetries int) (string, error) {
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	if maxRetries > 5 {
+		maxRetries = 5
+	}
 	u, e := m.currentURL()
 	if e != nil {
 		return "", e
 	}
 	var sig string
-	e = m.call(ctx, u, "sendTransaction", []any{base64.StdEncoding.EncodeToString(raw), map[string]any{"encoding": "base64", "skipPreflight": false, "preflightCommitment": "confirmed", "maxRetries": 0}}, &sig)
+	e = m.call(ctx, u, "sendTransaction", []any{base64.StdEncoding.EncodeToString(raw), map[string]any{"encoding": "base64", "skipPreflight": false, "preflightCommitment": "confirmed", "maxRetries": maxRetries}}, &sig)
 	return sig, e
 }
 func (m *Manager) Status(ctx context.Context, sig string) (string, error) {

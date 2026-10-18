@@ -70,6 +70,8 @@ func main() {
 	monitor := tokenmonitor.New(cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine, cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL, cfg.TakeProfitGrossPct, cfg.StopLossPct, time.Duration(cfg.MaxHoldSeconds)*time.Second, cfg.Simulation, bus, log)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	engine.SetRootContext(ctx)
+	monitor.SetTrailingStopPct(cfg.TrailingStopPct)
 	startupRPC, startupCancel := context.WithTimeout(ctx, 12*time.Second)
 	rpcs.Check(startupRPC)
 	startupCancel()
