@@ -4,7 +4,7 @@ Backend Go conservador para observação de novos tokens, controles de risco e e
 
 ## Segurança e modo de execução
 
-O padrão é `SIMULATION=true`. Neste modo o serviço registra a negociação simulada, mas não assina nem envia bytes de transação. O perfil de exemplo usa ordem de US$ 3, taxa prioritária máxima de 0,0015 SOL, take-profit bruto de 50%, stop-loss de 25%, trailing stop de 12% armado após ganho de 10% sobre o custo e limite de posição de 90 segundos. São parâmetros de operação, não promessa de lucro: preço, taxas, slippage, liquidez e execução podem causar perdas.
+O padrão é `SIMULATION=true`. Neste modo o serviço registra a negociação simulada, mas não assina nem envia bytes de transação. O perfil de exemplo usa ordem de US$ 3, prioridade por transação de 0,001 SOL, taxa-base simulada de 0,000005 SOL, take-profit bruto de 50%, stop-loss de 25%, trailing stop de 12% armado após ganho de 10% sobre o custo e limite de posição de 90 segundos. RugCheck roda de forma assíncrona depois da entrada e não bloqueia o sniping. São parâmetros de operação, não promessa de lucro: preço, taxas, slippage, liquidez e execução podem causar perdas.
 
 A simulação calcula saídas virtuais a partir das atualizações de preço por token do PumpPortal. Por isso, `PUMPPORTAL_API_KEY` também é obrigatória em simulação; o PumpPortal exige uma carteira vinculada com pelo menos 0,02 SOL para essa assinatura. A cotação SOL/USD validada é reutilizada por até 30 segundos; se expirar e a atualização falhar, novas entradas são bloqueadas. A banca exibida como saldo disponível desconta o capital alocado em posições abertas e incorpora resultados realizados após cada saída.
 

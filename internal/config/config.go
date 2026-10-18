@@ -13,7 +13,7 @@ import (
 
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
-	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, AsyncRugCheckAfterEntry, SkipPreflight                                                                                                          bool
+	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, SkipPreflight                                                                                                                                    bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
@@ -30,9 +30,6 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.LiveUnlockRequiresPaper, err = boolEnv("LIVE_UNLOCK_REQUIRES_PAPER", true); err != nil {
-		return c, err
-	}
-	if c.AsyncRugCheckAfterEntry, err = boolEnv("ASYNC_RUGCHECK_AFTER_ENTRY", true); err != nil {
 		return c, err
 	}
 	if c.SkipPreflight, err = boolEnv("SKIP_PREFLIGHT", true); err != nil {
@@ -73,7 +70,7 @@ func Load() (Config, error) {
 	if c.MaxSlippagePct, err = floatEnv("MAX_SLIPPAGE_PCT", 15); err != nil {
 		return c, err
 	}
-	if c.MaxPriorityFeeSOL, err = floatEnv("MAX_PRIORITY_FEE_SOL", .0015); err != nil {
+	if c.MaxPriorityFeeSOL, err = floatEnv("MAX_PRIORITY_FEE_SOL", .001); err != nil {
 		return c, err
 	}
 	if c.TokenQueueSize, err = intEnv("TOKEN_QUEUE_SIZE", 1024); err != nil {

@@ -174,7 +174,7 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 		"MAX_SLIPPAGE_PCT", "MAX_PRIORITY_FEE_SOL", "TOKEN_QUEUE_SIZE",
 		"MAX_OPEN_POSITIONS", "MAX_CONFIRMATION_WAIT_SECONDS", "MAX_SUBMISSION_ATTEMPTS",
 		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
-		"LIVE_UNLOCK_REQUIRES_PAPER", "ASYNC_RUGCHECK_AFTER_ENTRY", "SKIP_PREFLIGHT",
+		"LIVE_UNLOCK_REQUIRES_PAPER", "SKIP_PREFLIGHT",
 		"TOKEN_MAX_AGE_SECONDS", "TAKE_PROFIT_GROSS_PCT", "STOP_LOSS_PCT", "TRAILING_STOP_PCT", "MAX_HOLD_SECONDS",
 	}
 	type previousValue struct {
@@ -209,8 +209,8 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 90 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || !cfg.LiveUnlockRequiresPaper || !cfg.AsyncRugCheckAfterEntry || !cfg.SkipPreflight {
-		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f liveGate=%v asyncScreen=%v skipPreflight=%v", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.AsyncRugCheckAfterEntry, cfg.SkipPreflight)
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 90 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight {
+		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f priorityFee=%.9f liveGate=%v skipPreflight=%v", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.MaxPriorityFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.SkipPreflight)
 	}
 
 	_ = os.Setenv("MAX_HOLD_SECONDS", `"120"`)

@@ -90,6 +90,59 @@ func TestConsumeRejectsCreationEventWithoutTakeProfitBaseline(t *testing.T) {
 	}
 }
 
+func TestConsumeSubmitsEntryBeforeRunningRiskScreen(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "async-entry-screen.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+
+	screenStarted := make(chan struct{}, 1)
+	releaseScreen := make(chan struct{})
+	screenDone := make(chan struct{})
+	strat := strategy.New(db, 5*time.Minute)
+	strat.SetScreen(func(context.Context, string) (string, error) {
+		screenStarted <- struct{}{}
+		<-releaseScreen
+		close(screenDone)
+		return "RugCheck passed: test", nil
+	})
+	entry := &recordingEntrier{}
+	monitor := New("", "", 1, db, strat, entry, 1, 0, 0, 50, 25, 0, true, events.New(), zap.NewNop())
+	event := Event{
+		Mint: "async-screen-mint", Received: time.Now().UTC(), Created: time.Now().UTC(),
+		MarketCapSOL: 100, Raw: `{"mint":"async-screen-mint","marketCapSol":100}`,
+	}
+
+	consumeDone := make(chan struct{})
+	go func() {
+		monitor.consumeEvent(context.Background(), event)
+		close(consumeDone)
+	}()
+	select {
+	case <-consumeDone:
+	case <-time.After(time.Second):
+		t.Fatal("entry processing waited for the risk screen")
+	}
+	if entry.buyCalls != 1 {
+		t.Fatalf("entry was not submitted before screening: %d buys", entry.buyCalls)
+	}
+	select {
+	case <-screenStarted:
+	case <-time.After(time.Second):
+		t.Fatal("post-entry risk screen did not start")
+	}
+	close(releaseScreen)
+	select {
+	case <-screenDone:
+	case <-time.After(time.Second):
+		t.Fatal("post-entry risk screen did not finish")
+	}
+}
+
 func TestSimulationMarksTriggerVirtualTakeProfitAndStopLoss(t *testing.T) {
 	tests := []struct {
 		name          string

@@ -51,7 +51,6 @@ type Monitor struct {
 	trailingStop                    float64
 	maxHold                         time.Duration
 	simulation                      bool
-	asyncRiskScreen                 bool
 	subscriptions                   chan string
 	tracked                         sync.Map
 	seenMu                          sync.Mutex
@@ -174,7 +173,6 @@ func (m *Monitor) MaxHoldSeconds() int {
 	}
 	return int(m.maxHold / time.Second)
 }
-func (m *Monitor) SetAsyncRugCheckAfterEntry(enabled bool) { m.asyncRiskScreen = enabled }
 func (m *Monitor) Run(ctx context.Context) {
 	// The selected database is mode-isolated, so restoring its open positions
 	// keeps live and paper marks separate while resuming exits after a restart.
@@ -561,13 +559,7 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 				m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 	return
 			}
-			var ok bool
-			var reason string
-			if m.asyncRiskScreen && !m.simulation {
-				ok, reason = m.strategy.EvaluateFast(e.Mint, e.Created)
-			} else {
-				ok, reason = m.strategy.Evaluate(ctx, e.Mint, e.Created)
-			}
+			ok, reason := m.strategy.EvaluateFast(e.Mint, e.Created)
 			m.log.Info("token evaluated", zap.String("mint", e.Mint), zap.Bool("eligible", ok), zap.String("reason", reason), zap.Int64("latency_ms", latency))
 			if !ok || m.entry == nil {
 				_ = m.db.RecordAssessment(e.Mint, false, reason)
@@ -580,9 +572,6 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 				m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": entryErr.Error()})
 				m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.Error(entryErr))
 	return
-			}
-			if m.asyncRiskScreen && !m.simulation {
-				m.screenAfterEntry(ctx, e.Mint)
 			}
 			if assessmentErr := m.db.RecordAssessment(e.Mint, true, reason); assessmentErr != nil {
 				m.log.Warn("record entered-token assessment", zap.Error(assessmentErr))
@@ -603,6 +592,9 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 			}
 			m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": m.simulation})
+			if m.strategy.HasScreen() {
+				m.screenAfterEntry(ctx, e.Mint)
+			}
 }
 }
 

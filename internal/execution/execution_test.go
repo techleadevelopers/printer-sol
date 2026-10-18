@@ -51,3 +51,36 @@ func TestSimulationReserveUsesRealizedResultsAndOpenCapital(t *testing.T) {
 	}
 	engine.release("within-balance")
 }
+
+func TestSimulationChargesPriorityAndBaseFeePerTransaction(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "simulation-fees.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := New(db, nil, nil, nil, nil, zap.NewNop(), true, 1, nil, nil, Limits{
+		MaxPriorityFeeSOL: .001, SimulationBaseFeeSOL: .000005,
+	})
+	if _, err = engine.Execute(context.Background(), Request{
+		Mint: "fee-mint", Side: "buy", Amount: .05, DenominatedInSOL: true, PriorityFee: .001,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = engine.Execute(context.Background(), Request{
+		Mint: "fee-mint", Side: "sell", Amount: .05, DenominatedInSOL: true, PriorityFee: .001,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var fees float64
+	if err = db.QueryRow(`SELECT SUM(fees_sol) FROM trades WHERE state='simulated'`).Scan(&fees); err != nil {
+		t.Fatal(err)
+	}
+	if fees < .002009999 || fees > .002010001 {
+		t.Fatalf("round-trip simulated fees = %.9f SOL, want 0.00201 SOL", fees)
+	}
+}

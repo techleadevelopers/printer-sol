@@ -3,8 +3,10 @@ name: First-pump strategy
 description: User-stated trading behavior for newly launched tokens in this project.
 ---
 
-Prioritize entering a newly created token within its first seconds and exiting by take-profit/stop-loss, without checks that delay entry.
+Prioritize entering a newly created token within its first seconds. Keep TP/SL, trailing stop, and the max-hold dead-zone behavior; run RugCheck asynchronously after entry.
 
-**Why:** the user asked for the bot to capture the first Pump rather than lose the move to slow screening.
+Keep financial limits, duplicate-entry prevention, and transaction reconciliation. A failed post-entry RugCheck raises an alert but does not force-close the position.
 
-**How to apply:** keep this entry/exit behavior as the product target when changing the trading pipeline.
+**Why:** the user explicitly chose fast entry without removing existing portfolio limits or transaction integrity checks.
+
+**How to apply:** skip pre-entry RugCheck in the trade path; preserve exit triggers and controls while changing entry or price-monitoring behavior.

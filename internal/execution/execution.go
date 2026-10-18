@@ -127,6 +127,13 @@ func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage,
 	if err != nil {
 		return "", err
 	}
+	if e.simulation {
+		baseFee, feeErr := wallet.SOLToLamports(e.Limits().SimulationBaseFeeSOL)
+		if feeErr != nil {
+			return "", feeErr
+		}
+		fee += baseFee
+	}
 	if bought, err := e.db.HasPurchaseForMint(mint); err != nil {
 		return "", err
 	} else if bought {
@@ -430,6 +437,8 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	id := fmt.Sprintf("tr_%d", time.Now().UTC().UnixNano())
 	simulationFees := 0.0
 	if e.simulation {
+		// Each simulated transaction pays its configured priority bid plus
+		// one base network fee. A round trip contains one buy and one sell.
 		simulationFees = r.PriorityFee + e.Limits().SimulationBaseFeeSOL
 	}
 	t := database.Trade{ID: id, Mint: r.Mint, Side: r.Side, Quantity: fmt.Sprint(r.Amount), Requested: r.Amount, Fees: simulationFees, Slippage: r.Slippage, State: "prepared", EntryReason: r.Reason, ExitReason: r.Reason}

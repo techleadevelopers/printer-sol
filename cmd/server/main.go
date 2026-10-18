@@ -87,15 +87,12 @@ func main() {
 	prices := pricefeed.New(cfg.SOLUSDPriceURL)
 	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, cfg.SimulationBalanceSOL, controller, bus, limits)
 	strat := strategy.New(db, time.Duration(cfg.TokenMaxAgeSeconds)*time.Second)
-	if !cfg.Simulation {
-		strat.SetScreen(screener.RugCheck)
-	}
+	strat.SetScreen(screener.RugCheck)
 	monitor := tokenmonitor.New(cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine, cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL, cfg.TakeProfitGrossPct, cfg.StopLossPct, time.Duration(cfg.MaxHoldSeconds)*time.Second, cfg.Simulation, bus, log)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	engine.SetRootContext(ctx)
 	monitor.SetTrailingStopPct(cfg.TrailingStopPct)
-	monitor.SetAsyncRugCheckAfterEntry(cfg.AsyncRugCheckAfterEntry)
 	startupRPC, startupCancel := context.WithTimeout(ctx, 12*time.Second)
 	rpcs.Check(startupRPC)
 	startupCancel()
