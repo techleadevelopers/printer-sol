@@ -596,7 +596,6 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 				m.screenAfterEntry(ctx, e.Mint)
 			}
 }
-}
 
 func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {
 	go func() {
