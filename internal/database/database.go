@@ -264,6 +264,13 @@ func (d *DB) SetTradePnl(id string, executed, pnl float64) error {
 	_, e := d.Exec(d.bind(`UPDATE trades SET executed_value_sol=?,realized_pnl_sol=?,updated_at=? WHERE id=?`), executed, pnl, time.Now().UTC(), id)
 	return e
 }
+
+// SetTradeExecution persists values derived from the confirmed on-chain
+// transaction. It deliberately does not use a market-cap estimate for live P&L.
+func (d *DB) SetTradeExecution(id string, executed, fees, pnl float64) error {
+	_, e := d.Exec(d.bind(`UPDATE trades SET executed_value_sol=?,fees_sol=?,realized_pnl_sol=?,updated_at=? WHERE id=?`), executed, fees, pnl, time.Now().UTC(), id)
+	return e
+}
 func (d *DB) PaperOpenPnlSOL() (float64, error) {
 	var pnl float64
 	e := d.QueryRow(`SELECT COALESCE(SUM(p.cost_sol * (m.current_market_cap_sol - m.entry_market_cap_sol) / NULLIF(m.entry_market_cap_sol,0)),0) FROM positions p JOIN paper_marks m ON m.mint=p.mint WHERE p.status='open'`).Scan(&pnl)
