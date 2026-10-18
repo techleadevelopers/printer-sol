@@ -1,0 +1,57 @@
+PARE de olhar para frontend ou segurança. O foco agora é SOBREVIVÊNCIA DO CAPITAL E LÓGICA DE TRADING.
+
+Não crie novas camadas de autenticação. Não mexa no visual do painel. A prioridade é fazer o motor de trading rodar sem travar e sem perder dinheiro.
+
+Faça uma análise estática focada APENAS nos 4 gaps abaixo. Se não encontrar problema, diga "OK". Se encontrar, aplique o fix imediato.
+
+═══════════════════════════════════════════════════════════════
+GAP 1 — RACE CONDITION NO PREÇO (WS vs POLLING)
+═══════════════════════════════════════════════════════════════
+Agora temos duas fontes atualizando o `paper_marks` ao mesmo tempo:
+- WebSocket (marketCapSol dos eventos de trade)
+- API Pública (polling a cada 20s)
+
+Se as duas chamarem `UpdatePaperMark()` no mesmo segundo no SQLite, pode dar "database is locked" ou sobrescrever o `peak_market_cap_sol` com um valor menor por engano.
+
+AÇÃO:
+1. Mostre como o `UpdatePaperMark` está implementado no database.go.
+2. Verifique se há mutex (sync.Mutex) ou fila garantindo que as duas fontes não escrevem simultaneamente.
+3. Se não tiver, adicione um mutex na função de update ou faça o UPDATE ser atômico:
+   `SET current = MAX(current, ?), peak = MAX(peak, ?)` para nunca deixar o pico cair.
+
+═══════════════════════════════════════════════════════════════
+GAP 2 — BLOQUEIO DE POSIÇÕES FLAT (O BOT VAI TRAVAR)
+═══════════════════════════════════════════════════════════════
+Nós removemos a venda forçada a 0%. Isso significa que se o bot comprar um token e ele ficar 100% flat (parado no tempo), a posição nunca fecha e a vaga de `MAX_OPEN_POSITIONS` nunca é liberada. Se isso acontecer 25 vezes, o bot para de operar para sempre.
+
+AÇÃO:
+1. Verifique a lógica do `MaxHold`.
+2. Se `MAX_HOLD_SECONDS` (5 min) passar e o token estiver na zona morta, precisamos de uma regra de escape: vender a 0% (aceitar a perda da taxa) APENAS para liberar a vaga, OU remover do DB e marcar como órfã.
+3. A melhor regra: Se `now - OpenedAt > MAX_HOLD_SECONDS` e o token continuar flat, venda a 0% e libere a vaga. É melhor perder $0.40 de taxa do que travar o bot inteiro por horas.
+
+═══════════════════════════════════════════════════════════════
+GAP 3 — RATE LIMIT DA API PÚBLICA (ERRO 429)
+═══════════════════════════════════════════════════════════════
+Com 25 posições abertas e polling de 20s, faremos ~75 requisições por minuto na API da Pump.fun. Se a API bloquear (HTTP 429 Too Many Requests), o bot fica cego de novo.
+
+AÇÃO:
+1. Mostre a função de polling (loop/ticker) que busca o market cap.
+2. Adicione tratamento de erro: se receber 429, faça um backoff exponencial (espera 30s, 60s, etc) e NÃO trave a goroutine principal. 
+3. Se a API falhar 3 vezes seguidas, logue um `risk_alert` no dashboard avisando: "Fallback de preço falhando - bot operando com dados do WS apenas".
+
+═══════════════════════════════════════════════════════════════
+GAP 4 — EXECUÇÃO LIVE (P&L REAL vs ESTIMADO)
+═══════════════════════════════════════════════════════════════
+Na simulação, o P&L usa o Market Cap. No modo real (live), o bot NÃO pode usar o Market Cap para calcular lucro, ele tem que usar o saldo da carteira real.
+
+AÇÃO:
+1. Vá em `execution.go` e verifique a função `confirm()`.
+2. Garanta que, no modo LIVE, o P&L final (quando a venda confirmar) seja calculado via RPC `getTransaction` (lendo a diferença de saldo pré e pós-transação na carteira), e NÃO usando o `paper_marks` ou market cap.
+
+═══════════════════════════════════════════════════════════════
+ENTREGA ESPERADA
+═══════════════════════════════════════════════════════════════
+- Cole o código das 4 áreas (UpdatePaperMark, MaxHold, Polling, Confirm Live).
+- Aplique os fixes necessários.
+- go build ./... (deve passar sem erros).
+- NÃO modifique autenticação, Clerk ou o visual do frontend.
