@@ -129,6 +129,9 @@ func Load() (Config, error) {
 	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 {
 		return c, fmt.Errorf("queue, position, attempt, wait and RPC health-check interval limits must be positive; token age cannot be negative")
 	}
+	if !c.Simulation && c.TokenMaxAgeSeconds == 0 {
+		return c, fmt.Errorf("live trading requires TOKEN_MAX_AGE_SECONDS > 0")
+	}
 	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.TakeProfitGrossPct, c.StopLossPct} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")

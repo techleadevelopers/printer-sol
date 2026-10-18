@@ -21,11 +21,18 @@ func (s *Strategy) SetScreen(screen func(context.Context, string) (string, error
 func New(db *database.DB, maxAge time.Duration) *Strategy {
 	return &Strategy{db: db, maxAge: maxAge}
 }
-func (s *Strategy) Evaluate(ctx context.Context, mint string, receivedAt time.Time) (bool, string) {
+func (s *Strategy) Evaluate(ctx context.Context, mint string, createdAt time.Time) (bool, string) {
 	if mint == "" {
 		return false, "missing mint"
 	}
-	if s.maxAge > 0 && time.Since(receivedAt) > s.maxAge {
+	if createdAt.IsZero() {
+		return false, "missing token creation timestamp"
+	}
+	age := time.Since(createdAt)
+	if age < -30*time.Second {
+		return false, "token creation timestamp is in the future"
+	}
+	if s.maxAge > 0 && age >= s.maxAge {
 		return false, "token creation exceeded maximum entry age"
 	}
 	active, e := s.db.ActiveForMint(mint)

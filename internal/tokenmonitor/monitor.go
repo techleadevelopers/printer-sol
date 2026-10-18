@@ -56,28 +56,25 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, stopLoss: stopLoss, maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size), bus: b, log: l}
 }
 func (m *Monitor) Run(ctx context.Context) {
-	// Tracked mints are in-memory subscriptions. Restore them after a restart
-	// so persisted simulation positions keep receiving live price marks and can
-	// be closed when their take-profit is reached.
-	if !m.simulation {
-		// Paper marks and their virtual take-profit exits must never be restored
-		// or processed by a live worker.
-		go m.consume(ctx)
-		m.runConnections(ctx)
-		return
-	}
-	if mints, err := m.db.OpenPositionMints(); err != nil {
-		m.log.Warn("restore simulated positions", zap.Error(err))
-	} else {
-		for _, mint := range mints {
-			m.tracked.Store(mint, struct{}{})
-		}
-		if len(mints) > 0 {
-			m.log.Info("restored simulated positions", zap.Int("count", len(mints)))
-		}
-	}
+	// The selected database is mode-isolated, so restoring its open positions
+	// keeps live and paper marks separate while resuming exits after a restart.
+	m.restoreOpenPositions()
 	go m.consume(ctx)
 	m.runConnections(ctx)
+}
+
+func (m *Monitor) restoreOpenPositions() {
+	mints, err := m.db.OpenPositionMints()
+	if err != nil {
+		m.log.Warn("restore simulated positions", zap.Error(err))
+		return
+	}
+	for _, mint := range mints {
+		m.tracked.Store(mint, struct{}{})
+	}
+	if len(mints) > 0 {
+		m.log.Info("restored open positions", zap.Int("count", len(mints)), zap.Bool("simulation", m.simulation))
+	}
 }
 func (m *Monitor) runConnections(ctx context.Context) {
 	backoff := time.Second
@@ -164,7 +161,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 		}
 		received := time.Now().UTC()
 		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
-		if created.IsZero() {
+		if created.IsZero() && m.simulation {
 			created = received
 		}
 		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
@@ -258,8 +255,20 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 	if err != nil || !known {
 		return
 	}
+	if !m.simulation {
+		active, activeErr := m.db.ActiveForMint(mint)
+		if activeErr != nil || active {
+			return
+		}
+	}
 	openedAt, ok, err := m.db.PositionOpenedAt(mint)
-	if err != nil || !ok {
+	if err != nil {
+		return
+	}
+	if !ok {
+		if !m.simulation {
+			m.tracked.Delete(mint)
+		}
 		return
 	}
 	reason := positions.ExitReason(positions.Position{Mint: mint, CostSOL: 1, OpenedAt: openedAt}, 1+returnPct/100, true, positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, MaxHold: m.maxHold}, time.Now().UTC())
@@ -274,16 +283,18 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 		id, err = m.entry.CloseLivePosition(ctx, mint, m.slippage, m.priorityFee, reason+" reached in live operation")
 	}
 	if err != nil {
-		m.log.Warn("paper take-profit exit", zap.String("mint", mint), zap.Error(err))
+		m.log.Warn("position exit", zap.String("mint", mint), zap.Error(err))
 		return
 	}
-	m.tracked.Delete(mint)
+	if m.simulation {
+		m.tracked.Delete(mint)
+	}
 	m.bus.Publish("exit_triggered", map[string]any{"mint": mint, "tradeId": id, "reason": reason, "returnPct": returnPct, "simulation": m.simulation})
 }
 
-// timestampFromEvent accepts the timestamp variants emitted by PumpPortal. A
-// missing timestamp is safe here because subscribeNewToken is a live-only
-// stream; its receipt time then becomes the creation-time upper bound.
+// timestampFromEvent accepts timestamp variants emitted by PumpPortal. Live
+// entries reject missing timestamps; simulation may use receipt time because
+// its feed is observation-only.
 func timestampFromEvent(values ...json.RawMessage) time.Time {
 	for _, raw := range values {
 		if len(raw) == 0 || string(raw) == "null" {

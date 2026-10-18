@@ -236,6 +236,84 @@ func (d *DB) FinalizeSimulationSell(id, mint string, value float64) error {
 	return tx.Commit()
 }
 
+func (d *DB) FinalizeLiveBuy(id, mint, state, signature string, cost, fees float64) error {
+	if cost <= 0 {
+		return fmt.Errorf("invalid confirmed live buy cost")
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC()
+	if _, err = tx.Exec(d.bind(`INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
+		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,updated_at=excluded.updated_at`),
+		mint, fmt.Sprint(cost), cost, "open", now, now); err != nil {
+		return err
+	}
+	if err = updateExecutedTrade(tx, d, id, state, signature, cost, fees, nil, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *DB) FinalizeLiveSell(id, mint, state, signature string, value, fees float64) error {
+	if value < 0 {
+		return fmt.Errorf("invalid confirmed live sell value")
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var cost float64
+	if err = tx.QueryRow(d.bind(`SELECT COALESCE(cost_sol,0) FROM positions WHERE mint=? AND status='open'`), mint).Scan(&cost); err != nil {
+		return err
+	}
+	if cost <= 0 {
+		return fmt.Errorf("invalid confirmed live position cost")
+	}
+	now := time.Now().UTC()
+	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=? AND status='open'`), now, mint)
+	if err != nil {
+		return err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if affected != 1 {
+		return fmt.Errorf("live position %q is no longer open", mint)
+	}
+	if err = updateExecutedTrade(tx, d, id, state, signature, value, fees, value-cost, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func updateExecutedTrade(tx *sql.Tx, d *DB, id, state, signature string, executed, fees float64, realized any, now time.Time) error {
+	result, err := tx.Exec(d.bind(`UPDATE trades SET state=?,signature=COALESCE(NULLIF(?,''),signature),executed_value_sol=?,fees_sol=?,realized_pnl_sol=?,confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=?`),
+		state, signature, executed, fees, realized, now, false, now, id)
+	if err != nil {
+		return err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if affected != 1 {
+		return fmt.Errorf("live trade %q not found", id)
+	}
+	result, err = tx.Exec(d.bind(`UPDATE transactions SET state=?,signature=COALESCE(NULLIF(?,''),signature),updated_at=? WHERE trade_id=?`), state, signature, now, id)
+	if err != nil {
+		return err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if affected != 1 {
+		return fmt.Errorf("transaction for live trade %q not found", id)
+	}
+	return nil
+}
+
 func setSimulationTradeState(tx *sql.Tx, d *DB, id string, now time.Time) error {
 	result, err := tx.Exec(d.bind(`UPDATE trades SET state='simulated',confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='buy'`), now, false, now, id)
 	if err != nil {
@@ -427,9 +505,9 @@ func (d *DB) DailyRealizedLossSOL() (float64, error) {
 }
 func (d *DB) ReconciliationRequired() (bool, error) { n, e := d.UnknownTradeCount(); return n > 0, e }
 func (d *DB) UnreconciledTrades() (*sql.Rows, error) {
-	query := `SELECT id,COALESCE(signature,''),state FROM trades WHERE reconciliation_needed=1 ORDER BY created_at ASC`
+	query := `SELECT id,COALESCE(signature,''),mint,side FROM trades WHERE reconciliation_needed=1 ORDER BY created_at ASC`
 	if d.postgres {
-		query = `SELECT id,COALESCE(signature,''),state FROM trades WHERE reconciliation_needed=TRUE ORDER BY created_at ASC`
+		query = `SELECT id,COALESCE(signature,''),mint,side FROM trades WHERE reconciliation_needed=TRUE ORDER BY created_at ASC`
 	}
 	return d.Query(query)
 }

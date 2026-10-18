@@ -191,33 +191,78 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	type pendingTrade struct {
+		id, signature, mint, side string
+	}
+	pending := make([]pendingTrade, 0)
 	for rows.Next() {
-		var id, sig, state string
-		if err = rows.Scan(&id, &sig, &state); err != nil {
+		var trade pendingTrade
+		if err = rows.Scan(&trade.id, &trade.signature, &trade.mint, &trade.side); err != nil {
+			_ = rows.Close()
 			return err
 		}
-		if sig == "" {
-			_ = e.db.UpdateTradeState(id, "unknown", "", false)
-			e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "persisted operation has no signature; manual reconciliation required"})
+		pending = append(pending, trade)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, trade := range pending {
+		if trade.signature == "" {
+			_ = e.db.UpdateTradeState(trade.id, "unknown", "", false)
+			e.emit("risk_alert", map[string]any{"tradeId": trade.id, "reason": "persisted operation has no signature; manual reconciliation required"})
 			continue
 		}
-		status, statusErr := e.rpcs.Status(ctx, sig)
+		if e.simulation {
+			_ = e.db.UpdateTradeState(trade.id, "unknown", trade.signature, false)
+			e.emit("risk_alert", map[string]any{"tradeId": trade.id, "reason": "live signature found in simulation ledger"})
+			continue
+		}
+		status, statusErr := e.rpcs.Status(ctx, trade.signature)
 		if statusErr != nil {
-			e.emit("operational_error", map[string]any{"component": "reconciliation", "tradeId": id, "message": "RPC status unavailable"})
+			e.emit("operational_error", map[string]any{"component": "reconciliation", "tradeId": trade.id, "message": "RPC status unavailable"})
 			continue
 		}
 		switch status {
 		case "confirmed", "finalized":
-			_ = e.db.UpdateTradeState(id, status, sig, true)
+			execution, fee, executionErr := e.rpcs.Execution(ctx, trade.signature, e.wallet.Address())
+			if executionErr != nil {
+				_ = e.db.UpdateTradeState(trade.id, "unknown", trade.signature, false)
+				e.emit("operational_error", map[string]any{"component": "reconciliation", "tradeId": trade.id, "message": "confirmed transaction execution unavailable"})
+				continue
+			}
+			var finalizeErr error
+			switch trade.side {
+			case "buy":
+				if execution >= 0 {
+					finalizeErr = fmt.Errorf("confirmed buy did not debit operational wallet")
+				} else {
+					finalizeErr = e.db.FinalizeLiveBuy(trade.id, trade.mint, status, trade.signature, -execution, fee)
+				}
+			case "sell":
+				if execution < 0 {
+					finalizeErr = fmt.Errorf("confirmed sell did not credit operational wallet")
+				} else {
+					finalizeErr = e.db.FinalizeLiveSell(trade.id, trade.mint, status, trade.signature, execution, fee)
+				}
+			default:
+				finalizeErr = fmt.Errorf("unsupported reconciled trade side %q", trade.side)
+			}
+			if finalizeErr != nil {
+				_ = e.db.UpdateTradeState(trade.id, "unknown", trade.signature, false)
+				e.emit("risk_alert", map[string]any{"tradeId": trade.id, "reason": finalizeErr.Error()})
+			}
 		case "failed":
-			_ = e.db.UpdateTradeState(id, "failed", sig, true)
+			_ = e.db.UpdateTradeState(trade.id, "failed", trade.signature, true)
 		default:
-			_ = e.db.UpdateTradeState(id, "unknown", sig, false)
+			_ = e.db.UpdateTradeState(trade.id, "unknown", trade.signature, false)
 		}
-		_ = e.db.LogOperational("info", "reconciliation", "persisted transaction checked", fmt.Sprintf(`{"tradeId":%q,"state":%q}`, id, status))
+		_ = e.db.LogOperational("info", "reconciliation", "persisted transaction checked", fmt.Sprintf(`{"tradeId":%q,"state":%q}`, trade.id, status))
 	}
-	return rows.Err()
+	return nil
 }
 func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	if r.Mint == "" || (r.Side != "buy" && r.Side != "sell") || r.Amount <= 0 || r.Slippage < 0 || r.PriorityFee < 0 {
@@ -388,7 +433,6 @@ func (e *Engine) confirm(id, sig string, r Request) {
 		if err == nil {
 			switch state {
 			case "confirmed", "finalized":
-				_ = e.db.UpdateTradeState(id, state, sig, true)
 				execution, fee, executionErr := e.rpcs.Execution(ctx, sig, e.wallet.Address())
 				if executionErr != nil {
 					_ = e.db.UpdateTradeState(id, "unknown", sig, false)
@@ -402,16 +446,22 @@ func (e *Engine) confirm(id, sig string, r Request) {
 						return
 					}
 					cost := -execution
-					_ = e.db.SetTradeExecution(id, cost, fee, 0)
-					_ = e.db.OpenPosition(r.Mint, cost)
+					if err = e.db.FinalizeLiveBuy(id, r.Mint, state, sig, cost, fee); err != nil {
+						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
+						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed buy could not be committed to the live ledger"})
+						return
+					}
 				} else {
-					cost, costErr := e.db.ClosePosition(r.Mint)
-					if costErr != nil || execution < 0 {
+					if execution < 0 {
 						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
 						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "sell confirmation lacks valid wallet credit"})
 						return
 					}
-					_ = e.db.SetTradeExecution(id, execution, fee, execution-cost)
+					if err = e.db.FinalizeLiveSell(id, r.Mint, state, sig, execution, fee); err != nil {
+						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
+						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed sell could not be committed to the live ledger"})
+						return
+					}
 				}
 				e.release(r.Mint)
 				e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "signature": sig, "state": state})

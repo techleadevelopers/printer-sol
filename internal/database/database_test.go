@@ -107,3 +107,48 @@ func TestSimulationFinalizationUpdatesAvailableBankroll(t *testing.T) {
 		t.Fatalf("simulated exit not finalized atomically: state=%q pnl=%.9f", state, pnl)
 	}
 }
+
+func TestLiveTradeFinalizationCommitsExecutionAndPositionAtomically(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "live-finalization.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = db.InsertTrade(Trade{ID: "live-buy", Mint: "live-mint", Side: "buy", Quantity: "0.05", Requested: 0.05, State: "submitted"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.FinalizeLiveBuy("live-buy", "live-mint", "confirmed", "buy-signature", 0.05, 0.001); err != nil {
+		t.Fatal(err)
+	}
+	open, err := db.OpenPositionCount()
+	if err != nil || open != 1 {
+		t.Fatalf("confirmed buy position missing: open=%d err=%v", open, err)
+	}
+
+	if err = db.InsertTrade(Trade{ID: "live-sell", Mint: "live-mint", Side: "sell", Quantity: "100", Requested: 100, State: "submitted"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.FinalizeLiveSell("live-sell", "live-mint", "finalized", "sell-signature", 0.075, 0.002); err != nil {
+		t.Fatal(err)
+	}
+	open, err = db.OpenPositionCount()
+	if err != nil || open != 0 {
+		t.Fatalf("confirmed sell position remains open: open=%d err=%v", open, err)
+	}
+
+	var state, signature string
+	var executed, fees, pnl float64
+	if err = db.QueryRow(`SELECT state,signature,executed_value_sol,fees_sol,realized_pnl_sol FROM trades WHERE id='live-sell'`).Scan(&state, &signature, &executed, &fees, &pnl); err != nil {
+		t.Fatal(err)
+	}
+	if state != "finalized" || signature != "sell-signature" || executed != 0.075 || fees != 0.002 || pnl < 0.024999999 || pnl > 0.025000001 {
+		t.Fatalf("live sell ledger is inconsistent: state=%q signature=%q executed=%.9f fees=%.9f pnl=%.9f", state, signature, executed, fees, pnl)
+	}
+	if needed, err := db.ReconciliationRequired(); err != nil || needed {
+		t.Fatalf("finalized live trades should not remain unreconciled: needed=%v err=%v", needed, err)
+	}
+}

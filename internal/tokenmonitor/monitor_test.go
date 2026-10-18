@@ -12,6 +12,21 @@ import (
 	"solana-sniper-backend/internal/execution"
 )
 
+type recordingEntrier struct {
+	liveExitCalls int
+}
+
+func (e *recordingEntrier) BuyNewTokenUSD(context.Context, string, float64, float64, float64, string, string) (string, error) {
+	return "", nil
+}
+func (e *recordingEntrier) ClosePaperPosition(context.Context, string, float64, string) (string, error) {
+	return "", nil
+}
+func (e *recordingEntrier) CloseLivePosition(context.Context, string, float64, float64, string) (string, error) {
+	e.liveExitCalls++
+	return "live-sell", nil
+}
+
 func TestSimulationMarksTriggerVirtualTakeProfitAndStopLoss(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -72,6 +87,55 @@ func TestSimulationMarksTriggerVirtualTakeProfitAndStopLoss(t *testing.T) {
 				t.Fatalf("bankroll after virtual %s = %.9f SOL, want %.9f SOL", test.name, available, 1+test.wantPnL)
 			}
 		})
+	}
+}
+
+func TestLiveMonitorRestoresOpenPositionsAndWaitsForConfirmedExit(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "live-monitor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenPosition("live-mint", 0.05); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordLiveMark("live-mint", 100); err != nil {
+		t.Fatal(err)
+	}
+
+	bus := events.New()
+	entry := &recordingEntrier{}
+	monitor := New("", "", 8, db, nil, entry, 0, 0, 0, 50, 30, time.Minute, false, bus, zap.NewNop())
+	monitor.restoreOpenPositions()
+	if _, tracked := monitor.tracked.Load("live-mint"); !tracked {
+		t.Fatal("live open position was not restored for price monitoring")
+	}
+
+	monitor.markTrade(context.Background(), "live-mint", 150)
+	if entry.liveExitCalls != 1 {
+		t.Fatalf("take-profit should submit one live exit, got %d", entry.liveExitCalls)
+	}
+	if _, tracked := monitor.tracked.Load("live-mint"); !tracked {
+		t.Fatal("live position was untracked before its sell was confirmed")
+	}
+
+	if err = db.InsertTrade(database.Trade{ID: "live-sell", Mint: "live-mint", Side: "sell", Quantity: "100", Requested: 100, State: "submitted"}); err != nil {
+		t.Fatal(err)
+	}
+	monitor.markTrade(context.Background(), "live-mint", 175)
+	if entry.liveExitCalls != 1 {
+		t.Fatalf("pending sell caused a duplicate submission: %d exits", entry.liveExitCalls)
+	}
+
+	if err = db.FinalizeLiveSell("live-sell", "live-mint", "confirmed", "signature", 0.075, 0.001); err != nil {
+		t.Fatal(err)
+	}
+	monitor.markTrade(context.Background(), "live-mint", 175)
+	if _, tracked := monitor.tracked.Load("live-mint"); tracked {
+		t.Fatal("closed live position remained subscribed after the next price update")
 	}
 }
 
