@@ -46,19 +46,23 @@ type BondingCurveMarketCapSource interface {
 }
 
 type Settings struct {
-	EntryDelay        time.Duration
-	MinTransactions   int
-	PricePollInterval time.Duration
-	SnipeConcurrency  int
-	SnipeTimeout      time.Duration
-	DedupeTTL         time.Duration
-	BondingCurve      BondingCurveMarketCapSource
+	EntryDelay            time.Duration
+	MinTransactions       int
+	MinVolumeBeforeBuySOL float64
+	MinMarketCapSOL       float64
+	PricePollInterval     time.Duration
+	SnipeConcurrency      int
+	SnipeTimeout          time.Duration
+	DedupeTTL             time.Duration
+	BondingCurve          BondingCurveMarketCapSource
 }
 
 type candidate struct {
 	event             Event
 	detectedAt        time.Time
 	tradeEvents       int
+	buyVolumeSOL      float64
+	creatorSold       bool
 	tradeMarketCapSOL float64
 	checking          bool
 }
@@ -97,6 +101,8 @@ type Monitor struct {
 	validationSlots                 chan struct{}
 	entryDelay                      time.Duration
 	minTransactions                 int
+	minVolumeBeforeBuySOL           float64
+	minMarketCapSOL                 float64
 	pricePollInterval               time.Duration
 	snipeConcurrency                int
 	snipeTimeout                    time.Duration
@@ -253,7 +259,9 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		candidates:   make(map[string]*candidate),
 		snipePending: make(map[string]time.Time),
 		validationSlots: make(chan struct{}, settings.SnipeConcurrency),
-		entryDelay:   settings.EntryDelay, minTransactions: settings.MinTransactions,
+	entryDelay: settings.EntryDelay, minTransactions: settings.MinTransactions,
+	minVolumeBeforeBuySOL: settings.MinVolumeBeforeBuySOL,
+	minMarketCapSOL:       settings.MinMarketCapSOL,
 		pricePollInterval: settings.PricePollInterval,
 		snipeConcurrency:  settings.SnipeConcurrency,
 		snipeTimeout:      settings.SnipeTimeout, dedupeTTL: settings.DedupeTTL,
@@ -608,15 +616,22 @@ func (m *Monitor) connect(ctx context.Context) error {
 		})
 		return true
 	})
-	for {
-		_, b, err := c.ReadMessage()
+		for {
+			_, b, err := c.ReadMessage()
 		if err != nil {
 			return err
 		}
-		var d struct {
-			Mint, Creator, User, TxType            string
-			CreatedTimestamp, Timestamp, BlockTime json.RawMessage
-			MarketCapSol                           float64 `json:"marketCapSol"`
+			var d struct {
+				Mint             string          `json:"mint"`
+				Creator          string          `json:"creator"`
+				User             string          `json:"user"`
+				TraderPublicKey  string          `json:"traderPublicKey"`
+				TxType           string          `json:"txType"`
+				CreatedTimestamp json.RawMessage `json:"createdTimestamp"`
+				Timestamp        json.RawMessage `json:"timestamp"`
+				BlockTime        json.RawMessage `json:"blockTime"`
+				MarketCapSol     float64         `json:"marketCapSol"`
+				SolAmount        float64         `json:"solAmount"`
 		}
 		if err = json.Unmarshal(b, &d); err != nil {
 			m.log.Warn("invalid PumpPortal websocket JSON",
@@ -676,12 +691,19 @@ func (m *Monitor) connect(ctx context.Context) error {
 			}
 			continue
 		}
-		if m.recordCandidateTrade(d.Mint, d.TxType, d.MarketCapSol) {
+			trader := d.TraderPublicKey
+			if trader == "" {
+				trader = d.User
+			}
+			if m.recordCandidateTradeDetails(d.Mint, d.TxType, d.MarketCapSol, d.SolAmount, trader) {
 			continue
 		}
 		creator := d.Creator
 		if creator == "" {
-			creator = d.User
+				creator = d.TraderPublicKey
+			}
+			if creator == "" {
+				creator = d.User
 		}
 		received := time.Now().UTC()
 		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)

@@ -18,6 +18,8 @@ const (
 type candidateState struct {
 	event             Event
 	tradeEvents       int
+	buyVolumeSOL      float64
+	creatorSold       bool
 	tradeMarketCapSOL float64
 }
 
@@ -44,18 +46,36 @@ func (m *Monitor) addCandidate(event Event) bool {
 // recordCandidateTrade consumes the candidate's own PumpPortal subscription.
 // It counts only actual buy/sell trade frames, never the creation announcement.
 func (m *Monitor) recordCandidateTrade(mint, txType string, marketCapSOL float64) bool {
+	return m.recordCandidateTradeDetails(mint, txType, marketCapSOL, 0, "")
+}
+
+func (m *Monitor) recordCandidateTradeDetails(mint, txType string, marketCapSOL, solAmount float64, trader string) bool {
 	m.candidateMu.Lock()
 	defer m.candidateMu.Unlock()
 	item, exists := m.candidates[mint]
 	if !exists {
 		return false
 	}
+	isTrade := true
 	switch strings.ToLower(strings.TrimSpace(txType)) {
-	case "buy", "sell", "trade":
+	case "buy":
 		item.tradeEvents++
-		if marketCapSOL > 0 {
-			item.tradeMarketCapSOL = marketCapSOL
+		if solAmount > 0 && !math.IsNaN(solAmount) && !math.IsInf(solAmount, 0) {
+			item.buyVolumeSOL += solAmount
 		}
+	case "sell":
+		item.tradeEvents++
+		creator := strings.TrimSpace(item.event.Creator)
+		if creator != "" && strings.TrimSpace(trader) == creator {
+			item.creatorSold = true
+		}
+	case "trade":
+		item.tradeEvents++
+	default:
+		isTrade = false
+	}
+	if isTrade && marketCapSOL > 0 && !math.IsNaN(marketCapSOL) && !math.IsInf(marketCapSOL, 0) {
+		item.tradeMarketCapSOL = marketCapSOL
 	}
 	return true
 }
@@ -176,6 +196,9 @@ func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 		return
 	}
 	marketCapSOL := state.tradeMarketCapSOL
+	if marketCapSOL <= 0 {
+		marketCapSOL = state.event.MarketCapSOL
+	}
 	if state.tradeEvents >= m.minTransactions && marketCapSOL <= 0 {
 		var err error
 		marketCapSOL, err = m.readBondingCurveMarketCap(ctx, mint)
@@ -201,6 +224,7 @@ func (m *Monitor) candidateSnapshot(mint string) (candidateState, bool) {
 	}
 	return candidateState{
 		event: item.event, tradeEvents: item.tradeEvents,
+		buyVolumeSOL: item.buyVolumeSOL, creatorSold: item.creatorSold,
 		tradeMarketCapSOL: item.tradeMarketCapSOL,
 	}, true
 }
@@ -214,7 +238,8 @@ func (m *Monitor) finishCandidate(mint string, rpcMarketCapSOL float64) {
 	}
 	state := candidateState{
 		event:       item.event,
-		tradeEvents: item.tradeEvents, tradeMarketCapSOL: item.tradeMarketCapSOL,
+		tradeEvents: item.tradeEvents, buyVolumeSOL: item.buyVolumeSOL,
+		creatorSold: item.creatorSold, tradeMarketCapSOL: item.tradeMarketCapSOL,
 	}
 	delete(m.candidates, mint)
 	m.candidateMu.Unlock()
@@ -232,6 +257,18 @@ func (m *Monitor) finishCandidate(mint string, rpcMarketCapSOL float64) {
 		m.rejectCandidate(state.event, reason)
 		return
 	}
+	if strings.TrimSpace(state.event.Creator) == "" {
+		m.rejectCandidate(state.event, "creator wallet unavailable; developer sells cannot be monitored")
+		return
+	}
+	if state.creatorSold {
+		m.rejectCandidate(state.event, "creator sold during the entry activity window")
+		return
+	}
+	if state.buyVolumeSOL < m.minVolumeBeforeBuySOL {
+		m.rejectCandidate(state.event, fmt.Sprintf("buy volume %.6f SOL is below the %.6f SOL minimum", state.buyVolumeSOL, m.minVolumeBeforeBuySOL))
+		return
+	}
 	if reason := m.creatorBlacklistReason(state.event.Creator); reason != "" {
 		m.rejectCandidate(state.event, reason)
 		return
@@ -240,7 +277,16 @@ func (m *Monitor) finishCandidate(mint string, rpcMarketCapSOL float64) {
 		m.rejectCandidate(state.event, "candidate has no positive market cap")
 		return
 	}
+	if marketCapSOL < m.minMarketCapSOL {
+		m.rejectCandidate(state.event, fmt.Sprintf("market cap %.6f SOL is below the %.6f SOL minimum", marketCapSOL, m.minMarketCapSOL))
+		return
+	}
 	state.event.MarketCapSOL = marketCapSOL
+	m.log.Info("candidate passed entry activity gate",
+		zap.String("mint", mint),
+		zap.Int("trade_events", state.tradeEvents),
+		zap.Float64("buy_volume_sol", state.buyVolumeSOL),
+		zap.Float64("market_cap_sol", marketCapSOL))
 	queued, enqueueReason := m.enqueueSnipe(state.event)
 	if !queued {
 		m.rejectCandidate(state.event, enqueueReason)

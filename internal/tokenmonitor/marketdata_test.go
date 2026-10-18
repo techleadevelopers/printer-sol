@@ -38,7 +38,7 @@ func newMarketDataTestMonitor(t *testing.T) (*Monitor, func()) {
 func testCandidate(mint string) Event {
 	now := time.Now().UTC()
 	return Event{
-		Mint: mint, Received: now, Created: now,
+Mint: mint, Creator: "test-creator", Received: now, Created: now,
 		Raw: `{"mint":"` + mint + `"}`,
 	}
 }

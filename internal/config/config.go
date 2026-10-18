@@ -19,6 +19,7 @@ type Config struct {
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
 	SnipeConcurrency, SnipeTimeoutMS, DedupeTTLMS                                                                                                                                                           int
 	EntryDelaySeconds, MinTxnsBeforeBuy, PricePollSeconds                                                                                                                                                   int
+	MinVolumeBeforeBuySOL, MinMarketCapSOL                                                                                                                                                                   float64
 	RPCEndpoints                                                                                                                                                                                            []string
 }
 
@@ -94,6 +95,12 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.MinTxnsBeforeBuy, err = intEnv("MIN_TXNS_BEFORE_BUY", 2); err != nil {
+		return c, err
+	}
+	if c.MinVolumeBeforeBuySOL, err = floatEnv("MIN_VOLUME_BEFORE_BUY", .02); err != nil {
+		return c, err
+	}
+	if c.MinMarketCapSOL, err = floatEnv("MIN_MARKET_CAP_SOL", 20); err != nil {
 		return c, err
 	}
 	if c.PricePollSeconds, err = intEnv("PRICE_POLL_SECONDS", 20); err != nil {
@@ -177,7 +184,7 @@ func Load() (Config, error) {
 	if !c.Simulation && c.TokenMaxAgeSeconds == 0 {
 		return c, fmt.Errorf("live trading requires TOKEN_MAX_AGE_SECONDS > 0")
 	}
-	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct} {
+for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuySOL, c.MinMarketCapSOL} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}

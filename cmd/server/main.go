@@ -95,13 +95,15 @@ func main() {
 		cfg.TakeProfitGrossPct, cfg.StopLossPct,
 		time.Duration(cfg.MaxHoldSeconds)*time.Second, cfg.Simulation, bus, log,
 		tokenmonitor.Settings{
-			EntryDelay:        time.Duration(cfg.EntryDelaySeconds) * time.Second,
-			MinTransactions:   cfg.MinTxnsBeforeBuy,
-			PricePollInterval: time.Duration(cfg.PricePollSeconds) * time.Second,
-			SnipeConcurrency:  cfg.SnipeConcurrency,
-			SnipeTimeout:      time.Duration(cfg.SnipeTimeoutMS) * time.Millisecond,
-			DedupeTTL:         time.Duration(cfg.DedupeTTLMS) * time.Millisecond,
-			BondingCurve:      rpcs,
+			EntryDelay:            time.Duration(cfg.EntryDelaySeconds) * time.Second,
+			MinTransactions:       cfg.MinTxnsBeforeBuy,
+			MinVolumeBeforeBuySOL: cfg.MinVolumeBeforeBuySOL,
+			MinMarketCapSOL:       cfg.MinMarketCapSOL,
+			PricePollInterval:     time.Duration(cfg.PricePollSeconds) * time.Second,
+			SnipeConcurrency:      cfg.SnipeConcurrency,
+			SnipeTimeout:          time.Duration(cfg.SnipeTimeoutMS) * time.Millisecond,
+			DedupeTTL:             time.Duration(cfg.DedupeTTLMS) * time.Millisecond,
+			BondingCurve:          rpcs,
 		},
 	)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

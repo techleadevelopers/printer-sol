@@ -1,0 +1,50 @@
+Você agora é o Arquiteto Chefe do nosso Solana Sniper Bot. O usuário acabou de clonar 4 repositórios de referência na pasta `backend/tools/`:
+1. `tools/pump-fun-botp` (Lógica on-chain da Bonding Curve)
+2. `tools/pumpr-bot` (Filtros de segurança e entrada)
+3. `tools/pumpfun-grpc-sniper` e `tools/solana-grpc-sniper-bundler-bot` (Baixa latência e filas)
+
+O NOSSO OBJETIVO: Ser lucrativo na Pump.fun, comprando apenas tokens com volume real (evitando tokens mortos de 0%), lendo o preço direto da blockchain (sem depender de API lenta) e gerenciando a fila sem travar.
+
+Sua missão tem 2 fases: RELATÓRIO e IMPLEMENTAÇÃO.
+
+REGRA DE OURO: A pasta `tools/` é APENAS LEITURA. Não tente rodar `go build` dentro dela, nem importe arquivos de lá. Nós vamos reescrever a lógica em Go no nosso runtime (`internal/`).
+
+═══════════════════════════════════════════════════════════════
+FASE 1 — RELATÓRIO COMPLETO DE AUDITORIA
+═══════════════════════════════════════════════════════════════
+Antes de escrever código, leia os arquivos da pasta `tools/` e me entregue um relatório listando:
+- O que o `pump-fun-botp` ensina sobre ler a Bonding Curve (PDA, bytes de reservas).
+- O que o `pumpr-bot` ensina sobre filtros de entrada (como eles checam o criador, volume e compradores).
+- O que os bots gRPC ensinam sobre concorrência, TTL de memória e envio de transação (Jito/Priority Fees).
+Explique brevemente o que devemos trazer para o nosso Go.
+
+═══════════════════════════════════════════════════════════════
+FASE 2 — IMPLEMENTAÇÃO NO NOSSO CÓDIGO GO
+═══════════════════════════════════════════════════════════════
+
+AÇÃO 1 — LEITURA DA BONDING CURVE (O Coração do Sniper)
+- Baseado no `tools/pump-fun-botp`, implemente em `internal/rpcmanager/` a função `GetBondingCurveState(mint)`.
+- Ela deve calcular o endereço PDA da bonding curve (usando a seed "bonding-curve" e o Program ID 6EF8...), fazer o getAccountInfo e ler os bytes exatos (`virtualSolReserves`, `virtualTokenReserves`).
+- Calcule o Market Cap real em SOL e garanta que isso alimente o `paper_marks` e o `entry activity gate` (substituindo o DexScreener).
+
+AÇÃO 2 — ENTRY GATE INTELIGENTE (Evitar Tokens Mortos)
+- Baseado no `tools/pumpr-bot`, melhore o nosso `entry activity gate` no `internal/tokenmonitor/`.
+- A regra de entrada deve usar o Market Cap da Ação 1. 
+- Implemente filtros: só comprar se o token tiver um volume mínimo (configurável), um Market Cap inicial acima de um limite e se a carteira do Dev não estiver despejando tokens (se o repositório base tiver essa lógica).
+
+AÇÃO 3 — FILA COM DEDUPLICAÇÃO E TTL (Evitar Travar o Bot)
+- Baseado nos bots gRPC, implemente no `internal/tokenmonitor/monitor.go` uma fila de processamento.
+- Use `sync.Map` para deduplicação: se o mesmo mint chegar em menos de 60 segundos, ignore.
+- Adicione um limite de concorrência (ex: no máximo 10 goroutines processando entradas ao mesmo tempo) para não estourar a memória ou o RPC.
+
+AÇÃO 4 — EXECUÇÃO RÁPIDA
+- Baseado nos bots gRPC, se houver uma lógica melhor de `priorityFee` (taxa dinâmica) ou envio rápido (Jito/Retries), adapte para o nosso `internal/execution/execution.go`.
+
+═══════════════════════════════════════════════════════════════
+ENTREGA FINAL
+═══════════════════════════════════════════════════════════════
+1. O relatório da Fase 1.
+2. Os diffs (código antes e depois) das ações aplicadas no nosso Go.
+3. Rode `go build ./...` e garanta que tudo compila (a pasta `tools/` deve ser ignorada nesse build).
+
+Não desvie o foco. Não adicione autenticação. O objetivo é transformar nosso bot em um Sniper lucrativo.
