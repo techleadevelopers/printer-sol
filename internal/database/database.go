@@ -105,11 +105,20 @@ type Trade struct {
 
 func (d *DB) InsertTrade(t Trade) error {
 	now := time.Now().UTC()
+	exitReason := t.ExitReason
+	var realizedPnl any
+	if t.Side == "sell" {
+		exitReason = strings.TrimSpace(exitReason)
+		if exitReason == "" {
+			exitReason = "unspecified exit"
+		}
+		realizedPnl = 0.0
+	}
 	tx, e := d.Begin()
 	if e != nil {
 		return e
 	}
-	if _, e = tx.Exec(d.bind(`INSERT INTO trades(id,mint,side,quantity,requested_value_sol,fees_sol,slippage_pct,state,entry_reason,exit_reason,reconciliation_needed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`), t.ID, t.Mint, t.Side, t.Quantity, t.Requested, t.Fees, t.Slippage, t.State, t.EntryReason, t.ExitReason, true, now, now); e == nil {
+	if _, e = tx.Exec(d.bind(`INSERT INTO trades(id,mint,side,quantity,requested_value_sol,fees_sol,realized_pnl_sol,slippage_pct,state,entry_reason,exit_reason,reconciliation_needed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`), t.ID, t.Mint, t.Side, t.Quantity, t.Requested, t.Fees, realizedPnl, t.Slippage, t.State, t.EntryReason, exitReason, true, now, now); e == nil {
 		_, e = tx.Exec(d.bind(`INSERT INTO transactions(id,trade_id,state,created_at,updated_at) VALUES(?,?,?,?,?)`), "tx_"+t.ID, t.ID, t.State, now, now)
 	}
 	if e != nil {
@@ -264,11 +273,16 @@ func (d *DB) FinalizeSimulationSell(id, mint string, value float64, feesOpt ...f
 	if err = tx.QueryRow(d.bind(`SELECT COALESCE(exit_reason,'') FROM trades WHERE id=? AND side='sell'`), id).Scan(&exitReason); err != nil {
 		return err
 	}
+	exitReason = strings.TrimSpace(exitReason)
+	if exitReason == "" {
+		exitReason = "unspecified exit"
+	}
 	now := time.Now().UTC()
 	fees := 0.0
 	if len(feesOpt) > 0 {
 		fees = feesOpt[0]
 	}
+	realizedPnl := value - cost
 	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=? AND status='open'`), now, mint)
 	if err != nil {
 		return err
@@ -278,8 +292,8 @@ func (d *DB) FinalizeSimulationSell(id, mint string, value float64, feesOpt ...f
 	} else if affected != 1 {
 		return fmt.Errorf("simulated position %q is no longer open", mint)
 	}
-	result, err = tx.Exec(d.bind(`UPDATE trades SET state='simulated',executed_value_sol=?,fees_sol=?,realized_pnl_sol=?,confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='sell'`),
-		value, fees, value-cost, now, false, now, id)
+	result, err = tx.Exec(d.bind(`UPDATE trades SET state='simulated',executed_value_sol=COALESCE(?,0.0),fees_sol=COALESCE(?,0.0),realized_pnl_sol=COALESCE(?,0.0),exit_reason=COALESCE(NULLIF(TRIM(exit_reason),''),?),confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='sell'`),
+		value, fees, realizedPnl, exitReason, now, false, now, id)
 	if err != nil {
 		return err
 	}

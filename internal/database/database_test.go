@@ -370,6 +370,16 @@ func TestSimulationFinalizationUpdatesAvailableBankroll(t *testing.T) {
 	if err = db.InsertTrade(Trade{ID: "sim-sell", Mint: "winning-mint", Side: "sell", Quantity: "0.12", Requested: 0.12, State: "prepared"}); err != nil {
 		t.Fatal(err)
 	}
+	var pendingPnl sql.NullFloat64
+	if err = db.QueryRow(`SELECT realized_pnl_sol FROM trades WHERE id='sim-sell'`).Scan(&pendingPnl); err != nil {
+		t.Fatal(err)
+	}
+	if !pendingPnl.Valid || pendingPnl.Float64 != 0 {
+		t.Fatalf("prepared simulated sell P&L = %+v; want non-NULL 0", pendingPnl)
+	}
+	if _, err = db.Exec(`UPDATE trades SET exit_reason='' WHERE id='sim-sell'`); err != nil {
+		t.Fatal(err)
+	}
 	if err = db.FinalizeSimulationSell("sim-sell", "winning-mint", 0.12); err != nil {
 		t.Fatal(err)
 	}
@@ -393,13 +403,13 @@ func TestSimulationFinalizationUpdatesAvailableBankroll(t *testing.T) {
 		t.Fatalf("available simulation balance = %.9f SOL, want 0.42 SOL", available)
 	}
 
-	var state string
-	var pnl float64
-	if err = db.QueryRow(`SELECT state,realized_pnl_sol FROM trades WHERE id='sim-sell'`).Scan(&state, &pnl); err != nil {
+	var state, exitReason string
+	var fees, pnl float64
+	if err = db.QueryRow(`SELECT state,fees_sol,realized_pnl_sol,exit_reason FROM trades WHERE id='sim-sell'`).Scan(&state, &fees, &pnl, &exitReason); err != nil {
 		t.Fatal(err)
 	}
-	if state != "simulated" || pnl < 0.019999999 || pnl > 0.020000001 {
-		t.Fatalf("simulated exit not finalized atomically: state=%q pnl=%.9f", state, pnl)
+	if state != "simulated" || fees != 0 || pnl < 0.019999999 || pnl > 0.020000001 || exitReason != "unspecified exit" {
+		t.Fatalf("simulated exit not finalized with non-NULL financial fields: state=%q fees=%.9f pnl=%.9f exitReason=%q", state, fees, pnl, exitReason)
 	}
 }
 
