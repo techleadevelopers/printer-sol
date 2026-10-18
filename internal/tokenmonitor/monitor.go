@@ -14,7 +14,6 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 	"solana-sniper-backend/internal/database"
-	"solana-sniper-backend/internal/dexscreener"
 	"solana-sniper-backend/internal/events"
 	"solana-sniper-backend/internal/positions"
 	"solana-sniper-backend/internal/strategy"
@@ -41,14 +40,6 @@ type unknownTradeReconciler interface {
 	ReconcileUnknown(context.Context) error
 }
 
-type CoinSource interface {
-	Coin(context.Context, string) (dexscreener.CoinSnapshot, error)
-}
-
-type SOLUSDQuoter interface {
-	SOLUSD(context.Context) (float64, error)
-}
-
 type BondingCurveMarketCapSource interface {
 	BondingCurveMarketCapSOL(context.Context, string) (float64, error)
 }
@@ -56,10 +47,7 @@ type BondingCurveMarketCapSource interface {
 type Settings struct {
 	EntryDelay        time.Duration
 	MinTransactions   int
-	MinVolume         float64
 	PricePollInterval time.Duration
-	Coins             CoinSource
-	SOLUSD            SOLUSDQuoter
 	BondingCurve      BondingCurveMarketCapSource
 }
 
@@ -102,14 +90,11 @@ type Monitor struct {
 	candidates                      map[string]*candidate
 	entryDelay                      time.Duration
 	minTransactions                 int
-	minVolume                       float64
 	pricePollInterval               time.Duration
-	coins                           CoinSource
-	solUSD                          SOLUSDQuoter
 	bondingCurve                    BondingCurveMarketCapSource
-	coinAPIStatusMu                 sync.Mutex
-	coinAPIFailures                 int
-	coinAPIAlerted                  bool
+	priceSourceStatusMu             sync.Mutex
+	priceSourceFailures             int
+	priceSourceAlerted              bool
 }
 
 const exitRetryDelay = 5 * time.Second
@@ -214,9 +199,7 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 	settings := Settings{
 		EntryDelay:        5 * time.Second,
 		MinTransactions:   2,
-		MinVolume:         .5,
 		PricePollInterval: 20 * time.Second,
-		Coins:             dexscreener.NewClient(),
 	}
 	if len(options) > 0 {
 		option := options[0]
@@ -226,20 +209,10 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		if option.MinTransactions > 0 {
 			settings.MinTransactions = option.MinTransactions
 		}
-		if option.MinVolume > 0 {
-			settings.MinVolume = option.MinVolume
-		}
 		if option.PricePollInterval > 0 {
 			settings.PricePollInterval = option.PricePollInterval
 		}
-		if option.Coins != nil {
-			settings.Coins = option.Coins
-		}
-		settings.SOLUSD = option.SOLUSD
 		settings.BondingCurve = option.BondingCurve
-	}
-	if limiter, ok := settings.Coins.(interface{ SetRateLimitBase(time.Duration) }); ok {
-		limiter.SetRateLimitBase(settings.PricePollInterval)
 	}
 	return &Monitor{
 		ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry,
@@ -248,8 +221,8 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size),
 		seen: make(map[string]time.Time), candidates: make(map[string]*candidate),
 		entryDelay: settings.EntryDelay, minTransactions: settings.MinTransactions,
-		minVolume: settings.MinVolume, pricePollInterval: settings.PricePollInterval,
-		coins: settings.Coins, solUSD: settings.SOLUSD, bondingCurve: settings.BondingCurve,
+		pricePollInterval: settings.PricePollInterval,
+		bondingCurve: settings.BondingCurve,
 		bus: b, log: l,
 	}
 }
@@ -563,7 +536,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 					_ = c.Close()
 					return
 				}
-				m.log.Info("token trade subscription request sent", zap.String("mint", mint))
+				m.log.Info("PumpPortal subscribeTokenTrade request sent", zap.String("mint", mint))
 			}
 		}
 	}()

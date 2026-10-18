@@ -14,10 +14,10 @@ import (
 	"solana-sniper-backend/internal/strategy"
 )
 
-type fixedSOLUSD float64
+type fixedBondingCurveMarketCap float64
 
-func (q fixedSOLUSD) SOLUSD(context.Context) (float64, error) {
-	return float64(q), nil
+func (mcap fixedBondingCurveMarketCap) BondingCurveMarketCapSOL(context.Context, string) (float64, error) {
+	return float64(mcap), nil
 }
 
 func newMarketDataTestMonitor(t *testing.T) (*Monitor, func()) {
@@ -31,8 +31,7 @@ func newMarketDataTestMonitor(t *testing.T) (*Monitor, func()) {
 		t.Fatal(err)
 	}
 	monitor := New("", "", 8, db, strategy.New(db, time.Minute), &recordingEntrier{},
-		1, 0, 0, 50, 25, time.Minute, true, events.New(), zap.NewNop(),
-		Settings{SOLUSD: fixedSOLUSD(100)})
+		1, 0, 0, 50, 25, time.Minute, true, events.New(), zap.NewNop())
 	return monitor, func() { _ = db.Close() }
 }
 
@@ -44,7 +43,7 @@ func testCandidate(mint string) Event {
 	}
 }
 
-func TestCandidateGateRejectsExplicitZeroMarketCap(t *testing.T) {
+func TestCandidateGateRejectsTwoTradesWithoutPositiveMarketCap(t *testing.T) {
 	monitor, closeDB := newMarketDataTestMonitor(t)
 	defer closeDB()
 	event := testCandidate("zero-market-cap")
@@ -52,16 +51,15 @@ func TestCandidateGateRejectsExplicitZeroMarketCap(t *testing.T) {
 		t.Fatal("candidate was not queued")
 	}
 
-	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{
-		Transactions: 10, VolumeUSD: 100, HasTransactions: true, HasVolumeUSD: true,
-		HasMarketCapUSD: true, MarketCapUSD: 0,
-	}, nil)
+	monitor.recordCandidateTrade(event.Mint, "buy", 0)
+	monitor.recordCandidateTrade(event.Mint, "sell", 0)
+	monitor.finishCandidate(event.Mint, 0)
 	if len(monitor.q) != 0 {
-		t.Fatal("candidate with an explicit zero market cap was queued for entry")
+		t.Fatal("candidate without a positive WebSocket or RPC mark was queued for entry")
 	}
 }
 
-func TestCandidateGateRequiresBothActivityThresholds(t *testing.T) {
+func TestCandidateGateRequiresTwoWebSocketTrades(t *testing.T) {
 	monitor, closeDB := newMarketDataTestMonitor(t)
 	defer closeDB()
 	event := testCandidate("low-activity")
@@ -69,12 +67,10 @@ func TestCandidateGateRequiresBothActivityThresholds(t *testing.T) {
 		t.Fatal("candidate was not queued")
 	}
 
-	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{
-		Transactions: 1, VolumeUSD: 100, HasTransactions: true, HasVolumeUSD: true,
-		HasMarketCapUSD: true, MarketCapUSD: 10000,
-	}, nil)
+	monitor.recordCandidateTrade(event.Mint, "buy", 120)
+	monitor.finishCandidate(event.Mint, 0)
 	if len(monitor.q) != 0 {
-		t.Fatal("candidate below the transaction threshold was queued for entry")
+		t.Fatal("candidate with only one WebSocket trade was queued for entry")
 	}
 }
 
@@ -86,10 +82,9 @@ func TestCandidateGateQueuesActiveTokenWithPositiveMarketCap(t *testing.T) {
 		t.Fatal("candidate was not queued")
 	}
 
-	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{
-		Transactions: 3, VolumeUSD: 500, HasTransactions: true, HasVolumeUSD: true,
-		HasMarketCapUSD: true, MarketCapUSD: 12000,
-	}, nil)
+	monitor.recordCandidateTrade(event.Mint, "buy", 110)
+	monitor.recordCandidateTrade(event.Mint, "sell", 120)
+	monitor.finishCandidate(event.Mint, 0)
 	select {
 	case queued := <-monitor.q:
 		if queued.MarketCapSOL != 120 {
@@ -100,7 +95,7 @@ func TestCandidateGateQueuesActiveTokenWithPositiveMarketCap(t *testing.T) {
 	}
 }
 
-func TestCandidateGateUsesTwoPositivePriceWebSocketTradesWhenAPIUnavailable(t *testing.T) {
+func TestCandidateGateUsesTwoPositivePriceWebSocketTradesWithoutRPC(t *testing.T) {
 	monitor, closeDB := newMarketDataTestMonitor(t)
 	defer closeDB()
 	event := testCandidate("websocket-fallback")
@@ -110,7 +105,7 @@ func TestCandidateGateUsesTwoPositivePriceWebSocketTradesWhenAPIUnavailable(t *t
 	monitor.recordCandidateTrade(event.Mint, "buy", 130)
 	monitor.recordCandidateTrade(event.Mint, "sell", 140)
 
-	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{}, errors.New("API unavailable"))
+	monitor.finishCandidate(event.Mint, 0)
 	select {
 	case queued := <-monitor.q:
 		if queued.MarketCapSOL != 140 {
@@ -118,6 +113,28 @@ func TestCandidateGateUsesTwoPositivePriceWebSocketTradesWhenAPIUnavailable(t *t
 		}
 	default:
 		t.Fatal("eligible WebSocket fallback was not queued")
+	}
+}
+
+func TestCandidateGateUsesRPCAfterTwoWebSocketTradesWithoutMark(t *testing.T) {
+	monitor, closeDB := newMarketDataTestMonitor(t)
+	defer closeDB()
+	event := testCandidate("rpc-mark-fallback")
+	if !monitor.addCandidate(event) {
+		t.Fatal("candidate was not queued")
+	}
+	monitor.recordCandidateTrade(event.Mint, "buy", 0)
+	monitor.recordCandidateTrade(event.Mint, "sell", 0)
+	monitor.bondingCurve = fixedBondingCurveMarketCap(150)
+
+	monitor.checkCandidate(context.Background(), event.Mint)
+	select {
+	case queued := <-monitor.q:
+		if queued.MarketCapSOL != 150 {
+			t.Fatalf("RPC entry baseline market cap = %f, want 150", queued.MarketCapSOL)
+		}
+	default:
+		t.Fatal("candidate with two WS trades and positive RPC mark was not queued")
 	}
 }
 
@@ -130,23 +147,23 @@ func TestCandidateGateRejectsWebSocketFallbackWithoutTwoTrades(t *testing.T) {
 	}
 	monitor.recordCandidateTrade(event.Mint, "buy", 140)
 
-	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{}, errors.New("API unavailable"))
+	monitor.finishCandidate(event.Mint, 0)
 	if len(monitor.q) != 0 {
 		t.Fatal("candidate with only one WebSocket trade was queued for entry")
 	}
 }
 
-func TestCoinAPIAlertLogsAfterThreeConsecutiveFailures(t *testing.T) {
+func TestRPCPriceSourceAlertLogsAfterThreeConsecutiveFailures(t *testing.T) {
 	monitor, closeDB := newMarketDataTestMonitor(t)
 	defer closeDB()
 	alertEvents, unsubscribe := monitor.bus.Subscribe()
 	defer unsubscribe()
 
 	for i := 0; i < 3; i++ {
-		monitor.recordCoinAPIResult(errors.New("HTTP 429"))
+		monitor.recordPriceSourceResult(errors.New("RPC unavailable"))
 	}
-	if monitor.coinAPIFailures != 3 || !monitor.coinAPIAlerted {
-		t.Fatalf("alert state after three failures = (%d, %v)", monitor.coinAPIFailures, monitor.coinAPIAlerted)
+	if monitor.priceSourceFailures != 3 || !monitor.priceSourceAlerted {
+		t.Fatalf("alert state after three failures = (%d, %v)", monitor.priceSourceFailures, monitor.priceSourceAlerted)
 	}
 	select {
 	case alert := <-alertEvents:
@@ -164,9 +181,9 @@ func TestCoinAPIAlertLogsAfterThreeConsecutiveFailures(t *testing.T) {
 		t.Fatalf("persisted risk alerts = %d, want exactly 1", alerts)
 	}
 
-	monitor.recordCoinAPIResult(errors.New("HTTP 429"))
-	monitor.recordCoinAPIResult(nil)
-	if monitor.coinAPIFailures != 0 || monitor.coinAPIAlerted {
-		t.Fatalf("recovery did not reset alert state: (%d, %v)", monitor.coinAPIFailures, monitor.coinAPIAlerted)
+	monitor.recordPriceSourceResult(errors.New("RPC unavailable"))
+	monitor.recordPriceSourceResult(nil)
+	if monitor.priceSourceFailures != 0 || monitor.priceSourceAlerted {
+		t.Fatalf("recovery did not reset alert state: (%d, %v)", monitor.priceSourceFailures, monitor.priceSourceAlerted)
 	}
 }

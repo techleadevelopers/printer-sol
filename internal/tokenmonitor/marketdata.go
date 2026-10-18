@@ -9,11 +9,9 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	"solana-sniper-backend/internal/dexscreener"
 )
 
 const (
-	fallbackMinimumTradeEvents = 2
 	candidateCheckWorkers      = 8
 	pricePollWorkers           = 5
 )
@@ -112,30 +110,41 @@ func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 	generation := m.resetGeneration.Load()
 	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
-	var snapshot dexscreener.CoinSnapshot
-	var apiErr error
-	if m.coins != nil {
-		snapshot, apiErr = m.coins.Coin(ctx, mint)
-	} else {
-		apiErr = context.DeadlineExceeded
+	state, exists := m.candidateSnapshot(mint)
+	if !exists {
+		return
+	}
+	marketCapSOL := state.tradeMarketCapSOL
+	if state.tradeEvents >= m.minTransactions && marketCapSOL <= 0 {
+		var err error
+		marketCapSOL, err = m.readBondingCurveMarketCap(ctx, mint)
+		if err != nil {
+			m.log.Debug("candidate bonding-curve market-cap lookup failed",
+				zap.String("mint", mint), zap.Error(err))
+		}
 	}
 	if parent.Err() != nil {
 		return
 	}
-	m.recordCoinAPIResult(apiErr)
-	if apiErr == nil {
-		m.log.Info("polling source=dexscreener",
-			zap.String("mint", mint),
-			zap.Int("transactions", snapshot.Transactions),
-			zap.Float64("volume_usd", snapshot.VolumeUSD),
-			zap.Float64("mcap_usd", snapshot.MarketCapUSD))
-	}
 	m.runOperationAt(generation, func() {
-		m.finishCandidate(ctx, mint, snapshot, apiErr)
+		m.finishCandidate(mint, marketCapSOL)
 	})
 }
 
-func (m *Monitor) finishCandidate(ctx context.Context, mint string, coin dexscreener.CoinSnapshot, apiErr error) {
+func (m *Monitor) candidateSnapshot(mint string) (candidateState, bool) {
+	m.candidateMu.Lock()
+	defer m.candidateMu.Unlock()
+	item := m.candidates[mint]
+	if item == nil {
+		return candidateState{}, false
+	}
+	return candidateState{
+		event: item.event, tradeEvents: item.tradeEvents,
+		tradeMarketCapSOL: item.tradeMarketCapSOL,
+	}, true
+}
+
+func (m *Monitor) finishCandidate(mint string, rpcMarketCapSOL float64) {
 	m.candidateMu.Lock()
 	item := m.candidates[mint]
 	if item == nil {
@@ -149,55 +158,16 @@ func (m *Monitor) finishCandidate(ctx context.Context, mint string, coin dexscre
 	delete(m.candidates, mint)
 	m.candidateMu.Unlock()
 
-	accepted := false
-	reason := ""
-	marketCapSOL := 0.0
-	volumeSOL, hasVolume := m.coinVolumeSOL(ctx, coin)
-	if apiErr == nil {
-		activityAvailable := coin.HasTransactions && hasVolume
-		if coin.HasTransactions && coin.Transactions < m.minTransactions {
-			reason = "DexScreener activity below MIN_TXNS_BEFORE_BUY"
-		}
-		if reason == "" && hasVolume && volumeSOL < m.minVolume {
-			reason = "DexScreener volume below MIN_VOLUME_SOL_BEFORE_BUY"
-		}
-		if reason == "" && coin.HasMarketCapUSD {
-			if value, valid := m.coinMarketCapSOL(ctx, coin); valid {
-				marketCapSOL = value
-			}
-		}
-
-		if reason == "" && activityAvailable {
-			accepted = true
-		} else if reason == "" {
-			accepted, reason = m.websocketCandidateFallback(state)
-		}
-	} else {
-		accepted, reason = m.websocketCandidateFallback(state)
-	}
-
-	if accepted && marketCapSOL <= 0 && state.tradeMarketCapSOL > 0 {
-		marketCapSOL = state.tradeMarketCapSOL
-	}
-	if accepted && marketCapSOL <= 0 {
-		value, err := m.bondingCurveMarketCapSOL(ctx, mint)
-		if err == nil {
-			marketCapSOL = value
-		} else if m.bondingCurve != nil {
-			m.log.Debug("candidate bonding-curve market-cap fallback failed",
-				zap.String("mint", mint), zap.Error(err))
-		}
+	accepted, reason := m.websocketCandidateFallback(state)
+	marketCapSOL := state.tradeMarketCapSOL
+	if marketCapSOL <= 0 {
+		marketCapSOL = rpcMarketCapSOL
 	}
 	if accepted && marketCapSOL <= 0 {
 		accepted = false
-		if reason == "" {
-			reason = "candidate has no positive market cap"
-		}
+		reason = "candidate has no positive WebSocket or bonding-curve market cap"
 	}
 	if !accepted {
-		if reason == "" {
-			reason = "candidate did not meet the minimum activity and positive-price requirements"
-		}
 		m.rejectCandidate(state.event, reason)
 		return
 	}
@@ -215,8 +185,8 @@ func (m *Monitor) finishCandidate(ctx context.Context, mint string, coin dexscre
 }
 
 func (m *Monitor) websocketCandidateFallback(state candidateState) (bool, string) {
-	if state.tradeEvents < fallbackMinimumTradeEvents {
-		return false, "DexScreener API unavailable or incomplete; fewer than two WebSocket trades in the entry window"
+	if state.tradeEvents < m.minTransactions {
+		return false, fmt.Sprintf("fewer than %d WebSocket trades in the entry window", m.minTransactions)
 	}
 	return true, "WebSocket activity fallback accepted"
 }
@@ -235,38 +205,49 @@ func (m *Monitor) bondingCurveMarketCapSOL(ctx context.Context, mint string) (fl
 	return marketCapSOL, nil
 }
 
-func (m *Monitor) recordCoinAPIResult(err error) {
-	m.coinAPIStatusMu.Lock()
+func (m *Monitor) readBondingCurveMarketCap(ctx context.Context, mint string) (float64, error) {
+	marketCapSOL, err := m.bondingCurveMarketCapSOL(ctx, mint)
+	m.recordPriceSourceResult(err)
+	if err != nil {
+		return 0, err
+	}
+	m.log.Info("polling source=solana_rpc_bonding_curve",
+		zap.String("mint", mint), zap.Float64("mcap", marketCapSOL))
+	return marketCapSOL, nil
+}
+
+func (m *Monitor) recordPriceSourceResult(err error) {
+	m.priceSourceStatusMu.Lock()
 	if err == nil {
-		m.coinAPIFailures = 0
-		m.coinAPIAlerted = false
-		m.coinAPIStatusMu.Unlock()
+		m.priceSourceFailures = 0
+		m.priceSourceAlerted = false
+		m.priceSourceStatusMu.Unlock()
 		return
 	}
-	m.coinAPIFailures++
-	failures := m.coinAPIFailures
-	shouldAlert := failures >= 3 && !m.coinAPIAlerted
+	m.priceSourceFailures++
+	failures := m.priceSourceFailures
+	shouldAlert := failures >= 3 && !m.priceSourceAlerted
 	if shouldAlert {
-		m.coinAPIAlerted = true
+		m.priceSourceAlerted = true
 	}
-	m.coinAPIStatusMu.Unlock()
+	m.priceSourceStatusMu.Unlock()
 	if !shouldAlert {
 		return
 	}
 
 	message := "polling failing"
-	detail := "API pública de cotação indisponível; marcações por WebSocket/RPC são usadas quando disponíveis"
-	m.log.Warn("polling failing: DexScreener public price feed degraded",
+	detail := "Solana RPC bonding-curve market-cap source unavailable; valid WebSocket marks remain usable"
+	m.log.Warn("polling failing: Solana RPC bonding-curve price feed degraded",
 		zap.Int("consecutiveFailures", failures), zap.Error(err))
 	if m.db != nil {
-		payload := fmt.Sprintf(`{"component":"dexscreener_token_api","consecutiveFailures":%d,"detail":"%s"}`, failures, detail)
+		payload := fmt.Sprintf(`{"component":"solana_bonding_curve_rpc","consecutiveFailures":%d,"detail":"%s"}`, failures, detail)
 		if logErr := m.db.LogOperational("warn", "risk_alert", message, payload); logErr != nil {
 			m.log.Warn("persist public price feed risk alert", zap.Error(logErr))
 		}
 	}
 	if m.bus != nil {
 		m.bus.Publish("risk.alert", map[string]any{
-			"reason": message, "component": "dexscreener_token_api",
+			"reason": message, "component": "solana_bonding_curve_rpc",
 			"consecutiveFailures": failures, "detail": detail + ": " + err.Error(),
 		})
 	}
@@ -289,30 +270,6 @@ func (m *Monitor) rejectCandidate(event Event, reason string) {
 	})
 }
 
-func (m *Monitor) coinVolumeSOL(ctx context.Context, coin dexscreener.CoinSnapshot) (float64, bool) {
-	if !coin.HasVolumeUSD || coin.VolumeUSD < 0 || m.solUSD == nil {
-		return 0, false
-	}
-	solUSD, err := m.solUSD.SOLUSD(ctx)
-	if err != nil || solUSD <= 0 || math.IsNaN(solUSD) || math.IsInf(solUSD, 0) {
-		return 0, false
-	}
-	volumeSOL := coin.VolumeUSD / solUSD
-	return volumeSOL, volumeSOL >= 0 && !math.IsNaN(volumeSOL) && !math.IsInf(volumeSOL, 0)
-}
-
-func (m *Monitor) coinMarketCapSOL(ctx context.Context, coin dexscreener.CoinSnapshot) (float64, bool) {
-	if !coin.HasMarketCapUSD || coin.MarketCapUSD <= 0 || m.solUSD == nil {
-		return 0, false
-	}
-	solUSD, err := m.solUSD.SOLUSD(ctx)
-	if err != nil || solUSD <= 0 {
-		return 0, false
-	}
-	marketCapSOL := coin.MarketCapUSD / solUSD
-	return marketCapSOL, marketCapSOL > 0 && !math.IsNaN(marketCapSOL) && !math.IsInf(marketCapSOL, 0)
-}
-
 func (m *Monitor) runPricePoller(ctx context.Context) {
 	ticker := time.NewTicker(m.pricePollInterval)
 	defer ticker.Stop()
@@ -322,13 +279,7 @@ func (m *Monitor) runPricePoller(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.pollOpenPositionPrices(ctx)
-			nextInterval := m.pricePollInterval
-			if limiter, ok := m.coins.(interface{ RateLimitDelay() time.Duration }); ok {
-				if retryAfter := limiter.RateLimitDelay(); retryAfter > nextInterval && m.bondingCurve == nil {
-					nextInterval = retryAfter
-				}
-			}
-			ticker.Reset(nextInterval)
+			ticker.Reset(m.pricePollInterval)
 		}
 	}
 }
@@ -343,7 +294,7 @@ func (m *Monitor) pollOpenPositionPrices(ctx context.Context) {
 		return
 	}
 	if scanErr != nil {
-		m.log.Warn("scan open positions for public price refresh", zap.Error(scanErr))
+		m.log.Warn("scan open positions for RPC mark refresh", zap.Error(scanErr))
 		return
 	}
 	workers := make(chan struct{}, pricePollWorkers)
@@ -366,39 +317,13 @@ func (m *Monitor) pollOpenPositionPrices(ctx context.Context) {
 }
 
 func (m *Monitor) refreshOpenPositionPrice(ctx context.Context, mint string, generation uint64) {
-	if m.coins == nil {
-		m.recordCoinAPIResult(fmt.Errorf("DexScreener client is not configured"))
-		m.refreshBondingCurveMarketCap(ctx, mint, generation)
-		return
-	}
 	requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	coin, err := m.coins.Coin(requestCtx, mint)
-	if err != nil {
-		m.recordCoinAPIResult(err)
-		m.log.Debug("DexScreener market-cap refresh failed", zap.String("mint", mint), zap.Error(err))
-		m.refreshBondingCurveMarketCap(requestCtx, mint, generation)
-		return
-	}
-	marketCapSOL, valid := m.coinMarketCapSOL(requestCtx, coin)
-	m.log.Info("polling source=dexscreener",
-		zap.String("mint", mint),
-		zap.Float64("mcap_usd", coin.MarketCapUSD),
-		zap.Float64("mcap_sol", marketCapSOL),
-		zap.Bool("positive_mark", valid && marketCapSOL > 0))
-	if !valid || marketCapSOL <= 0 {
-		markErr := fmt.Errorf("DexScreener response has no usable positive market cap")
-		m.recordCoinAPIResult(markErr)
-		m.log.Debug("DexScreener returned no positive mark", zap.String("mint", mint))
-		m.refreshBondingCurveMarketCap(requestCtx, mint, generation)
-		return
-	}
-	m.recordCoinAPIResult(nil)
-	m.markTradeWithSourceAt(generation, requestCtx, mint, marketCapSOL, "dexscreener_public_api")
+	m.refreshBondingCurveMarketCap(requestCtx, mint, generation)
 }
 
 func (m *Monitor) refreshBondingCurveMarketCap(ctx context.Context, mint string, generation uint64) bool {
-	marketCapSOL, err := m.bondingCurveMarketCapSOL(ctx, mint)
+	marketCapSOL, err := m.readBondingCurveMarketCap(ctx, mint)
 	if err != nil {
 		if m.bondingCurve != nil {
 			m.log.Debug("bonding-curve market-cap refresh failed",
