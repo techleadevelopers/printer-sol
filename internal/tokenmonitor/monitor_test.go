@@ -2,6 +2,7 @@ package tokenmonitor
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 type recordingEntrier struct {
 	liveExitCalls int
+	liveExitFailures int
 	buyCalls      int
 }
 
@@ -27,6 +29,9 @@ func (e *recordingEntrier) ClosePaperPosition(context.Context, string, float64, 
 }
 func (e *recordingEntrier) CloseLivePosition(context.Context, string, float64, float64, string) (string, error) {
 	e.liveExitCalls++
+	if e.liveExitCalls <= e.liveExitFailures {
+		return "", errors.New("simulated live sell failure")
+	}
 	return "live-sell", nil
 }
 
@@ -187,6 +192,42 @@ func TestLiveMonitorRestoresOpenPositionsAndWaitsForConfirmedExit(t *testing.T) 
 	}
 }
 
+func TestLivePendingBuyKeepsMarkTrackingUntilConfirmation(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "live-pending-buy-mark.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.InsertTrade(database.Trade{ID: "pending-buy", Mint: "pending-mint", Side: "buy", Quantity: "0.05", Requested: 0.05, State: "submitted"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordLiveMark("pending-mint", 100); err != nil {
+		t.Fatal(err)
+	}
+
+	entry := &recordingEntrier{}
+	monitor := New("", "", 8, db, nil, entry, 0, 0, 0, 50, 30, 5*time.Minute, false, events.New(), zap.NewNop())
+	monitor.tracked.Store("pending-mint", struct{}{})
+	monitor.markTrade(context.Background(), "pending-mint", 150)
+	if _, tracked := monitor.tracked.Load("pending-mint"); !tracked {
+		t.Fatal("pending live buy lost its price subscription before confirmation")
+	}
+	if entry.liveExitCalls != 0 {
+		t.Fatalf("pending buy triggered a sell before confirmation: %d exits", entry.liveExitCalls)
+	}
+
+	if err = db.FinalizeLiveBuy("pending-buy", "pending-mint", "confirmed", "buy-signature", 0.05, 0); err != nil {
+		t.Fatal(err)
+	}
+	monitor.markTrade(context.Background(), "pending-mint", 150)
+	if entry.liveExitCalls != 1 {
+		t.Fatalf("confirmed position did not exit at its configured 50%% target: %d exits", entry.liveExitCalls)
+	}
+}
+
 func TestLiveMaxHoldClosesExpiredPositionWithoutFurtherPriceUpdates(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "live-max-hold-no-feed.db"))
 	if err != nil {
@@ -216,6 +257,79 @@ func TestLiveMaxHoldClosesExpiredPositionWithoutFurtherPriceUpdates(t *testing.T
 	monitor.expireOpenPositions(context.Background())
 	if entry.liveExitCalls != 1 {
 		t.Fatalf("pending timed exit caused a duplicate sell: %d", entry.liveExitCalls)
+	}
+}
+
+func TestLiveTakeProfitRetriesAfterSellFailureWithoutNewPriceEvent(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "live-take-profit-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenPosition("retry-live-mint", 0.05); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordLiveMark("retry-live-mint", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdateLiveMark("retry-live-mint", 150); err != nil {
+		t.Fatal(err)
+	}
+
+	entry := &recordingEntrier{liveExitFailures: 1}
+	monitor := New("", "", 8, db, nil, entry, 0, 0, 0, 50, 30, 5*time.Minute, false, events.New(), zap.NewNop())
+	monitor.expireOpenPositions(context.Background())
+	if entry.liveExitCalls != 1 {
+		t.Fatalf("take-profit should attempt the first live exit, got %d", entry.liveExitCalls)
+	}
+
+	if err = db.UpdateLiveMark("retry-live-mint", 120); err != nil {
+		t.Fatal(err)
+	}
+	monitor.expireOpenPositions(context.Background())
+	if entry.liveExitCalls != 1 {
+		t.Fatal("retry backoff did not suppress an immediate repeated request")
+	}
+	monitor.exitRetryAfter.Store("retry-live-mint", time.Now().Add(-time.Second))
+	monitor.expireOpenPositions(context.Background())
+	if entry.liveExitCalls != 2 {
+		t.Fatalf("take-profit was not retried from the persisted mark: %d exits", entry.liveExitCalls)
+	}
+}
+
+func TestLiveFailedSellRetriesEvenAfterPriceFallsBelowTakeProfit(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "live-failed-sell-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenPosition("failed-sell-mint", 0.05); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordLiveMark("failed-sell-mint", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdateLiveMark("failed-sell-mint", 120); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.InsertTrade(database.Trade{ID: "confirmed-failed-sell", Mint: "failed-sell-mint", Side: "sell", Quantity: "100", Requested: 100, State: "prepared"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.MarkTradeFailed("confirmed-failed-sell"); err != nil {
+		t.Fatal(err)
+	}
+
+	entry := &recordingEntrier{}
+	monitor := New("", "", 8, db, nil, entry, 0, 0, 0, 50, 30, 5*time.Minute, false, events.New(), zap.NewNop())
+	monitor.expireOpenPositions(context.Background())
+	if entry.liveExitCalls != 1 {
+		t.Fatalf("persisted failed sell should be retried below take-profit: %d exits", entry.liveExitCalls)
 	}
 }
 

@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"github.com/gagliardetto/solana-go"
 	"go.uber.org/zap"
@@ -191,24 +192,41 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return e.reconcileRows(ctx, rows)
+}
+
+// ReconcileUnknown revisits outcomes that were uncertain while the service
+// stayed online. It only reads persisted signatures and never submits trades.
+func (e *Engine) ReconcileUnknown(ctx context.Context) error {
+	if e.simulation {
+		return nil
+	}
+	rows, err := e.db.UnknownTrades()
+	if err != nil {
+		return err
+	}
+	return e.reconcileRows(ctx, rows)
+}
+
+func (e *Engine) reconcileRows(ctx context.Context, rows *sql.Rows) error {
 	type pendingTrade struct {
 		id, signature, mint, side string
 	}
 	pending := make([]pendingTrade, 0)
 	for rows.Next() {
 		var trade pendingTrade
-		if err = rows.Scan(&trade.id, &trade.signature, &trade.mint, &trade.side); err != nil {
+		if scanErr := rows.Scan(&trade.id, &trade.signature, &trade.mint, &trade.side); scanErr != nil {
 			_ = rows.Close()
-			return err
+			return scanErr
 		}
 		pending = append(pending, trade)
 	}
-	if err = rows.Err(); err != nil {
+	if rowsErr := rows.Err(); rowsErr != nil {
 		_ = rows.Close()
-		return err
+		return rowsErr
 	}
-	if err = rows.Close(); err != nil {
-		return err
+	if closeErr := rows.Close(); closeErr != nil {
+		return closeErr
 	}
 	for _, trade := range pending {
 		if trade.signature == "" {
@@ -359,6 +377,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 			}
 		} else {
 			if err := e.db.FinalizeSimulationSell(id, r.Mint, r.Amount); err != nil {
+				_ = e.db.MarkTradeFailed(id)
 				return id, fmt.Errorf("close simulated position: %w", err)
 			}
 		}
@@ -372,33 +391,33 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	}
 	txBytes, err := e.portal.Prepare(ctx, pumpportal.Request{PublicKey: e.wallet.Address(), Action: r.Side, Mint: r.Mint, Amount: amount, DenominatedInSOL: fmt.Sprint(r.DenominatedInSOL), Slippage: r.Slippage, PriorityFee: r.PriorityFee, Pool: r.Pool})
 	if err != nil {
-		_ = e.db.UpdateTradeState(id, "failed", "", false)
+		_ = e.db.MarkTradeFailed(id)
 		return id, err
 	}
 	tx, err := solana.TransactionFromBytes(txBytes)
 	if err != nil {
-		_ = e.db.UpdateTradeState(id, "failed", "", false)
+		_ = e.db.MarkTradeFailed(id)
 		return id, fmt.Errorf("unsupported PumpPortal transaction encoding: %w", err)
 	}
 	if err = tx.Sanitize(); err != nil {
-		_ = e.db.UpdateTradeState(id, "failed", "", false)
+		_ = e.db.MarkTradeFailed(id)
 		return id, fmt.Errorf("unsafe transaction: %w", err)
 	}
 	if err = e.validatePreparedTransaction(tx); err != nil {
-		_ = e.db.UpdateTradeState(id, "failed", "", false)
+		_ = e.db.MarkTradeFailed(id)
 		return id, fmt.Errorf("unsafe prepared transaction: %w", err)
 	}
 	if !tx.IsSigner(e.wallet.PublicKey()) {
-		_ = e.db.UpdateTradeState(id, "failed", "", false)
+		_ = e.db.MarkTradeFailed(id)
 		return id, fmt.Errorf("prepared transaction does not require operational wallet")
 	}
 	if err = e.wallet.Sign(tx); err != nil {
-		_ = e.db.UpdateTradeState(id, "failed", "", false)
+		_ = e.db.MarkTradeFailed(id)
 		return id, err
 	}
 	raw, err := tx.MarshalBinary()
 	if err != nil {
-		_ = e.db.UpdateTradeState(id, "failed", "", false)
+		_ = e.db.MarkTradeFailed(id)
 		return id, err
 	}
 	signature := tx.Signatures[0].String()

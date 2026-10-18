@@ -34,6 +34,9 @@ type Entrier interface {
 	ClosePaperPosition(context.Context, string, float64, string) (string, error)
 	CloseLivePosition(context.Context, string, float64, float64, string) (string, error)
 }
+type unknownTradeReconciler interface {
+	ReconcileUnknown(context.Context) error
+}
 type Monitor struct {
 	ws, key                         string
 	q                               chan Event
@@ -51,7 +54,11 @@ type Monitor struct {
 	seen                            sync.Map
 	connected                       atomic.Bool
 	exitMu                          sync.Mutex
+	exitRetryAfter                  sync.Map
+	exitIntents                     sync.Map
 }
+
+const exitRetryDelay = 5 * time.Second
 
 func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit, stopLoss float64, maxHold time.Duration, simulation bool, b *events.Bus, l *zap.Logger) *Monitor {
 	const maximumPositionHold = 5 * time.Minute
@@ -71,10 +78,13 @@ func (m *Monitor) Run(ctx context.Context) {
 
 func (m *Monitor) runMaxHoldChecker(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
+	reconcileTicker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	defer reconcileTicker.Stop()
 	if ctx.Err() != nil {
 		return
 	}
+	m.reconcileUnknownTrades(ctx)
 	m.expireOpenPositions(ctx)
 	for {
 		select {
@@ -82,7 +92,20 @@ func (m *Monitor) runMaxHoldChecker(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.expireOpenPositions(ctx)
+		case <-reconcileTicker.C:
+			m.reconcileUnknownTrades(ctx)
+			m.expireOpenPositions(ctx)
 		}
+	}
+}
+
+func (m *Monitor) reconcileUnknownTrades(ctx context.Context) {
+	reconciler, ok := m.entry.(unknownTradeReconciler)
+	if !ok {
+		return
+	}
+	if err := reconciler.ReconcileUnknown(ctx); err != nil {
+		m.log.Warn("reconcile unknown live trades", zap.Error(err))
 	}
 }
 
@@ -96,6 +119,28 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 		return
 	}
 	now := time.Now().UTC()
+	openMints := make(map[string]struct{}, len(mints))
+	for _, mint := range mints {
+		openMints[mint] = struct{}{}
+		if _, tracked := m.tracked.Load(mint); !tracked {
+			select {
+			case m.subscriptions <- mint:
+				m.tracked.Store(mint, struct{}{})
+			default:
+				m.log.Warn("open-position subscription queue full", zap.String("mint", mint))
+			}
+		}
+	}
+	m.exitRetryAfter.Range(func(key, _ any) bool {
+		mint, ok := key.(string)
+		if ok {
+			if _, stillOpen := openMints[mint]; !stillOpen {
+				m.exitRetryAfter.Delete(mint)
+				m.exitIntents.Delete(mint)
+			}
+		}
+		return true
+	})
 	for _, mint := range mints {
 		if ctx.Err() != nil {
 			return
@@ -105,10 +150,11 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 			m.log.Warn("read position age", zap.String("mint", mint), zap.Error(err))
 			continue
 		}
-		if !open || now.Sub(openedAt) < m.maxHold {
+		if !open {
 			continue
 		}
 
+		holdExpired := now.Sub(openedAt) >= m.maxHold
 		var returnPct float64
 		var known bool
 		if m.simulation {
@@ -124,7 +170,31 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 			// its entry value; live exits sell the full confirmed token balance.
 			returnPct = 0
 		}
-		m.submitExit(ctx, mint, returnPct, "max hold time")
+		failedExit, failedExitErr := m.db.HasFailedSellForMint(mint)
+		if failedExitErr != nil {
+			m.log.Warn("check previous exit failures", zap.String("mint", mint), zap.Error(failedExitErr))
+		}
+		reason := ""
+		exitIntent, hasExitIntent := m.exitIntents.Load(mint)
+		switch {
+		case hasExitIntent:
+			reason = exitIntent.(string)
+		case failedExitErr == nil && failedExit:
+			reason = "retry failed exit"
+		case known:
+			reason = positions.ExitReason(
+				positions.Position{Mint: mint, CostSOL: 1, OpenedAt: openedAt},
+				1+returnPct/100,
+				true,
+				positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, MaxHold: m.maxHold},
+				now,
+			)
+		case holdExpired:
+			reason = "max hold time"
+		}
+		if reason != "" {
+			m.submitExit(ctx, mint, returnPct, reason)
+		}
 	}
 }
 
@@ -186,10 +256,12 @@ func (m *Monitor) connect(ctx context.Context) error {
 				return
 			case mint := <-m.subscriptions:
 				if err := c.WriteJSON(map[string]any{"method": "subscribeTokenTrade", "keys": []string{mint}}); err != nil {
-					if m.simulation {
-						// Reconnect so all open paper positions are subscribed again.
-						_ = c.Close()
-					}
+					m.log.Warn("token trade subscription failed; reconnecting", zap.String("mint", mint), zap.Error(err))
+					m.bus.Publish("operational_error", map[string]any{
+						"component": "token_monitor", "mint": mint, "message": "price subscription failed; reconnecting",
+					})
+					// Reconnect in both modes so tracked positions are subscribed again.
+					_ = c.Close()
 					return
 				}
 			}
@@ -326,6 +398,12 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 	if err != nil || !known {
 		return
 	}
+	if !m.simulation {
+		active, activeErr := m.db.ActiveForMint(mint)
+		if activeErr != nil || active {
+			return
+		}
+	}
 	openedAt, ok, err := m.db.PositionOpenedAt(mint)
 	if err != nil {
 		return
@@ -335,7 +413,24 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 		return
 	}
 	reason := positions.ExitReason(positions.Position{Mint: mint, CostSOL: 1, OpenedAt: openedAt}, 1+returnPct/100, true, positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, MaxHold: m.maxHold}, time.Now().UTC())
-	m.bus.Publish("position_mark_updated", map[string]any{"mint": mint, "marketCapSol": marketCapSOL, "returnPct": returnPct, "takeProfitPct": m.takeProfit, "stopLossPct": m.stopLoss, "simulation": m.simulation})
+	var estimatedPnl, estimatedValue any
+	if cost, costErr := m.db.PositionCost(mint); costErr == nil && cost > 0 {
+		estimatedPnl = cost * returnPct / 100
+		estimatedValue = cost + cost*returnPct/100
+	}
+	var entryMarketCap any
+	if marketCapRatio := 1 + returnPct/100; marketCapRatio > 0 {
+		entryMarketCap = marketCapSOL / marketCapRatio
+	}
+	m.bus.Publish("position_mark_updated", map[string]any{
+		"mint": mint, "marketCapSol": marketCapSOL, "entryMarketCapSol": entryMarketCap,
+		"currentMarketCapSol": marketCapSOL, "returnPct": returnPct,
+		"estimatedPnlSol": estimatedPnl, "estimatedValueSol": estimatedValue,
+		"markAvailable": true, "markUpdatedAt": time.Now().UTC(),
+		"markSource": "pumpportal_market_cap", "tokenPriceAvailable": false,
+		"pnlBasis": "market_cap_ratio_estimate", "takeProfitPct": m.takeProfit,
+		"stopLossPct": m.stopLoss, "simulation": m.simulation,
+	})
 	if reason == "" {
 		return
 	}
@@ -353,22 +448,27 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, returnPct float64
 	}
 	if !open {
 		m.tracked.Delete(mint)
+		m.exitRetryAfter.Delete(mint)
+		m.exitIntents.Delete(mint)
 		return
 	}
-	if !m.simulation {
-		active, activeErr := m.db.ActiveForMint(mint)
-		if activeErr != nil {
-			m.log.Warn("check pending live exit", zap.String("mint", mint), zap.Error(activeErr))
-			return
-		}
-		if active {
-			return
-		}
+	if retryAt, ok := m.exitRetryAfter.Load(mint); ok && time.Now().Before(retryAt.(time.Time)) {
+		return
+	}
+	active, activeErr := m.db.ActiveForMint(mint)
+	if activeErr != nil {
+		m.log.Warn("check pending exit", zap.String("mint", mint), zap.Error(activeErr))
+		return
+	}
+	if active {
+		return
 	}
 	if m.entry == nil {
 		m.log.Warn("cannot close position: entry engine unavailable", zap.String("mint", mint))
 		return
 	}
+	m.exitRetryAfter.Store(mint, time.Now().Add(exitRetryDelay))
+	m.exitIntents.Store(mint, reason)
 	var id string
 	if m.simulation {
 		id, err = m.entry.ClosePaperPosition(ctx, mint, returnPct, reason+" reached in simulation")
@@ -377,10 +477,16 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, returnPct float64
 	}
 	if err != nil {
 		m.log.Warn("position exit", zap.String("mint", mint), zap.Error(err))
+		m.bus.Publish("exit_retry_scheduled", map[string]any{
+			"mint": mint, "reason": reason, "retryInSeconds": int(exitRetryDelay.Seconds()),
+			"simulation": m.simulation,
+		})
 		return
 	}
 	if m.simulation {
 		m.tracked.Delete(mint)
+		m.exitRetryAfter.Delete(mint)
+		m.exitIntents.Delete(mint)
 	}
 	m.bus.Publish("exit_triggered", map[string]any{"mint": mint, "tradeId": id, "reason": reason, "returnPct": returnPct, "simulation": m.simulation})
 }

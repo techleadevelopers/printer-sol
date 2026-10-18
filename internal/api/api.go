@@ -79,14 +79,59 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
-	positions, _ := s.db.OpenPositionCount()
-	detected, _ := s.db.TokenEventCount()
-	openPnl := 0.0
-	if s.cfg.Simulation {
-		openPnl, _ = s.db.PaperOpenPnlSOL()
+	positions, err := s.db.OpenPositionCount()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load open position count")
+		return
 	}
-	realizedPnl, _ := s.db.RealizedPnlSOL()
-	trades := s.tradeItems()
+	detected, err := s.db.TokenEventCount()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load detected token count")
+		return
+	}
+	openPnl, err := s.db.OpenPnlSOL(s.cfg.Simulation)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load estimated open P&L")
+		return
+	}
+	unmarkedPositions, err := s.db.UnmarkedOpenPositionCount(s.cfg.Simulation)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load position price coverage")
+		return
+	}
+	realizedPnl, err := s.db.RealizedPnlSOL()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load realized P&L")
+		return
+	}
+	costs, err := s.db.TradeCostsSOL()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load transaction costs")
+		return
+	}
+	trades, err := s.tradeItems()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load recent trades")
+		return
+	}
+	tradeCount, err := s.db.TradeCount()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load trade count")
+		return
+	}
+	now := time.Now().UTC()
+	periodStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	periodEnd := periodStart.AddDate(0, 0, 1)
+	periodTotal, positive, negative, err := s.db.TradePeriodStats(periodStart, periodEnd)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load daily trade results")
+		return
+	}
+	cumulativeResult, err := s.cumulativeResult()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load P&L history")
+		return
+	}
 	balance := s.balanceSOL()
 	virtualEquity := balance
 	if s.cfg.Simulation {
@@ -95,8 +140,19 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 			virtualEquity = 0
 		}
 	}
-	now := time.Now().UTC()
-	dashboard := map[string]any{"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance, "walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "detectedTokens": detected, "analyzedTokens": detected, "tradesCount": len(trades), "openPositions": positions, "realizedPnlSol": realizedPnl, "estimatedOpenPnlSol": openPnl, "netPnlSol": realizedPnl, "costsSol": 0.0, "cumulativeResult": []map[string]any{{"timestamp": now, "value": realizedPnl}}, "tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": len(trades), "positive": 0, "negative": 0}}, "balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades}
+	totalEstimatedPnl := realizedPnl + openPnl
+	dashboard := map[string]any{
+		"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance,
+		"walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL,
+		"detectedTokens": detected, "analyzedTokens": detected, "tradesCount": tradeCount, "openPositions": positions,
+		"realizedPnlSol": realizedPnl, "estimatedOpenPnlSol": openPnl, "totalEstimatedPnlSol": totalEstimatedPnl,
+		"netPnlSol": totalEstimatedPnl, "estimatedOpenPnlComplete": unmarkedPositions == 0,
+		"unmarkedOpenPositions": unmarkedPositions, "costsSol": costs,
+		"openPnlBasis": "pumpportal_market_cap_ratio_estimate",
+		"cumulativeResult": cumulativeResult,
+		"tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": periodTotal, "positive": positive, "negative": negative}},
+		"balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades,
+	}
 	if s.cfg.Simulation {
 		dashboard["virtualEquitySol"] = virtualEquity
 	}
@@ -126,7 +182,7 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
-	rows, e := s.db.ListPositions()
+	rows, e := s.db.ListPositionsForMode(s.cfg.Simulation)
 	if e != nil {
 		fail(w, 500, "database_unavailable", "database unavailable")
 		return
@@ -134,29 +190,70 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var mint, q, status, opened, updated string
+		var mint, q, status, opened, updated, markUpdated string
 		var cost, entryMarketCap, currentMarketCap float64
-		if rows.Scan(&mint, &q, &cost, &status, &opened, &updated, &entryMarketCap, &currentMarketCap) == nil {
-			quantity, _ := strconv.ParseFloat(q, 64)
-			value := cost
-			if entryMarketCap > 0 && currentMarketCap > 0 {
-				value = cost * currentMarketCap / entryMarketCap
-			}
-			out = append(out, map[string]any{"id": mint, "tokenName": nil, "symbol": nil, "mint": mint, "quantity": quantity, "averageEntryPriceSol": cost, "buyValueSol": cost, "costsSol": 0.0, "estimatedValueSol": value, "estimatedPnlSol": value - cost, "realizedPnlSol": nil, "openedAt": opened, "status": status, "sellStatus": "not_requested"})
+		var realized sql.NullFloat64
+		if err := rows.Scan(&mint, &q, &cost, &status, &opened, &updated, &entryMarketCap, &currentMarketCap, &markUpdated, &realized); err != nil {
+			fail(w, http.StatusInternalServerError, "database_unavailable", "could not read position data")
+			return
 		}
+		quantity, _ := strconv.ParseFloat(q, 64)
+		markAvailable := entryMarketCap > 0 && currentMarketCap > 0
+		var returnPct, estimatedValue, estimatedPnl any
+		if markAvailable && status == "open" && cost > 0 {
+			pct := (currentMarketCap - entryMarketCap) / entryMarketCap * 100
+			value := cost * currentMarketCap / entryMarketCap
+			returnPct, estimatedValue, estimatedPnl = pct, value, value-cost
+		}
+		var realizedPnl any
+		if realized.Valid {
+			realizedPnl = realized.Float64
+		}
+		pnlEstimateAvailable := markAvailable && cost > 0 && status == "open"
+		position := map[string]any{
+			"id": mint, "tokenName": nil, "symbol": nil, "mint": mint,
+			"quantity": quantity, "quantityUnit": "SOL allocation", "investedSol": cost,
+			"averageEntryPriceSol": nil, "buyValueSol": cost, "costsSol": nil,
+			"entryMarketCapSol": nil, "currentMarketCapSol": nil,
+			"entryTokenPriceSol": nil, "currentTokenPriceSol": nil, "tokenPriceAvailable": false,
+			"returnPct": returnPct, "estimatedValueSol": estimatedValue, "estimatedPnlSol": estimatedPnl,
+			"markAvailable": markAvailable, "pnlEstimateAvailable": pnlEstimateAvailable,
+			"markUpdatedAt": nil, "markAgeSeconds": nil,
+			"markSource": "pumpportal_market_cap", "pnlBasis": "market_cap_ratio_estimate",
+			"realizedPnlSol": realizedPnl, "openedAt": opened, "updatedAt": updated, "status": status,
+			"sellStatus": "not_requested", "simulation": s.cfg.Simulation,
+		}
+		if markAvailable {
+			position["entryMarketCapSol"] = entryMarketCap
+			position["currentMarketCapSol"] = currentMarketCap
+			position["markUpdatedAt"] = markUpdated
+			if age, ok := positionMarkAgeSeconds(markUpdated, time.Now().UTC()); ok {
+				position["markAgeSeconds"] = age
+			}
+		}
+		out = append(out, position)
 	}
-	write(w, 200, map[string]any{"items": out})
+	if err := rows.Err(); err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not read positions")
+		return
+	}
+	write(w, 200, map[string]any{"items": out, "mode": s.mode()})
 }
 func (s *Server) trades(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
-	write(w, 200, map[string]any{"items": s.tradeItems(), "nextCursor": nil})
+	items, err := s.tradeItems()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load trades")
+		return
+	}
+	write(w, 200, map[string]any{"items": items, "nextCursor": nil})
 }
-func (s *Server) tradeItems() []map[string]any {
+func (s *Server) tradeItems() ([]map[string]any, error) {
 	rows, err := s.db.ListTrades()
 	if err != nil {
-		return []map[string]any{}
+		return nil, err
 	}
 	defer rows.Close()
 	items := []map[string]any{}
@@ -165,7 +262,7 @@ func (s *Server) tradeItems() []map[string]any {
 		var requested, executed, fees, slippage float64
 		var realized sql.NullFloat64
 		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &fees, &slippage, &signature, &state, &createdAt, &realized); err != nil {
-			continue
+			return nil, err
 		}
 		quantity, _ := strconv.ParseFloat(quantityText, 64)
 		status := state
@@ -175,15 +272,30 @@ func (s *Server) tradeItems() []map[string]any {
 		if status != "pending" && status != "submitted" && status != "confirmed" && status != "failed" {
 			status = "unknown"
 		}
-		item := map[string]any{"id": id, "timestamp": createdAt, "tokenName": nil, "symbol": nil, "mint": mint, "side": side, "quantity": quantity, "buyValueSol": nil, "sellValueSol": nil, "feesSol": fees, "slippage": slippage, "grossPnlSol": nil, "netPnlSol": nil, "transactionId": nil, "signature": nil, "status": status}
+		item := map[string]any{
+			"id": id, "timestamp": createdAt, "tokenName": nil, "symbol": nil, "mint": mint,
+			"side": side, "quantity": quantity, "requestedValueSol": requested,
+			"buyValueSol": nil, "sellValueSol": nil, "executedValueSol": nil, "feesSol": fees,
+			"slippage": slippage, "grossPnlSol": nil, "netPnlSol": nil, "realizedPnlSol": nil,
+			"transactionId": nil, "signature": nil, "status": status,
+		}
+		if executed > 0 {
+			item["executedValueSol"] = executed
+		}
+		value := requested
+		if executed > 0 {
+			value = executed
+		}
 		if side == "buy" {
-			item["buyValueSol"] = requested
+			item["buyValueSol"] = value
 		} else {
-			item["sellValueSol"] = requested
+			item["sellValueSol"] = value
 		}
 		if realized.Valid {
-			item["grossPnlSol"] = realized.Float64
-			item["netPnlSol"] = realized.Float64 - fees
+			// realized_pnl_sol already uses wallet deltas after transaction fees;
+			// subtracting fees here would count them twice.
+			item["netPnlSol"] = realized.Float64
+			item["realizedPnlSol"] = realized.Float64
 		}
 		if signature != "" {
 			item["transactionId"] = signature
@@ -191,7 +303,53 @@ func (s *Server) tradeItems() []map[string]any {
 		}
 		items = append(items, item)
 	}
-	return items
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+func (s *Server) cumulativeResult() ([]map[string]any, error) {
+	rows, err := s.db.RealizedPnlHistory()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	var cumulative float64
+	for rows.Next() {
+		var timestamp string
+		var pnl float64
+		if err := rows.Scan(&timestamp, &pnl); err != nil {
+			return nil, err
+		}
+		cumulative += pnl
+		result = append(result, map[string]any{"timestamp": timestamp, "value": cumulative})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+func positionMarkAgeSeconds(markUpdated string, now time.Time) (float64, bool) {
+	layouts := []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05",
+	}
+	for _, layout := range layouts {
+		markedAt, err := time.Parse(layout, markUpdated)
+		if err == nil {
+			age := now.Sub(markedAt).Seconds()
+			if age < 0 {
+				age = 0
+			}
+			return age, true
+		}
+	}
+	return 0, false
 }
 func (s *Server) mode() string {
 	if s.cfg.Simulation {

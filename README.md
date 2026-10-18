@@ -38,6 +38,8 @@ Rotas de leitura:
 - `GET /api/health` — separa serviço ativo, monitor conectado e capacidade de negociação.
 - `GET /api/dashboard`, `/api/tokens`, `/api/positions`, `/api/trades`, `/api/rpcs`, `/api/config`, `/api/wallet`.
 
+`/api/dashboard` calcula P&L aberto para o modo ativo, separa resultado realizado de estimativa aberta e informa `estimatedOpenPnlComplete`/`unmarkedOpenPositions`. `/api/positions` devolve os market caps de entrada e atuais, idade da marca e P&L estimado; `currentTokenPriceSol` permanece `null` porque o feed registra market cap, não preço unitário do token. Valores abertos usam a variação de market cap como estimativa, não como P&L garantido de uma venda.
+
 Autenticação: `POST /api/auth/login` recebe `{ "password": "..." }` e retorna uma sessão de administrador. Rotas administrativas usam `Authorization: Bearer <session-token>`:
 
 - `POST /api/bot/stop`, `/pause`, `/resume`, `/emergency-stop`
@@ -46,7 +48,7 @@ Autenticação: `POST /api/auth/login` recebe `{ "password": "..." }` e retorna 
 
 `POST /api/rpcs/test` e `/api/rpcs/select` recebem `{ "url": "https://..." }`. Configuração recebe os campos de `execution.Limits` em JSON. O painel deve tratar `401`, `409` e `422` como bloqueios operacionais, não como sucesso.
 
-`WS /ws/events` entrega envelopes `{ "type": string, "data": object, "at": RFC3339 }`. Eventos incluem `token_detected`, `token_approved`, `token_rejected`, `buy_sent`, `buy_confirmed`, `buy_failed`, `sell_sent`, `sell_confirmed`, `sell_failed`, `position_updated`, `rpc_changed`, `risk_alert`, `bot_paused` e `operational_error`. O cliente deve reconectar ao receber close/timeout; cada nova sessão recebe `connection_ready`. O servidor usa ping/pong e remove clientes desconectados.
+`WS /ws/events` entrega envelopes `{ "type": string, "data": object, "at": RFC3339 }`. Eventos incluem `token_detected`, `token_approved`, `token_rejected`, `buy_sent`, `buy_confirmed`, `buy_failed`, `sell_sent`, `sell_confirmed`, `sell_failed`, `position_updated`, `position_mark_updated`, `rpc_changed`, `risk_alert`, `bot_paused` e `operational_error`. `position_mark_updated` inclui market cap atual, variação percentual, P&L/valor estimados em SOL e horário da marca. O cliente deve reconectar ao receber close/timeout; cada nova sessão recebe `connection_ready`. O servidor usa ping/pong e remove clientes desconectados.
 
 ## Banco e testes
 

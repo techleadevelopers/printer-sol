@@ -1,1 +1,2 @@
 - [Go toolchain verification](go-toolchain.md) — this workspace's Go 1.21 toolchain cannot satisfy the project's Go 1.24 requirement with checksum downloads disabled.
+- [Unknown live exits](unknown-live-exits.md) — reconcile a persisted signature before retrying; only a definitive failure permits a replacement sell.

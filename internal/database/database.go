@@ -126,6 +126,36 @@ func (d *DB) UpdateTradeState(id, state, sig string, confirmed bool) error {
 	}
 	return tx.Commit()
 }
+
+func (d *DB) MarkTradeFailed(id string) error {
+	now := time.Now().UTC()
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(d.bind(`UPDATE trades SET state='failed',reconciliation_needed=?,updated_at=? WHERE id=?`), false, now, id)
+	if err != nil {
+		return err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if affected != 1 {
+		return fmt.Errorf("failed trade %q not found", id)
+	}
+	result, err = tx.Exec(d.bind(`UPDATE transactions SET state='failed',updated_at=? WHERE trade_id=?`), now, id)
+	if err != nil {
+		return err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if affected != 1 {
+		return fmt.Errorf("transaction for failed trade %q not found", id)
+	}
+	return tx.Commit()
+}
+
 func (d *DB) ActiveForMint(mint string) (bool, error) {
 	var n int
 	e := d.QueryRow(d.bind(`SELECT COUNT(*) FROM trades WHERE mint=? AND state IN ('prepared','signed','submitted','pending','unknown')`), mint).Scan(&n)
@@ -137,6 +167,11 @@ func (d *DB) HasPurchaseForMint(mint string) (bool, error) {
 	// attempt failed or its outcome is unknown, preventing accidental averaging
 	// and a second entry after an RPC/PumpPortal failure.
 	e := d.QueryRow(d.bind(`SELECT COUNT(*) FROM trades WHERE mint=? AND side='buy'`), mint).Scan(&n)
+	return n > 0, e
+}
+func (d *DB) HasFailedSellForMint(mint string) (bool, error) {
+	var n int
+	e := d.QueryRow(d.bind(`SELECT COUNT(*) FROM trades WHERE mint=? AND side='sell' AND state='failed'`), mint).Scan(&n)
 	return n > 0, e
 }
 func (d *DB) RecordEvent(mint, creator, raw string, at time.Time, latency int64) error {
@@ -423,9 +458,50 @@ func (d *DB) SetTradeExecution(id string, executed, fees, pnl float64) error {
 	return e
 }
 func (d *DB) PaperOpenPnlSOL() (float64, error) {
+	return d.OpenPnlSOL(true)
+}
+func (d *DB) OpenPnlSOL(simulation bool) (float64, error) {
+	marks := "live_marks"
+	if simulation {
+		marks = "paper_marks"
+	}
 	var pnl float64
-	e := d.QueryRow(`SELECT COALESCE(SUM(p.cost_sol * (m.current_market_cap_sol - m.entry_market_cap_sol) / NULLIF(m.entry_market_cap_sol,0)),0) FROM positions p JOIN paper_marks m ON m.mint=p.mint WHERE p.status='open'`).Scan(&pnl)
+	query := `SELECT COALESCE(SUM(p.cost_sol * (m.current_market_cap_sol - m.entry_market_cap_sol) / NULLIF(m.entry_market_cap_sol,0)),0) FROM positions p JOIN ` + marks + ` m ON m.mint=p.mint WHERE p.status='open' AND p.cost_sol>0`
+	e := d.QueryRow(query).Scan(&pnl)
 	return pnl, e
+}
+func (d *DB) UnmarkedOpenPositionCount(simulation bool) (int, error) {
+	marks := "live_marks"
+	if simulation {
+		marks = "paper_marks"
+	}
+	var count int
+	query := `SELECT COUNT(*) FROM positions p LEFT JOIN ` + marks + ` m ON m.mint=p.mint
+		WHERE p.status='open' AND (COALESCE(p.cost_sol,0)<=0 OR m.mint IS NULL OR m.entry_market_cap_sol<=0 OR m.current_market_cap_sol<=0)`
+	err := d.QueryRow(query).Scan(&count)
+	return count, err
+}
+func (d *DB) TradeCostsSOL() (float64, error) {
+	var costs float64
+	err := d.QueryRow(`SELECT COALESCE(SUM(fees_sol),0) FROM trades WHERE fees_sol IS NOT NULL`).Scan(&costs)
+	return costs, err
+}
+func (d *DB) TradeCount() (int, error) {
+	var count int
+	err := d.QueryRow(`SELECT COUNT(*) FROM trades`).Scan(&count)
+	return count, err
+}
+func (d *DB) TradePeriodStats(start, end time.Time) (total, positive, negative int, err error) {
+	err = d.QueryRow(d.bind(`SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN realized_pnl_sol>0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN realized_pnl_sol<0 THEN 1 ELSE 0 END),0)
+		FROM trades WHERE created_at>=? AND created_at<?`), start, end).Scan(&total, &positive, &negative)
+	return
+}
+func (d *DB) RealizedPnlHistory() (*sql.Rows, error) {
+	return d.Query(`SELECT CAST(COALESCE(confirmed_at,created_at) AS TEXT),realized_pnl_sol
+		FROM trades WHERE realized_pnl_sol IS NOT NULL
+		ORDER BY COALESCE(confirmed_at,created_at) ASC`)
 }
 func (d *DB) RealizedPnlSOL() (float64, error) {
 	var pnl float64
@@ -443,7 +519,20 @@ func (d *DB) SimulationAvailableBalanceSOL(initialBalance float64) (float64, err
 }
 
 func (d *DB) ListPositions() (*sql.Rows, error) {
-	return d.Query(`SELECT p.mint,p.quantity,COALESCE(p.cost_sol,0),p.status,p.opened_at,p.updated_at,COALESCE(m.entry_market_cap_sol,0),COALESCE(m.current_market_cap_sol,0) FROM positions p LEFT JOIN paper_marks m ON m.mint=p.mint ORDER BY p.updated_at DESC`)
+	return d.Query(`SELECT p.mint,p.quantity,COALESCE(p.cost_sol,0),p.status,p.opened_at,p.updated_at,
+		COALESCE(m.entry_market_cap_sol,0),COALESCE(m.current_market_cap_sol,0)
+		FROM positions p LEFT JOIN paper_marks m ON m.mint=p.mint ORDER BY p.updated_at DESC`)
+}
+func (d *DB) ListPositionsForMode(simulation bool) (*sql.Rows, error) {
+	marks := "live_marks"
+	if simulation {
+		marks = "paper_marks"
+	}
+	query := `SELECT p.mint,p.quantity,COALESCE(p.cost_sol,0),p.status,p.opened_at,p.updated_at,
+		COALESCE(m.entry_market_cap_sol,0),COALESCE(m.current_market_cap_sol,0),COALESCE(CAST(m.updated_at AS TEXT),''),
+		(SELECT SUM(t.realized_pnl_sol) FROM trades t WHERE t.mint=p.mint AND t.side='sell' AND t.realized_pnl_sol IS NOT NULL)
+		FROM positions p LEFT JOIN ` + marks + ` m ON m.mint=p.mint ORDER BY p.updated_at DESC`
+	return d.Query(query)
 }
 func (d *DB) OpenPositionMints() ([]string, error) {
 	rows, err := d.Query(`SELECT mint FROM positions WHERE status='open'`)
@@ -510,6 +599,9 @@ func (d *DB) UnreconciledTrades() (*sql.Rows, error) {
 		query = `SELECT id,COALESCE(signature,''),mint,side FROM trades WHERE reconciliation_needed=TRUE ORDER BY created_at ASC`
 	}
 	return d.Query(query)
+}
+func (d *DB) UnknownTrades() (*sql.Rows, error) {
+	return d.Query(`SELECT id,COALESCE(signature,''),mint,side FROM trades WHERE state='unknown' AND COALESCE(signature,'')<>'' ORDER BY created_at ASC`)
 }
 func (d *DB) LogOperational(level, eventType, message string, payload string) error {
 	_, e := d.Exec(d.bind(`INSERT INTO operational_logs(level,event_type,message,payload_json,created_at) VALUES(?,?,?,?,?)`), level, eventType, message, payload, time.Now().UTC())
