@@ -78,20 +78,20 @@ func TestClosedStopLossBlacklistsCreatorFor24Hours(t *testing.T) {
 				return
 			}
 
-			var blockedUntil string
-			if err = db.QueryRow(`SELECT blocked_until FROM creator_blacklist WHERE creator=?`, creator).Scan(&blockedUntil); err != nil {
+			var blockedAt string
+			if err = db.QueryRow(`SELECT blocked_at FROM creator_blacklist WHERE creator=?`, creator).Scan(&blockedAt); err != nil {
 				t.Fatal(err)
 			}
-			expiration, err := time.Parse(time.RFC3339Nano, blockedUntil)
+			blockedAtTime, err := time.Parse(time.RFC3339Nano, blockedAt)
 			if err != nil {
-				t.Fatalf("parse stored block expiration %q: %v", blockedUntil, err)
+				t.Fatalf("parse stored block timestamp %q: %v", blockedAt, err)
 			}
-			remaining := time.Until(expiration)
-			if remaining < 23*time.Hour+59*time.Minute || remaining > 24*time.Hour {
-				t.Fatalf("creator block duration = %s; want approximately 24 hours", remaining)
+			age := time.Since(blockedAtTime)
+			if age < 0 || age > time.Second {
+				t.Fatalf("creator block timestamp age = %s; want approximately zero", age)
 			}
-			if _, err = db.Exec(`UPDATE creator_blacklist SET blocked_until=? WHERE creator=?`,
-				time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano), creator); err != nil {
+			if _, err = db.Exec(`UPDATE creator_blacklist SET blocked_at=? WHERE creator=?`,
+				time.Now().UTC().Add(-25*time.Hour).Format(time.RFC3339Nano), creator); err != nil {
 				t.Fatal(err)
 			}
 			blocked, err = db.IsCreatorBlacklisted(creator)

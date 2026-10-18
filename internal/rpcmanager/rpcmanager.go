@@ -241,7 +241,13 @@ type BondingCurveState struct {
 
 // GetBondingCurveState reads Pump.fun's bonding-curve PDA via getAccountInfo
 // and decodes its Anchor account data.
-func (m *Manager) GetBondingCurveState(ctx context.Context, mint string) (BondingCurveState, error) {
+func (m *Manager) GetBondingCurveState(mint string) (BondingCurveState, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	return m.GetBondingCurveStateWithContext(ctx, mint)
+}
+
+func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint string) (BondingCurveState, error) {
 	mintKey, err := solana.PublicKeyFromBase58(mint)
 	if err != nil {
 		return BondingCurveState{}, fmt.Errorf("parse mint public key: %w", err)
@@ -301,8 +307,8 @@ func (m *Manager) GetBondingCurveState(ctx context.Context, mint string) (Bondin
 	if state.VirtualTokenReserves == 0 || state.VirtualSOLReserves == 0 || state.TokenSupply == 0 {
 		return BondingCurveState{}, fmt.Errorf("Pump.fun bonding-curve reserves or supply are zero")
 	}
-	state.MarketCapSOL = float64(state.VirtualSOLReserves) *
-		float64(state.TokenSupply) / float64(state.VirtualTokenReserves) / 1e9
+	priceFromReserves := float64(state.VirtualSOLReserves) / float64(state.VirtualTokenReserves)
+	state.MarketCapSOL = priceFromReserves * float64(state.TokenSupply) / 1e9
 	if state.MarketCapSOL <= 0 || math.IsNaN(state.MarketCapSOL) || math.IsInf(state.MarketCapSOL, 0) {
 		return BondingCurveState{}, fmt.Errorf("derived Pump.fun market cap is not positive and finite")
 	}
@@ -312,7 +318,7 @@ func (m *Manager) GetBondingCurveState(ctx context.Context, mint string) (Bondin
 // BondingCurveMarketCapSOL preserves the market-cap interface used by entry
 // validation and position mark refreshes.
 func (m *Manager) BondingCurveMarketCapSOL(ctx context.Context, mint string) (float64, error) {
-	state, err := m.GetBondingCurveState(ctx, mint)
+	state, err := m.GetBondingCurveStateWithContext(ctx, mint)
 	if err != nil {
 		return 0, err
 	}

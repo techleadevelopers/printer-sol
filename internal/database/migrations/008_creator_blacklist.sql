@@ -1,8 +1,5 @@
 CREATE TABLE IF NOT EXISTS creator_blacklist (
   creator TEXT PRIMARY KEY,
-  blocked_until TEXT NOT NULL,
-  source_mint TEXT NOT NULL,
-  reason TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  blocked_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_creator_blacklist_until ON creator_blacklist(blocked_until);
+CREATE INDEX IF NOT EXISTS idx_creator_blacklist_blocked_at ON creator_blacklist(blocked_at);

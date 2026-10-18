@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gagliardetto/solana-go"
 )
 
 func TestRPCRejectsRateLimitAndForbidden(t *testing.T) {
@@ -140,8 +139,8 @@ func TestGetBondingCurveStateReadsAndDecodesRPCAccount(t *testing.T) {
 		current:   0,
 		client:    server.Client(),
 	}
-	mint := solana.MustPublicKeyFromBase58("So11111111111111111111111111111111111111112").String()
-	state, err := manager.GetBondingCurveState(context.Background(), mint)
+	mint := "So11111111111111111111111111111111111111112"
+	state, err := manager.GetBondingCurveState(mint)
 	if err != nil {
 		t.Fatal(err)
 	}

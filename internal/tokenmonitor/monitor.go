@@ -78,8 +78,8 @@ type Monitor struct {
 	simulation                      bool
 	subscriptions                   chan string
 	tracked                         sync.Map
-	seenMu                          sync.Mutex
-	seen                            map[string]time.Time
+	recentlyProcessed               sync.Map
+	recentlyProcessedMu             sync.Mutex
 	connected                       atomic.Bool
 	operationMu                     sync.RWMutex
 	resetting                       atomic.Bool
@@ -94,6 +94,7 @@ type Monitor struct {
 	candidates                      map[string]*candidate
 	snipeMu                         sync.Mutex
 	snipePending                    map[string]time.Time
+	validationSlots                 chan struct{}
 	entryDelay                      time.Duration
 	minTransactions                 int
 	pricePollInterval               time.Duration
@@ -165,9 +166,12 @@ func (m *Monitor) ResetInMemoryState() {
 		m.tracked.Delete(key)
 		return true
 	})
-	m.seenMu.Lock()
-	m.seen = make(map[string]time.Time)
-	m.seenMu.Unlock()
+	m.recentlyProcessedMu.Lock()
+	m.recentlyProcessed.Range(func(key, _ any) bool {
+		m.recentlyProcessed.Delete(key)
+		return true
+	})
+	m.recentlyProcessedMu.Unlock()
 	m.exitRetryAfter.Range(func(key, _ any) bool {
 		m.exitRetryAfter.Delete(key)
 		return true
@@ -238,13 +242,17 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		}
 		settings.BondingCurve = option.BondingCurve
 	}
+	if settings.SnipeConcurrency > 10 {
+		settings.SnipeConcurrency = 10
+	}
 	return &Monitor{
 		ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry,
 		tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee,
 		takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15,
 		maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size),
-		seen: make(map[string]time.Time), candidates: make(map[string]*candidate),
+		candidates:   make(map[string]*candidate),
 		snipePending: make(map[string]time.Time),
+		validationSlots: make(chan struct{}, settings.SnipeConcurrency),
 		entryDelay:   settings.EntryDelay, minTransactions: settings.MinTransactions,
 		pricePollInterval: settings.PricePollInterval,
 		snipeConcurrency:  settings.SnipeConcurrency,
@@ -291,30 +299,51 @@ func (m *Monitor) runSeenJanitor(ctx context.Context) {
 }
 
 func (m *Monitor) pruneSeen(now time.Time) {
-	cutoff := now.Add(-30 * time.Minute)
-	m.seenMu.Lock()
-	for mint, seenAt := range m.seen {
-		if seenAt.Before(cutoff) {
-			delete(m.seen, mint)
-		}
+	ttl := m.dedupeTTL
+	if ttl <= 0 {
+		ttl = 60 * time.Second
 	}
-	m.seenMu.Unlock()
+	cutoff := now.Add(-ttl)
+	m.recentlyProcessed.Range(func(mint, value any) bool {
+		seenAt, ok := value.(time.Time)
+		if !ok || seenAt.Before(cutoff) {
+			m.recentlyProcessed.Delete(mint)
+		}
+		return true
+	})
 }
 
 func (m *Monitor) rememberMint(mint string, now time.Time) bool {
-	m.seenMu.Lock()
-	defer m.seenMu.Unlock()
-	if seenAt, exists := m.seen[mint]; exists && now.Sub(seenAt) < 30*time.Minute {
-		return false
+	ttl := m.dedupeTTL
+	if ttl <= 0 {
+		ttl = 60 * time.Second
 	}
-	m.seen[mint] = now
+	m.recentlyProcessedMu.Lock()
+	defer m.recentlyProcessedMu.Unlock()
+	if value, exists := m.recentlyProcessed.Load(mint); exists {
+		if seenAt, ok := value.(time.Time); ok && now.Sub(seenAt) < ttl {
+			return false
+		}
+	}
+	m.recentlyProcessed.Store(mint, now)
 	return true
 }
 
 func (m *Monitor) forgetMint(mint string) {
-	m.seenMu.Lock()
-	delete(m.seen, mint)
-	m.seenMu.Unlock()
+	m.recentlyProcessedMu.Lock()
+	m.recentlyProcessed.Delete(mint)
+	m.recentlyProcessedMu.Unlock()
+}
+
+func (m *Monitor) snipeEventExpired(event Event, now time.Time) bool {
+	if event.queuedAt.IsZero() {
+		return false
+	}
+	ttl := m.dedupeTTL
+	if ttl <= 0 {
+		ttl = 60 * time.Second
+	}
+	return !now.Before(event.queuedAt.Add(ttl))
 }
 
 func (m *Monitor) runMaxHoldChecker(ctx context.Context) {
@@ -704,17 +733,29 @@ func (m *Monitor) consumeSnipeQueue(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			if !e.queuedAt.IsZero() && time.Since(e.queuedAt) >= m.dedupeTTL {
-				m.rejectCandidate(e, "snipe queue item expired before processing")
-				continue
+			select {
+			case m.validationSlots <- struct{}{}:
+			case <-ctx.Done():
+				return
 			}
-			jobCtx, cancel := context.WithTimeout(ctx, m.snipeTimeout)
-			m.runOperation(func() {
-				if jobCtx.Err() == nil {
-					m.consumeEvent(jobCtx, e)
+			func() {
+				defer func() { <-m.validationSlots }()
+				if m.snipeEventExpired(e, time.Now().UTC()) {
+					m.rejectCandidate(e, "snipe queue item expired before processing")
+					return
 				}
-			})
-			cancel()
+				timeout := m.snipeTimeout
+				if timeout <= 0 {
+					timeout = 15 * time.Second
+				}
+				jobCtx, cancel := context.WithTimeout(ctx, timeout)
+				m.runOperation(func() {
+					if jobCtx.Err() == nil {
+						m.consumeEvent(jobCtx, e)
+					}
+				})
+				cancel()
+			}()
 		}
 	}
 }

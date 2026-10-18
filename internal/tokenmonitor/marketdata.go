@@ -12,8 +12,7 @@ import (
 )
 
 const (
-	candidateCheckWorkers = 8
-	pricePollWorkers      = 5
+	pricePollWorkers = 5
 )
 
 type candidateState struct {
@@ -64,7 +63,6 @@ func (m *Monitor) recordCandidateTrade(mint, txType string, marketCapSOL float64
 func (m *Monitor) runCandidateChecker(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	workers := make(chan struct{}, candidateCheckWorkers)
 	for {
 		select {
 		case <-ctx.Done():
@@ -72,9 +70,9 @@ func (m *Monitor) runCandidateChecker(ctx context.Context) {
 		case <-ticker.C:
 			for _, mint := range m.dueCandidates(time.Now().UTC()) {
 				select {
-				case workers <- struct{}{}:
+				case m.validationSlots <- struct{}{}:
 					go func(candidateMint string) {
-						defer func() { <-workers }()
+						defer func() { <-m.validationSlots }()
 						m.checkCandidate(ctx, candidateMint)
 					}(mint)
 				default:
@@ -159,14 +157,19 @@ func (m *Monitor) creatorBlacklistReason(creator string) string {
 		return "creator blacklist unavailable; entry blocked"
 	}
 	if blocked {
-		return "creator blocked for 24 hours after a stop-loss"
+		m.log.Info("creator in blacklist", zap.String("creator", creator))
+		return "creator in blacklist: blocked for 24 hours after a stop-loss"
 	}
 	return ""
 }
 
 func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 	generation := m.resetGeneration.Load()
-	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
+	timeout := m.snipeTimeout
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	state, exists := m.candidateSnapshot(mint)
 	if !exists {

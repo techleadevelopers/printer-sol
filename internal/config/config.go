@@ -168,8 +168,8 @@ func Load() (Config, error) {
 	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.MinTxnsBeforeBuy < 1 || c.PricePollSeconds < 1 {
 		return c, fmt.Errorf("queue, position, timing, and entry thresholds must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
 	}
-	if c.SnipeConcurrency < 1 || c.SnipeConcurrency > 64 || c.SnipeTimeoutMS < 1 || c.SnipeTimeoutMS > 120000 || c.DedupeTTLMS < 1 || c.DedupeTTLMS > 3600000 {
-		return c, fmt.Errorf("SNIPE_CONCURRENCY must be 1-64, SNIPE_TIMEOUT_MS must be 1-120000, and DEDUPE_TTL_MS must be 1-3600000")
+	if c.SnipeConcurrency < 1 || c.SnipeConcurrency > 10 || c.SnipeTimeoutMS < 1 || c.SnipeTimeoutMS > 120000 || c.DedupeTTLMS < 1 || c.DedupeTTLMS > 3600000 {
+		return c, fmt.Errorf("SNIPE_CONCURRENCY must be 1-10, SNIPE_TIMEOUT_MS must be 1-120000, and DEDUPE_TTL_MS must be 1-3600000")
 	}
 	if c.TokenMaxAgeSeconds > 0 && c.TokenMaxAgeSeconds <= c.EntryDelaySeconds {
 		return c, fmt.Errorf("TOKEN_MAX_AGE_SECONDS must be greater than ENTRY_DELAY_SECONDS")

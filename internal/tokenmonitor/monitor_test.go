@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,7 +31,11 @@ type concurrentEntrier struct {
 
 func (e *concurrentEntrier) BuyNewTokenUSD(ctx context.Context, _ string, _, _, _ float64, _, _ string) (string, error) {
 	active := e.active.Add(1)
-	for previous := e.maximum.Load(); active > previous && !e.maximum.CompareAndSwap(previous, active); previous = e.maximum.Load() {
+	for {
+		previous := e.maximum.Load()
+		if active <= previous || e.maximum.CompareAndSwap(previous, active) {
+			break
+		}
 	}
 	e.started <- struct{}{}
 	defer e.active.Add(-1)
@@ -50,15 +55,15 @@ func (e *concurrentEntrier) CloseLivePosition(context.Context, string, float64, 
 }
 
 func TestSeenMintIsDeduplicatedOnlyWithinRetentionWindow(t *testing.T) {
-	monitor := &Monitor{seen: make(map[string]time.Time)}
+	monitor := &Monitor{dedupeTTL: time.Minute}
 	first := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	if !monitor.rememberMint("mint", first) {
 		t.Fatal("first observation was treated as a duplicate")
 	}
-	if monitor.rememberMint("mint", first.Add(29*time.Minute)) {
+	if monitor.rememberMint("mint", first.Add(59*time.Second)) {
 		t.Fatal("duplicate inside retention window was accepted")
 	}
-	if !monitor.rememberMint("mint", first.Add(31*time.Minute)) {
+	if !monitor.rememberMint("mint", first.Add(time.Minute)) {
 		t.Fatal("mint was not eligible for memory cleanup after retention")
 	}
 }
@@ -116,6 +121,53 @@ func TestConsumeRejectsCreationEventWithoutTakeProfitBaseline(t *testing.T) {
 	<-done
 	if entry.buyCalls != 0 {
 		t.Fatalf("entry attempted without a take-profit baseline: %d buys", entry.buyCalls)
+	}
+}
+
+func TestConsumeRejectsCreatorBlockedByClosedStopLoss(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "blocked-creator.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	const creator = "creator-with-stop-loss"
+	if err = db.RecordEvent("stopped-mint", creator, "{}", time.Now().UTC(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenPosition("stopped-mint", 0.1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.InsertTrade(database.Trade{
+		ID: "stop-loss-sell", Mint: "stopped-mint", Side: "sell", Quantity: "100",
+		Requested: 0.075, State: "prepared", ExitReason: "stop loss",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.FinalizeSimulationSell("stop-loss-sell", "stopped-mint", 0.075); err != nil {
+		t.Fatal(err)
+	}
+
+	entry := &recordingEntrier{}
+	monitor := New("", "", 8, db, strategy.New(db, time.Minute), entry,
+		1, 0, 0, 50, 25, time.Minute, true, events.New(), zap.NewNop())
+	now := time.Now().UTC()
+	monitor.consumeEvent(context.Background(), Event{
+		Mint: "new-mint-from-blocked-creator", Creator: creator, Received: now,
+		Created: now, MarketCapSOL: 100, Raw: `{"mint":"new-mint-from-blocked-creator"}`,
+	})
+	if entry.buyCalls != 0 {
+		t.Fatalf("blacklisted creator submitted %d entries", entry.buyCalls)
+	}
+	var reason string
+	if err = db.QueryRow(`SELECT reason FROM risk_assessments WHERE mint=? ORDER BY id DESC LIMIT 1`,
+		"new-mint-from-blocked-creator").Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reason, "creator in blacklist") {
+		t.Fatalf("blacklist rejection reason = %q", reason)
 	}
 }
 

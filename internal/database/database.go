@@ -373,17 +373,14 @@ func blacklistCreatorAfterStopLoss(tx *sql.Tx, d *DB, mint, reason string, now t
 		return err
 	}
 
-	blockedUntil := any(now.Add(24 * time.Hour))
-	updatedAt := any(now)
+	blockedAt := any(now)
 	if !d.postgres {
-		blockedUntil = now.Add(24 * time.Hour).UTC().Format(time.RFC3339Nano)
-		updatedAt = now.UTC().Format(time.RFC3339Nano)
+		blockedAt = now.UTC().Format(time.RFC3339Nano)
 	}
-	_, err = tx.Exec(d.bind(`INSERT INTO creator_blacklist(creator,blocked_until,source_mint,reason,updated_at)
-		VALUES(?,?,?,?,?)
-		ON CONFLICT(creator) DO UPDATE SET blocked_until=excluded.blocked_until,
-		source_mint=excluded.source_mint,reason=excluded.reason,updated_at=excluded.updated_at`),
-		strings.TrimSpace(creator.String), blockedUntil, mint, reason, updatedAt)
+	_, err = tx.Exec(d.bind(`INSERT INTO creator_blacklist(creator,blocked_at)
+		VALUES(?,?)
+		ON CONFLICT(creator) DO UPDATE SET blocked_at=excluded.blocked_at`),
+		strings.TrimSpace(creator.String), blockedAt)
 	return err
 }
 
@@ -394,12 +391,12 @@ func (d *DB) IsCreatorBlacklisted(creator string) (bool, error) {
 	if creator == "" {
 		return false, nil
 	}
-	now := any(time.Now().UTC())
+	cutoff := any(time.Now().UTC().Add(-24 * time.Hour))
 	if !d.postgres {
-		now = time.Now().UTC().Format(time.RFC3339Nano)
+		cutoff = time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
 	}
 	var count int
-	err := d.QueryRow(d.bind(`SELECT COUNT(*) FROM creator_blacklist WHERE creator=? AND blocked_until>?`), creator, now).Scan(&count)
+	err := d.QueryRow(d.bind(`SELECT COUNT(*) FROM creator_blacklist WHERE creator=? AND blocked_at>?`), creator, cutoff).Scan(&count)
 	return count > 0, err
 }
 
