@@ -9,10 +9,16 @@ import (
 
 	"go.uber.org/zap"
 	"solana-sniper-backend/internal/database"
+	"solana-sniper-backend/internal/dexscreener"
 	"solana-sniper-backend/internal/events"
-	"solana-sniper-backend/internal/pumpportal"
 	"solana-sniper-backend/internal/strategy"
 )
+
+type fixedSOLUSD float64
+
+func (q fixedSOLUSD) SOLUSD(context.Context) (float64, error) {
+	return float64(q), nil
+}
 
 func newMarketDataTestMonitor(t *testing.T) (*Monitor, func()) {
 	t.Helper()
@@ -25,7 +31,8 @@ func newMarketDataTestMonitor(t *testing.T) (*Monitor, func()) {
 		t.Fatal(err)
 	}
 	monitor := New("", "", 8, db, strategy.New(db, time.Minute), &recordingEntrier{},
-		1, 0, 0, 50, 25, time.Minute, true, events.New(), zap.NewNop())
+		1, 0, 0, 50, 25, time.Minute, true, events.New(), zap.NewNop(),
+		Settings{SOLUSD: fixedSOLUSD(100)})
 	return monitor, func() { _ = db.Close() }
 }
 
@@ -45,9 +52,9 @@ func TestCandidateGateRejectsExplicitZeroMarketCap(t *testing.T) {
 		t.Fatal("candidate was not queued")
 	}
 
-	monitor.finishCandidate(context.Background(), event.Mint, pumpportal.CoinSnapshot{
-		Transactions: 10, Volume: 100, HasTransactions: true, HasVolume: true,
-		HasMarketCapSOL: true, MarketCapSOL: 0,
+	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{
+		Transactions: 10, VolumeUSD: 100, HasTransactions: true, HasVolumeUSD: true,
+		HasMarketCapUSD: true, MarketCapUSD: 0,
 	}, nil)
 	if len(monitor.q) != 0 {
 		t.Fatal("candidate with an explicit zero market cap was queued for entry")
@@ -62,9 +69,9 @@ func TestCandidateGateRequiresBothActivityThresholds(t *testing.T) {
 		t.Fatal("candidate was not queued")
 	}
 
-	monitor.finishCandidate(context.Background(), event.Mint, pumpportal.CoinSnapshot{
-		Transactions: 1, Volume: 100, HasTransactions: true, HasVolume: true,
-		HasMarketCapSOL: true, MarketCapSOL: 100,
+	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{
+		Transactions: 1, VolumeUSD: 100, HasTransactions: true, HasVolumeUSD: true,
+		HasMarketCapUSD: true, MarketCapUSD: 10000,
 	}, nil)
 	if len(monitor.q) != 0 {
 		t.Fatal("candidate below the transaction threshold was queued for entry")
@@ -79,9 +86,9 @@ func TestCandidateGateQueuesActiveTokenWithPositiveMarketCap(t *testing.T) {
 		t.Fatal("candidate was not queued")
 	}
 
-	monitor.finishCandidate(context.Background(), event.Mint, pumpportal.CoinSnapshot{
-		Transactions: 3, Volume: 5, HasTransactions: true, HasVolume: true,
-		HasMarketCapSOL: true, MarketCapSOL: 120,
+	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{
+		Transactions: 3, VolumeUSD: 500, HasTransactions: true, HasVolumeUSD: true,
+		HasMarketCapUSD: true, MarketCapUSD: 12000,
 	}, nil)
 	select {
 	case queued := <-monitor.q:
@@ -103,7 +110,7 @@ func TestCandidateGateUsesTwoPositivePriceWebSocketTradesWhenAPIUnavailable(t *t
 	monitor.recordCandidateTrade(event.Mint, "buy", 130)
 	monitor.recordCandidateTrade(event.Mint, "sell", 140)
 
-	monitor.finishCandidate(context.Background(), event.Mint, pumpportal.CoinSnapshot{}, errors.New("API unavailable"))
+	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{}, errors.New("API unavailable"))
 	select {
 	case queued := <-monitor.q:
 		if queued.MarketCapSOL != 140 {
@@ -123,7 +130,7 @@ func TestCandidateGateRejectsWebSocketFallbackWithoutTwoTrades(t *testing.T) {
 	}
 	monitor.recordCandidateTrade(event.Mint, "buy", 140)
 
-	monitor.finishCandidate(context.Background(), event.Mint, pumpportal.CoinSnapshot{}, errors.New("API unavailable"))
+	monitor.finishCandidate(context.Background(), event.Mint, dexscreener.CoinSnapshot{}, errors.New("API unavailable"))
 	if len(monitor.q) != 0 {
 		t.Fatal("candidate with only one WebSocket trade was queued for entry")
 	}

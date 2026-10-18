@@ -128,7 +128,7 @@ func (c *Client) Coin(ctx context.Context, mint string) (CoinSnapshot, error) {
 	pair := response.Pairs[selected]
 	var snapshot CoinSnapshot
 	if raw, ok := firstPeriod(pair.Txns); ok {
-		if value, valid := metricValue(raw, "buys", "buy", "sells", "sell"); valid && value >= 0 && finite(value) {
+		if value, valid := metricValue(raw); valid && value >= 0 && finite(value) {
 			snapshot.Transactions = int(value)
 			snapshot.HasTransactions = true
 		}

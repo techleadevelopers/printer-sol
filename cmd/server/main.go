@@ -13,6 +13,7 @@ import (
 	"solana-sniper-backend/internal/bot"
 	"solana-sniper-backend/internal/config"
 	"solana-sniper-backend/internal/database"
+	"solana-sniper-backend/internal/dexscreener"
 	"solana-sniper-backend/internal/events"
 	"solana-sniper-backend/internal/execution"
 	"solana-sniper-backend/internal/logging"
@@ -99,7 +100,7 @@ func main() {
 			MinTransactions:   cfg.MinTxnsBeforeBuy,
 			MinVolume:         cfg.MinVolumeBeforeBuy,
 			PricePollInterval: time.Duration(cfg.PricePollSeconds) * time.Second,
-			Coins:             pumpportal.NewCoinDataClient(),
+			Coins:             dexscreener.NewClient(),
 			SOLUSD:            prices,
 			BondingCurve:      rpcs,
 		},

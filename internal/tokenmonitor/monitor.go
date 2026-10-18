@@ -14,9 +14,9 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 	"solana-sniper-backend/internal/database"
+	"solana-sniper-backend/internal/dexscreener"
 	"solana-sniper-backend/internal/events"
 	"solana-sniper-backend/internal/positions"
-	"solana-sniper-backend/internal/pumpportal"
 	"solana-sniper-backend/internal/strategy"
 )
 
@@ -42,7 +42,7 @@ type unknownTradeReconciler interface {
 }
 
 type CoinSource interface {
-	Coin(context.Context, string) (pumpportal.CoinSnapshot, error)
+	Coin(context.Context, string) (dexscreener.CoinSnapshot, error)
 }
 
 type SOLUSDQuoter interface {
@@ -216,7 +216,7 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		MinTransactions:   2,
 		MinVolume:         .5,
 		PricePollInterval: 20 * time.Second,
-		Coins:             pumpportal.NewCoinDataClient(),
+		Coins:             dexscreener.NewClient(),
 	}
 	if len(options) > 0 {
 		option := options[0]
@@ -544,8 +544,8 @@ func (m *Monitor) connect(ctx context.Context) error {
 		return err
 	}
 	m.connected.Store(true)
-			m.log.Info("PumpPortal websocket connected; subscribed to new-token feed",
-				zap.String("endpoint", u.Host))
+	m.log.Info("PumpPortal websocket connected; subscribed to new-token feed",
+		zap.String("endpoint", u.Host))
 	writerDone := make(chan struct{})
 	defer close(writerDone)
 	go func() {
@@ -621,11 +621,20 @@ func (m *Monitor) connect(ctx context.Context) error {
 			continue
 		}
 		_, tracked := m.tracked.Load(d.Mint)
-		m.log.Debug("PumpPortal websocket market-cap event",
-			zap.String("mint", d.Mint),
-			zap.String("tx_type", d.TxType),
-			zap.Float64("market_cap_sol", d.MarketCapSol),
-			zap.Bool("tracked", tracked))
+		switch strings.ToLower(strings.TrimSpace(d.TxType)) {
+		case "buy", "sell", "trade":
+			m.log.Info("PumpPortal websocket trade event received",
+				zap.String("mint", d.Mint),
+				zap.String("tx_type", d.TxType),
+				zap.Float64("mcap", d.MarketCapSol),
+				zap.Bool("tracked", tracked))
+		default:
+			m.log.Debug("PumpPortal websocket market-cap event",
+				zap.String("mint", d.Mint),
+				zap.String("tx_type", d.TxType),
+				zap.Float64("market_cap_sol", d.MarketCapSol),
+				zap.Bool("tracked", tracked))
+		}
 		if tracked {
 			if d.MarketCapSol > 0 {
 				m.markTrade(ctx, d.Mint, d.MarketCapSol)

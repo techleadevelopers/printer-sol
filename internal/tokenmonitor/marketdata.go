@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	"solana-sniper-backend/internal/pumpportal"
+	"solana-sniper-backend/internal/dexscreener"
 )
 
 const (
@@ -112,7 +112,7 @@ func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 	generation := m.resetGeneration.Load()
 	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
-	var snapshot pumpportal.CoinSnapshot
+	var snapshot dexscreener.CoinSnapshot
 	var apiErr error
 	if m.coins != nil {
 		snapshot, apiErr = m.coins.Coin(ctx, mint)
@@ -123,12 +123,19 @@ func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 		return
 	}
 	m.recordCoinAPIResult(apiErr)
+	if apiErr == nil {
+		m.log.Info("polling source=dexscreener",
+			zap.String("mint", mint),
+			zap.Int("transactions", snapshot.Transactions),
+			zap.Float64("volume_usd", snapshot.VolumeUSD),
+			zap.Float64("mcap_usd", snapshot.MarketCapUSD))
+	}
 	m.runOperationAt(generation, func() {
 		m.finishCandidate(ctx, mint, snapshot, apiErr)
 	})
 }
 
-func (m *Monitor) finishCandidate(ctx context.Context, mint string, coin pumpportal.CoinSnapshot, apiErr error) {
+func (m *Monitor) finishCandidate(ctx context.Context, mint string, coin dexscreener.CoinSnapshot, apiErr error) {
 	m.candidateMu.Lock()
 	item := m.candidates[mint]
 	if item == nil {
@@ -149,15 +156,13 @@ func (m *Monitor) finishCandidate(ctx context.Context, mint string, coin pumppor
 	if apiErr == nil {
 		activityAvailable := coin.HasTransactions && hasVolume
 		if coin.HasTransactions && coin.Transactions < m.minTransactions {
-			reason = "Pump.fun activity below MIN_TXNS_BEFORE_BUY"
+			reason = "DexScreener activity below MIN_TXNS_BEFORE_BUY"
 		}
 		if reason == "" && hasVolume && volumeSOL < m.minVolume {
-			reason = "Pump.fun volume below MIN_VOLUME_SOL_BEFORE_BUY"
+			reason = "DexScreener volume below MIN_VOLUME_SOL_BEFORE_BUY"
 		}
-		if reason == "" && (coin.HasMarketCapSOL || coin.HasMarketCapUSD) {
-			if hasExplicitZeroMarketCap(coin) {
-				reason = "Pump.fun reported no positive market cap; candidate rejected"
-			} else if value, valid := m.coinMarketCapSOL(ctx, coin); valid {
+		if reason == "" && coin.HasMarketCapUSD {
+			if value, valid := m.coinMarketCapSOL(ctx, coin); valid {
 				marketCapSOL = value
 			}
 		}
@@ -174,7 +179,7 @@ func (m *Monitor) finishCandidate(ctx context.Context, mint string, coin pumppor
 	if accepted && marketCapSOL <= 0 && state.tradeMarketCapSOL > 0 {
 		marketCapSOL = state.tradeMarketCapSOL
 	}
-	if accepted && marketCapSOL <= 0 && !hasExplicitZeroMarketCap(coin) {
+	if accepted && marketCapSOL <= 0 {
 		value, err := m.bondingCurveMarketCapSOL(ctx, mint)
 		if err == nil {
 			marketCapSOL = value
@@ -211,16 +216,9 @@ func (m *Monitor) finishCandidate(ctx context.Context, mint string, coin pumppor
 
 func (m *Monitor) websocketCandidateFallback(state candidateState) (bool, string) {
 	if state.tradeEvents < fallbackMinimumTradeEvents {
-		return false, "Pump.fun API unavailable or incomplete; fewer than two WebSocket trades in the entry window"
+		return false, "DexScreener API unavailable or incomplete; fewer than two WebSocket trades in the entry window"
 	}
 	return true, "WebSocket activity fallback accepted"
-}
-
-func hasExplicitZeroMarketCap(coin pumpportal.CoinSnapshot) bool {
-	if coin.HasMarketCapSOL {
-		return coin.MarketCapSOL <= 0
-	}
-	return coin.HasMarketCapUSD && coin.MarketCapUSD <= 0
 }
 
 func (m *Monitor) bondingCurveMarketCapSOL(ctx context.Context, mint string) (float64, error) {
@@ -258,17 +256,17 @@ func (m *Monitor) recordCoinAPIResult(err error) {
 
 	message := "polling failing"
 	detail := "API pública de cotação indisponível; marcações por WebSocket/RPC são usadas quando disponíveis"
-	m.log.Warn("polling failing: Pump.fun public price feed degraded",
+	m.log.Warn("polling failing: DexScreener public price feed degraded",
 		zap.Int("consecutiveFailures", failures), zap.Error(err))
 	if m.db != nil {
-		payload := fmt.Sprintf(`{"component":"pump_fun_coin_api","consecutiveFailures":%d,"detail":"%s"}`, failures, detail)
+		payload := fmt.Sprintf(`{"component":"dexscreener_token_api","consecutiveFailures":%d,"detail":"%s"}`, failures, detail)
 		if logErr := m.db.LogOperational("warn", "risk_alert", message, payload); logErr != nil {
 			m.log.Warn("persist public price feed risk alert", zap.Error(logErr))
 		}
 	}
 	if m.bus != nil {
 		m.bus.Publish("risk.alert", map[string]any{
-			"reason": message, "component": "pump_fun_coin_api",
+			"reason": message, "component": "dexscreener_token_api",
 			"consecutiveFailures": failures, "detail": detail + ": " + err.Error(),
 		})
 	}
@@ -291,10 +289,7 @@ func (m *Monitor) rejectCandidate(event Event, reason string) {
 	})
 }
 
-func (m *Monitor) coinVolumeSOL(ctx context.Context, coin pumpportal.CoinSnapshot) (float64, bool) {
-	if coin.HasVolume {
-		return coin.Volume, coin.Volume >= 0 && !math.IsNaN(coin.Volume) && !math.IsInf(coin.Volume, 0)
-	}
+func (m *Monitor) coinVolumeSOL(ctx context.Context, coin dexscreener.CoinSnapshot) (float64, bool) {
 	if !coin.HasVolumeUSD || coin.VolumeUSD < 0 || m.solUSD == nil {
 		return 0, false
 	}
@@ -306,10 +301,7 @@ func (m *Monitor) coinVolumeSOL(ctx context.Context, coin pumpportal.CoinSnapsho
 	return volumeSOL, volumeSOL >= 0 && !math.IsNaN(volumeSOL) && !math.IsInf(volumeSOL, 0)
 }
 
-func (m *Monitor) coinMarketCapSOL(ctx context.Context, coin pumpportal.CoinSnapshot) (float64, bool) {
-	if coin.HasMarketCapSOL {
-		return coin.MarketCapSOL, coin.MarketCapSOL > 0 && !math.IsNaN(coin.MarketCapSOL) && !math.IsInf(coin.MarketCapSOL, 0)
-	}
+func (m *Monitor) coinMarketCapSOL(ctx context.Context, coin dexscreener.CoinSnapshot) (float64, bool) {
 	if !coin.HasMarketCapUSD || coin.MarketCapUSD <= 0 || m.solUSD == nil {
 		return 0, false
 	}
@@ -375,7 +367,7 @@ func (m *Monitor) pollOpenPositionPrices(ctx context.Context) {
 
 func (m *Monitor) refreshOpenPositionPrice(ctx context.Context, mint string, generation uint64) {
 	if m.coins == nil {
-		m.recordCoinAPIResult(fmt.Errorf("Pump.fun coin API client is not configured"))
+		m.recordCoinAPIResult(fmt.Errorf("DexScreener client is not configured"))
 		m.refreshBondingCurveMarketCap(ctx, mint, generation)
 		return
 	}
@@ -384,20 +376,25 @@ func (m *Monitor) refreshOpenPositionPrice(ctx context.Context, mint string, gen
 	coin, err := m.coins.Coin(requestCtx, mint)
 	if err != nil {
 		m.recordCoinAPIResult(err)
-		m.log.Debug("public market-cap refresh failed", zap.String("mint", mint), zap.Error(err))
+		m.log.Debug("DexScreener market-cap refresh failed", zap.String("mint", mint), zap.Error(err))
 		m.refreshBondingCurveMarketCap(requestCtx, mint, generation)
 		return
 	}
 	marketCapSOL, valid := m.coinMarketCapSOL(requestCtx, coin)
+	m.log.Info("polling source=dexscreener",
+		zap.String("mint", mint),
+		zap.Float64("mcap_usd", coin.MarketCapUSD),
+		zap.Float64("mcap_sol", marketCapSOL),
+		zap.Bool("positive_mark", valid && marketCapSOL > 0))
 	if !valid || marketCapSOL <= 0 {
-		markErr := fmt.Errorf("Pump.fun response has no usable positive market cap")
+		markErr := fmt.Errorf("DexScreener response has no usable positive market cap")
 		m.recordCoinAPIResult(markErr)
-		m.log.Debug("public market-cap refresh returned no positive mark", zap.String("mint", mint))
+		m.log.Debug("DexScreener returned no positive mark", zap.String("mint", mint))
 		m.refreshBondingCurveMarketCap(requestCtx, mint, generation)
 		return
 	}
 	m.recordCoinAPIResult(nil)
-	m.markTradeWithSourceAt(generation, requestCtx, mint, marketCapSOL, "pump_fun_public_coin_api")
+	m.markTradeWithSourceAt(generation, requestCtx, mint, marketCapSOL, "dexscreener_public_api")
 }
 
 func (m *Monitor) refreshBondingCurveMarketCap(ctx context.Context, mint string, generation uint64) bool {
@@ -409,6 +406,8 @@ func (m *Monitor) refreshBondingCurveMarketCap(ctx context.Context, mint string,
 		}
 		return false
 	}
-	m.markTradeWithSourceAt(generation, ctx, mint, marketCapSOL, "pump_fun_bonding_curve_rpc")
+	m.log.Info("polling source=solana_rpc_bonding_curve",
+		zap.String("mint", mint), zap.Float64("mcap", marketCapSOL))
+	m.markTradeWithSourceAt(generation, ctx, mint, marketCapSOL, "solana_bonding_curve_rpc")
 	return true
 }
