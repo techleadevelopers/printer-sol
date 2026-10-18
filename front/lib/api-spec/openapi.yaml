@@ -62,6 +62,30 @@ paths:
                 $ref: "#/components/schemas/Dashboard"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+  /simulation/reset:
+    post:
+      operationId: resetSimulation
+      tags: [dashboard]
+      summary: Clear paper-trading data and begin a fresh simulation session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SimulationResetRequest"
+      responses:
+        "200":
+          description: Paper simulation reset completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulationResetResult"
+        "400":
+          description: Invalid balance or live mode
+        "409":
+          description: Unresolved trade reconciliation prevents reset
+        "429":
+          description: Reset rate limit reached
   /tokens:
     get:
       operationId: getTokens
@@ -465,6 +489,7 @@ components:
         estimatedOpenPnlSol: { type: ["number", "null"] }
         netPnlSol: { type: ["number", "null"] }
         costsSol: { type: ["number", "null"] }
+        simulationBalanceSol: { type: ["number", "null"] }
         staleMarks:
           type: object
           required: [total, flat, pctFlat]
@@ -484,6 +509,23 @@ components:
         recentTrades:
           type: array
           items: { $ref: "#/components/schemas/Trade" }
+    SimulationResetRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        balance_sol:
+          type: number
+          exclusiveMinimum: 0
+          description: New virtual starting balance in SOL; omitted to use the current simulation balance.
+    SimulationResetResult:
+      type: object
+      required: [accepted, balanceSol, deletedTrades, deletedPositions, botStatus]
+      properties:
+        accepted: { type: boolean }
+        balanceSol: { type: number }
+        deletedTrades: { type: integer }
+        deletedPositions: { type: integer }
+        botStatus: { $ref: "#/components/schemas/BotStatus" }
     TimeValue:
       type: object
       required: [timestamp, value]

@@ -23,6 +23,7 @@ import (
 	"solana-sniper-backend/internal/wallet"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -37,6 +38,8 @@ type Server struct {
 	paperDB    *database.DB
 	cfg        config.Config
 	log        *zap.Logger
+	resetMu    sync.Mutex
+	lastReset  time.Time
 }
 
 func New(db *database.DB, w *wallet.Wallet, r *rpcmanager.Manager, e *execution.Engine, c *bot.Controller, m *tokenmonitor.Monitor, b *events.Bus, cfg config.Config, l *zap.Logger, paperDatabases ...*database.DB) http.Handler {
@@ -49,6 +52,7 @@ func New(db *database.DB, w *wallet.Wallet, r *rpcmanager.Manager, e *execution.
 	mux.HandleFunc("/api/auth/login", s.login)
 	mux.HandleFunc("/api/dashboard", s.admin(s.dashboard))
 	mux.HandleFunc("/api/simulation/report", s.admin(s.simulationReport))
+	mux.HandleFunc("/api/simulation/reset", s.admin(s.simulationReset))
 	mux.HandleFunc("/api/performance/report", s.admin(s.performanceReport))
 	mux.HandleFunc("/api/tokens", s.admin(s.tokens))
 	mux.HandleFunc("/api/positions", s.admin(s.positions))
@@ -251,6 +255,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.Simulation {
 		dashboard["virtualEquitySol"] = virtualEquity
+dashboard["simulationBalanceSol"] = simSummary.BalanceStartSOL
 		dashboard["simulation"] = simSummary
 		dashboard["closedTrades"] = simSummary.TotalTrades
 		dashboard["staleMarks"] = staleMarks

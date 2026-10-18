@@ -1,15 +1,22 @@
 package database
 
 import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
 	"time"
 )
 
+var ErrSimulationResetPending = errors.New("reconciliação pendente; finalize antes de resetar")
+
 type SimulationRun struct {
 	StartedAt       time.Time
 	BalanceStartSOL float64
+	State           string
 }
 
 type SimulationTrade struct {
@@ -54,7 +61,7 @@ func (d *DB) EnsureSimulationRun(balanceStartSOL float64) (SimulationRun, error)
 		return SimulationRun{}, fmt.Errorf("simulation starting balance must be finite and positive")
 	}
 	now := time.Now().UTC()
-	if _, err := d.Exec(d.bind(`INSERT INTO simulation_sessions(id,started_at,balance_start_sol) VALUES(1,?,?) ON CONFLICT(id) DO NOTHING`), now, balanceStartSOL); err != nil {
+	if _, err := d.Exec(d.bind(`INSERT INTO simulation_sessions(id,started_at,balance_start_sol,state) VALUES(1,?,?,'running') ON CONFLICT(id) DO NOTHING`), now, balanceStartSOL); err != nil {
 		return SimulationRun{}, err
 	}
 	return d.SimulationRun()
@@ -62,12 +69,116 @@ func (d *DB) EnsureSimulationRun(balanceStartSOL float64) (SimulationRun, error)
 
 func (d *DB) SimulationRun() (SimulationRun, error) {
 	var run SimulationRun
-	err := d.QueryRow(`SELECT started_at,balance_start_sol FROM simulation_sessions WHERE id=1`).Scan(&run.StartedAt, &run.BalanceStartSOL)
+	err := d.QueryRow(`SELECT started_at,balance_start_sol,state FROM simulation_sessions WHERE id=1`).Scan(&run.StartedAt, &run.BalanceStartSOL, &run.State)
 	if err != nil {
 		return run, err
 	}
 	run.StartedAt = run.StartedAt.UTC()
 	return run, nil
+}
+
+// ResetSimulation clears paper-trading records and starts a new paper session
+// atomically. Operational logs are preserved so the reset itself remains auditable.
+func (d *DB) ResetSimulation(ctx context.Context, newBalanceSOL float64) (deletedTrades, deletedPositions int, err error) {
+	if newBalanceSOL <= 0 || math.IsNaN(newBalanceSOL) || math.IsInf(newBalanceSOL, 0) {
+		return 0, 0, fmt.Errorf("simulation starting balance must be finite and positive")
+	}
+
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+
+	var oldBalance float64
+	err = tx.QueryRowContext(ctx, `SELECT balance_start_sol FROM simulation_sessions WHERE id=1`).Scan(&oldBalance)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, 0, err
+	}
+	if err == sql.ErrNoRows {
+		oldBalance = newBalanceSOL
+	}
+
+	var pending int
+	err = tx.QueryRowContext(ctx, d.bind(`SELECT COUNT(*) FROM trades
+		WHERE state IN ('prepared','signed','submitted','pending','unknown')`)).Scan(&pending)
+	if err != nil {
+		return 0, 0, err
+	}
+	var pendingTransactions int
+	err = tx.QueryRowContext(ctx, d.bind(`SELECT COUNT(*) FROM transactions
+		WHERE state IN ('prepared','signed','submitted','pending','unknown')`)).Scan(&pendingTransactions)
+	if err != nil {
+		return 0, 0, err
+	}
+	if pending+pendingTransactions > 0 {
+		return 0, 0, ErrSimulationResetPending
+	}
+
+	rowsAffected := func(result sql.Result) (int, error) {
+		count, rowsErr := result.RowsAffected()
+		return int(count), rowsErr
+	}
+	deletedCounts := make(map[string]int)
+	transactionResult, err := tx.ExecContext(ctx, `DELETE FROM transactions`)
+	if err != nil {
+		return 0, 0, err
+	}
+	if deletedCounts["transactions"], err = rowsAffected(transactionResult); err != nil {
+		return 0, 0, err
+	}
+	tradeResult, err := tx.ExecContext(ctx, `DELETE FROM trades`)
+	if err != nil {
+		return 0, 0, err
+	}
+	if deletedTrades, err = rowsAffected(tradeResult); err != nil {
+		return 0, 0, err
+	}
+	deletedCounts["trades"] = deletedTrades
+	positionResult, err := tx.ExecContext(ctx, `DELETE FROM positions`)
+	if err != nil {
+		return 0, 0, err
+	}
+	if deletedPositions, err = rowsAffected(positionResult); err != nil {
+		return 0, 0, err
+	}
+	deletedCounts["positions"] = deletedPositions
+	for _, table := range []string{"paper_marks", "token_events", "risk_assessments"} {
+		result, deleteErr := tx.ExecContext(ctx, `DELETE FROM `+table)
+		if deleteErr != nil {
+			return 0, 0, deleteErr
+		}
+		if deletedCounts[table], err = rowsAffected(result); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	now := time.Now().UTC()
+	_, err = tx.ExecContext(ctx, d.bind(`INSERT INTO simulation_sessions(id,started_at,balance_start_sol,state)
+		VALUES(1,?,?, 'running')
+		ON CONFLICT(id) DO UPDATE SET started_at=excluded.started_at,
+		balance_start_sol=excluded.balance_start_sol,state=excluded.state`), now, newBalanceSOL)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"old_balance":   oldBalance,
+		"new_balance":   newBalanceSOL,
+		"deleted_counts": deletedCounts,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	_, err = tx.ExecContext(ctx, d.bind(`INSERT INTO operational_logs(level,event_type,message,payload_json,created_at)
+		VALUES('info','simulation_reset','Paper simulation reset',?,?)`), string(payload), now)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return deletedTrades, deletedPositions, nil
 }
 
 func (d *DB) SimulationTrades(from, to time.Time) ([]SimulationTrade, error) {

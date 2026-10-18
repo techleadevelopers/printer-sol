@@ -37,6 +37,7 @@ import {
 import { Link, Redirect, Route, Router as WouterRouter, Switch, useLocation } from 'wouter';
 import { apiBaseUrl, apiConnectionLabel, hasConfiguredApiBase } from '@/services/api';
 import { createEventSocket, type BotEvent, type EventState } from '@/services/websocket';
+import { customFetch } from '@/api-client/custom-fetch';
 import { formatSol } from '@/lib/sol-format';
 import NotFound from '@/pages/not-found';
 import PerformanceReportPage from '@/pages/performance-report';
@@ -220,11 +221,43 @@ function DashboardPage() {
   const busy = start.isPending || stop.isPending || pause.isPending || resume.isPending;
   const backendAvailable = health.data?.status === 'ok';
   const qc = useQueryClient();
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetBalance, setResetBalance] = useState('');
+  const [resetPending, setResetPending] = useState(false);
+  const [resetError, setResetError] = useState('');
   const runAction = (fn: () => Promise<unknown>, label: string) => void fn().then((result: any) => {
     if (result?.accepted) { notify({ text: `${label}: pedido aceite pelo back-end.`, kind: 'success' }); void qc.invalidateQueries({ queryKey: getGetDashboardQueryKey() }); }
     else notify({ text: result?.message || 'O back-end não confirmou o pedido.', kind: 'error' });
   }).catch(() => notify({ text: 'Aguardando conexão com o back-end', kind: 'error' }));
   const d = dash.data;
+  const defaultResetBalance = d?.simulationBalanceSol ?? 1;
+  const resetTargetBalance = resetBalance.trim() ? Number(resetBalance) : defaultResetBalance;
+  const resetPaperSimulation = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const hasCustomBalance = resetBalance.trim() !== '';
+    const balanceSol = hasCustomBalance ? Number(resetBalance) : defaultResetBalance;
+    if (!Number.isFinite(balanceSol) || balanceSol <= 0) {
+      setResetError('Informe um saldo SOL finito e maior que zero.');
+      return;
+    }
+    setResetPending(true);
+    setResetError('');
+    try {
+      await customFetch('/api/simulation/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(hasCustomBalance ? { balance_sol: balanceSol } : {}),
+      });
+      setResetOpen(false);
+      setResetBalance('');
+      notify({ text: 'Simulação paper resetada.', kind: 'success' });
+      void qc.invalidateQueries();
+    } catch (cause) {
+      setResetError(cause instanceof Error ? cause.message : 'Não foi possível resetar a simulação.');
+    } finally {
+      setResetPending(false);
+    }
+  };
   const totalEstimatedPnl = d?.totalEstimatedPnlSol ?? d?.netPnlSol;
   const balancePoints = (d?.balanceHistory || []).filter(p => p.value != null);
   const resultChartData = (d?.cumulativeResult || []).filter(p => p.value != null).map(p => ({ timestamp: p.timestamp, value: p.value as number }));
@@ -249,6 +282,7 @@ function DashboardPage() {
           {(d.botStatus === 'stopped' || d.botStatus === 'error') && <button className="button button-primary button-small" disabled={busy || !backendAvailable} onClick={() => runAction(() => start.mutateAsync(), 'Iniciar')}><CirclePlay size={14} /> Iniciar</button>}
           {d.botStatus === 'running' && <><button className="button button-small" disabled={busy || !backendAvailable} onClick={() => runAction(() => pause.mutateAsync(), 'Pausar')}><CirclePause size={14} /> Pausar novas compras</button><button className="button button-danger button-small" disabled={busy || !backendAvailable} onClick={() => runAction(() => stop.mutateAsync(), 'Parar')}><X size={14} /> Parar novas operações</button></>}
           {d.botStatus === 'paused' && <><button className="button button-primary button-small" disabled={busy || !backendAvailable} onClick={() => runAction(() => resume.mutateAsync(), 'Retomar')}><CirclePlay size={14} /> Retomar estratégia</button><button className="button button-danger button-small" disabled={busy || !backendAvailable} onClick={() => runAction(() => stop.mutateAsync(), 'Parar')}><X size={14} /> Parar novas operações</button></>}
+          {d.mode === 'simulation' && <button className="button button-danger button-small" disabled={!backendAvailable || resetPending} onClick={() => { setResetError(''); setResetOpen(true); }}>Limpar operações paper</button>}
         </div>
       </div>
       <p className="mb-3 mt-0 text-right text-[10px] muted" role="status">
@@ -283,6 +317,16 @@ function DashboardPage() {
         <section className="panel"><PanelTitle title="Monitor de eventos" aside={<span className="text-xs muted">{eventState === 'connected' ? 'Ligado' : eventState === 'connecting' ? 'A ligar' : 'Desligado'}</span>} /><div className="p-4">{latest ? <div className="flex items-start gap-3"><Radio className="technical mt-0.5" size={16} /><div><div className="mono text-xs">{latest.type}</div><div className="mt-1 text-xs muted">{fmtDate(latest.at ?? latest.timestamp)}</div></div></div> : <p className="m-0 text-xs muted">Aguardando conexão com o back-end</p>}</div></section>
       </div>
       <section className="panel mt-4"><PanelTitle title="Operações recentes" aside={<Link href="/user-portal/trades" className="text-xs technical no-underline">Ver histórico <ArrowRight size={13} className="inline" /></Link>} />{recentTrades.length ? <TradesTable items={recentTrades} /> : <EmptyRows />}</section>
+      {resetOpen && d.mode === 'simulation' && <div className="modal-backdrop" role="presentation"><form className="modal" role="dialog" aria-modal="true" aria-labelledby="reset-paper-title" onSubmit={resetPaperSimulation}>
+        <div className="eyebrow">AÇÃO DESTRUTIVA · SOMENTE PAPER</div>
+        <h2 id="reset-paper-title" className="display mt-2 text-xl">Limpar operações e resetar</h2>
+        <p className="mt-3 text-sm muted">Isso apaga as operações paper, posições, marcas, eventos de tokens e avaliações de risco. A ação não pode ser desfeita. Se houver operação aguardando reconciliação, o servidor recusará o reset.</p>
+        <label className="mt-4 block text-xs muted" htmlFor="reset-paper-balance">Saldo inicial novo em SOL (opcional)</label>
+        <input id="reset-paper-balance" className="input mt-1 w-full" type="number" min="0.000000001" step="0.000000001" value={resetBalance} onChange={event => setResetBalance(event.target.value)} placeholder={fmt(defaultResetBalance, 9)} />
+        <p className="mt-2 text-xs muted">Saldo do novo ciclo: {Number.isFinite(resetTargetBalance) && resetTargetBalance > 0 ? fmt(resetTargetBalance, 9) : 'inválido'} SOL. O estado atual do bot será preservado durante o reset.</p>
+        {resetError && <p className="mt-3 text-sm negative" role="alert">{resetError}</p>}
+        <div className="mt-5 flex justify-end gap-2"><button type="button" className="button" disabled={resetPending} onClick={() => setResetOpen(false)}>Cancelar</button><button type="submit" className="button button-danger" disabled={resetPending}>{resetPending ? 'A resetar…' : 'Confirmar reset'}</button></div>
+      </form></div>}
     </>}
   </DataPageFrame>;
 }

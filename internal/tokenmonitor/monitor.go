@@ -3,6 +3,7 @@ package tokenmonitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 	"net/url"
@@ -56,12 +57,104 @@ type Monitor struct {
 	seenMu                          sync.Mutex
 	seen                            map[string]time.Time
 	connected                       atomic.Bool
+	operationMu                     sync.RWMutex
+	resetting                       atomic.Bool
+	resetGeneration                 atomic.Uint64
+	connectionMu                    sync.Mutex
+	connection                      *websocket.Conn
+	missingMarks                    sync.Map
 	exitMu                          sync.Mutex
 	exitRetryAfter                  sync.Map
 	exitIntents                     sync.Map
 }
 
 const exitRetryDelay = 5 * time.Second
+
+func (m *Monitor) runOperation(fn func()) bool {
+	generation := m.resetGeneration.Load()
+	if m.resetting.Load() {
+		return false
+	}
+	m.operationMu.RLock()
+	defer m.operationMu.RUnlock()
+	if m.resetting.Load() || m.resetGeneration.Load() != generation {
+		return false
+	}
+	fn()
+	return true
+}
+
+// WithReset blocks event processing while the database and in-memory paper
+// state are reset, then forces the feed connection to reconnect without old
+// tracked-position subscriptions.
+func (m *Monitor) WithReset(reset func() error) error {
+	if !m.resetting.CompareAndSwap(false, true) {
+		return errors.New("monitor reset already in progress")
+	}
+	m.resetGeneration.Add(1)
+	m.operationMu.Lock()
+	defer func() {
+		m.resetting.Store(false)
+		m.operationMu.Unlock()
+	}()
+
+	m.closeConnection()
+	if reset != nil {
+		if err := reset(); err != nil {
+			return err
+		}
+	}
+	m.ResetInMemoryState()
+	return nil
+}
+
+func (m *Monitor) closeConnection() {
+	m.connectionMu.Lock()
+	connection := m.connection
+	m.connectionMu.Unlock()
+	m.connected.Store(false)
+	if connection != nil {
+		_ = connection.Close()
+	}
+}
+
+// ResetInMemoryState is called only while WithReset holds the operation lock.
+func (m *Monitor) ResetInMemoryState() {
+	m.tracked.Range(func(key, _ any) bool {
+		m.tracked.Delete(key)
+		return true
+	})
+	m.seenMu.Lock()
+	m.seen = make(map[string]time.Time)
+	m.seenMu.Unlock()
+	m.exitRetryAfter.Range(func(key, _ any) bool {
+		m.exitRetryAfter.Delete(key)
+		return true
+	})
+	m.exitIntents.Range(func(key, _ any) bool {
+		m.exitIntents.Delete(key)
+		return true
+	})
+	m.missingMarks.Range(func(key, _ any) bool {
+		m.missingMarks.Delete(key)
+		return true
+	})
+	for {
+		select {
+		case <-m.q:
+		default:
+			goto subscriptions
+		}
+	}
+subscriptions:
+	for {
+		select {
+		case <-m.subscriptions:
+		default:
+			return
+		}
+	}
+}
 
 func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit, stopLoss float64, maxHold time.Duration, simulation bool, b *events.Bus, l *zap.Logger) *Monitor {
 	const maximumPositionHold = 5 * time.Minute
@@ -156,6 +249,12 @@ func (m *Monitor) runMaxHoldChecker(ctx context.Context) {
 }
 
 func (m *Monitor) reconcileUnknownTrades(ctx context.Context) {
+	m.runOperation(func() {
+		m.reconcileUnknownTradesLocked(ctx)
+	})
+}
+
+func (m *Monitor) reconcileUnknownTradesLocked(ctx context.Context) {
 	reconciler, ok := m.entry.(unknownTradeReconciler)
 	if !ok {
 		return
@@ -166,6 +265,12 @@ func (m *Monitor) reconcileUnknownTrades(ctx context.Context) {
 }
 
 func (m *Monitor) expireOpenPositions(ctx context.Context) {
+	m.runOperation(func() {
+		m.expireOpenPositionsLocked(ctx)
+	})
+}
+
+func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -232,15 +337,16 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 		} else {
 			returnPct, known, err = m.db.LiveReturnPct(mint)
 		}
-		_, exitMarketCap, _, _, _ = m.db.MarkMarketCaps(mint, m.simulation)
+	_, exitMarketCap, _, markKnown, markErr := m.db.MarkMarketCaps(mint, m.simulation)
+	if err != nil || markErr != nil || !known || !markKnown || exitMarketCap <= 0 {
 		if err != nil {
-			m.log.Warn("read last position mark; using safe timed-exit fallback", zap.String("mint", mint), zap.Error(err))
-			returnPct = 0
-		} else if !known {
-			// Unknown marks use a neutral value; both modes wait through the same
-			// extension window before a forced time-based close.
-			returnPct = 0
+			m.alertMissingMark(mint, err)
+		} else {
+			m.alertMissingMark(mint, markErr)
 		}
+		continue
+		}
+	m.missingMarks.Delete(mint)
 		failedExit, failedExitErr := m.db.HasFailedSellForMint(mint)
 		if failedExitErr != nil {
 			m.log.Warn("check previous exit failures", zap.String("mint", mint), zap.Error(failedExitErr))
@@ -269,9 +375,35 @@ func (m *Monitor) restoreOpenPositions() {
 	}
 	for _, mint := range mints {
 		m.tracked.Store(mint, struct{}{})
+		_, currentMarketCap, _, known, markErr := m.db.MarkMarketCaps(mint, m.simulation)
+		if markErr != nil || !known || currentMarketCap <= 0 {
+			m.alertMissingMark(mint, markErr)
+		}
 	}
 	if len(mints) > 0 {
 		m.log.Info("restored open positions", zap.Int("count", len(mints)), zap.Bool("simulation", m.simulation))
+	}
+}
+
+func (m *Monitor) alertMissingMark(mint string, markErr error) {
+	if _, alreadyReported := m.missingMarks.LoadOrStore(mint, struct{}{}); alreadyReported {
+		return
+	}
+	reason := "open position has no usable market-cap mark; position remains open"
+	payload, _ := json.Marshal(map[string]any{
+		"mint": mint, "simulation": m.simulation, "reason": reason,
+	})
+	fields := []zap.Field{zap.String("mint", mint), zap.Bool("simulation", m.simulation)}
+	if markErr != nil {
+		fields = append(fields, zap.Error(markErr))
+	}
+	m.log.Warn("open position has no valid mark; keeping it open", fields...)
+	m.bus.Publish("risk_alert", map[string]any{
+		"mint": mint, "reason": reason, "positionRemainsOpen": true,
+		"simulation": m.simulation,
+	})
+	if logErr := m.db.LogOperational("warn", "orphan_position_mark_missing", reason, string(payload)); logErr != nil {
+		m.log.Warn("record missing-mark risk alert", zap.String("mint", mint), zap.Error(logErr))
 	}
 }
 func (m *Monitor) runConnections(ctx context.Context) {
@@ -304,12 +436,22 @@ func (m *Monitor) connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer c.Close()
+	m.connectionMu.Lock()
+	m.connection = c
+	m.connectionMu.Unlock()
+	defer func() {
+		m.connectionMu.Lock()
+		if m.connection == c {
+			m.connection = nil
+		}
+		m.connectionMu.Unlock()
+		m.connected.Store(false)
+		_ = c.Close()
+	}()
 	if err = c.WriteJSON(map[string]string{"method": "subscribeNewToken"}); err != nil {
 		return err
 	}
 	m.connected.Store(true)
-	defer m.connected.Store(false)
 	writerDone := make(chan struct{})
 	defer close(writerDone)
 	go func() {
@@ -331,12 +473,14 @@ func (m *Monitor) connect(ctx context.Context) error {
 		}
 	}()
 	m.tracked.Range(func(key, _ any) bool {
-		select {
-		case m.subscriptions <- key.(string):
-		default:
-			m.tracked.Delete(key)
-			m.log.Warn("open-position subscription queue full during reconnect", zap.String("mint", key.(string)))
-		}
+		m.runOperation(func() {
+			select {
+			case m.subscriptions <- key.(string):
+			default:
+				m.tracked.Delete(key)
+				m.log.Warn("open-position subscription queue full during reconnect", zap.String("mint", key.(string)))
+			}
+		})
 		return true
 	})
 	for {
@@ -351,6 +495,9 @@ func (m *Monitor) connect(ctx context.Context) error {
 		}
 		if err = json.Unmarshal(b, &d); err != nil || d.Mint == "" {
 			m.log.Warn("invalid token event", zap.Error(err))
+			continue
+		}
+		if m.resetting.Load() {
 			continue
 		}
 		if _, tracked := m.tracked.Load(d.Mint); tracked {
@@ -374,17 +521,19 @@ func (m *Monitor) connect(ctx context.Context) error {
 			created = received
 		}
 		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
-		if !m.rememberMint(e.Mint, received) {
-			continue
-		}
-		m.bus.Publish("token_detected", map[string]any{"mint": e.Mint, "creator": e.Creator, "receivedAt": e.Received.UTC()})
-		select {
-		case m.q <- e:
-		default:
-			m.log.Warn("token queue full", zap.String("mint", e.Mint))
-			m.bus.Publish("operational_error", map[string]string{"component": "token_monitor", "message": "token queue full"})
-			m.forgetMint(e.Mint)
-		}
+		m.runOperation(func() {
+			if !m.rememberMint(e.Mint, received) {
+				return
+			}
+			m.bus.Publish("token_detected", map[string]any{"mint": e.Mint, "creator": e.Creator, "receivedAt": e.Received.UTC()})
+			select {
+			case m.q <- e:
+			default:
+				m.log.Warn("token queue full", zap.String("mint", e.Mint))
+				m.bus.Publish("operational_error", map[string]string{"component": "token_monitor", "message": "token queue full"})
+				m.forgetMint(e.Mint)
+			}
+		})
 	}
 }
 func (m *Monitor) consume(ctx context.Context) {
@@ -393,7 +542,15 @@ func (m *Monitor) consume(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case e := <-m.q:
-			latency := time.Since(e.Received).Milliseconds()
+			m.runOperation(func() {
+				m.consumeEvent(ctx, e)
+			})
+		}
+	}
+}
+
+func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
+	latency := time.Since(e.Received).Milliseconds()
 			if err := m.db.RecordEvent(e.Mint, e.Creator, e.Raw, e.Received, latency); err != nil {
 				m.log.Warn("record event", zap.Error(err))
 				m.bus.Publish("operational_error", map[string]string{"component": "database", "message": "unable to record token"})
@@ -402,7 +559,7 @@ func (m *Monitor) consume(ctx context.Context) {
 				reason := "missing creation market cap for take-profit baseline"
 				_ = m.db.RecordAssessment(e.Mint, false, reason)
 				m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
-				continue
+	return
 			}
 			var ok bool
 			var reason string
@@ -415,14 +572,14 @@ func (m *Monitor) consume(ctx context.Context) {
 			if !ok || m.entry == nil {
 				_ = m.db.RecordAssessment(e.Mint, false, reason)
 				m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
-				continue
+	return
 			}
 			id, entryErr := m.entry.BuyNewTokenUSD(ctx, e.Mint, m.tradeUSD, m.slippage, m.priorityFee, "pump", reason)
 			if entryErr != nil {
 				_ = m.db.RecordAssessment(e.Mint, false, entryErr.Error())
 				m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": entryErr.Error()})
 				m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.Error(entryErr))
-				continue
+	return
 			}
 			if m.asyncRiskScreen && !m.simulation {
 				m.screenAfterEntry(ctx, e.Mint)
@@ -446,8 +603,7 @@ func (m *Monitor) consume(ctx context.Context) {
 			}
 			m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": m.simulation})
-		}
-	}
+}
 }
 
 func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {
@@ -483,6 +639,12 @@ func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {
 }
 
 func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float64) {
+	m.runOperation(func() {
+		m.markTradeLocked(ctx, mint, marketCapSOL)
+	})
+}
+
+func (m *Monitor) markTradeLocked(ctx context.Context, mint string, marketCapSOL float64) {
 	var err error
 	if m.simulation {
 		err = m.db.RecordPaperMark(mint, marketCapSOL)

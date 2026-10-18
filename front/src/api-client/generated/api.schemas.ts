@@ -171,6 +171,7 @@ export interface Dashboard {
   totalEstimatedPnlComplete?: boolean;
   feesPaidSol?: number | null;
   virtualEquitySol?: number | null;
+  simulationBalanceSol?: number | null;
   staleMarks?: {
     total: number;
     flat: number;

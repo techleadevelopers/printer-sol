@@ -44,6 +44,7 @@ type Engine struct {
 	controller        *bot.Controller
 	bus               *events.Bus
 	rootCtx           context.Context
+	executionGate     sync.RWMutex
 	mu                sync.RWMutex
 	limits            Limits
 	reserved          map[string]uint64
@@ -62,7 +63,44 @@ func (e *Engine) SetRootContext(ctx context.Context) {
 		e.mu.Unlock()
 	}
 }
-func (e *Engine) SimulationBalanceSOL() float64 { return float64(e.simulationBalance) / 1e9 }
+func (e *Engine) SimulationBalanceSOL() float64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return float64(e.simulationBalance) / 1e9
+}
+
+// WithSimulationReset serializes a paper reset against execution. The callback
+// is expected to perform the database transaction; in-memory state is cleared
+// only after it commits successfully.
+func (e *Engine) WithSimulationReset(balanceSOL float64, reset func() error) error {
+	if !e.simulation {
+		return fmt.Errorf("simulation reset is unavailable in live mode")
+	}
+	balance, err := wallet.SOLToLamports(balanceSOL)
+	if err != nil {
+		return err
+	}
+	e.executionGate.Lock()
+	defer e.executionGate.Unlock()
+	if reset != nil {
+		if err = reset(); err != nil {
+			return err
+		}
+	}
+	e.ResetInMemoryState()
+	e.mu.Lock()
+	e.simulationBalance = balance
+	e.mu.Unlock()
+	return nil
+}
+
+func (e *Engine) ResetInMemoryState() {
+	e.mu.Lock()
+	for mint := range e.reserved {
+		delete(e.reserved, mint)
+	}
+	e.mu.Unlock()
+}
 func (e *Engine) emit(kind string, data any) {
 	if e.bus != nil {
 		e.bus.Publish(kind, data)
@@ -299,6 +337,9 @@ func (e *Engine) reconcileRows(ctx context.Context, rows *sql.Rows) error {
 	return nil
 }
 func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
+	e.executionGate.RLock()
+	defer e.executionGate.RUnlock()
+
 	if r.Mint == "" || (r.Side != "buy" && r.Side != "sell") || r.Amount <= 0 || r.Slippage < 0 || r.PriorityFee < 0 {
 		return "", fmt.Errorf("invalid trade request")
 	}

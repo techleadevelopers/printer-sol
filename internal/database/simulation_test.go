@@ -1,6 +1,8 @@
 package database
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -58,6 +60,82 @@ func TestSimulationSessionFeesAndNetResultsPersist(t *testing.T) {
 	stats, err := db.Performance(true)
 	if err != nil || stats.NetRealizedPnlSOL < 0.044999 || stats.NetRealizedPnlSOL > 0.045001 {
 		t.Fatalf("net paper performance = %+v err=%v", stats, err)
+	}
+}
+
+func TestResetSimulationClearsPaperDataAndStartsFreshSession(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "simulation-reset.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.EnsureSimulationRun(1.25); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.InsertTrade(Trade{ID: "reset-trade", Mint: "reset-mint", Side: "buy", Quantity: "0.1", Requested: 0.1, State: "failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenSimulationPosition("reset-mint", 0.1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordPaperMark("reset-mint", 5); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordEvent("reset-mint", "creator", "{}", time.Now().UTC(), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordAssessment("reset-mint", false, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	deletedTrades, deletedPositions, err := db.ResetSimulation(context.Background(), 2.5)
+	if err != nil || deletedTrades != 1 || deletedPositions != 1 {
+		t.Fatalf("reset counts trades=%d positions=%d err=%v", deletedTrades, deletedPositions, err)
+	}
+	for _, table := range []string{"transactions", "trades", "positions", "paper_marks", "token_events", "risk_assessments"} {
+		var count int
+		if err = db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("%s count=%d err=%v after reset", table, count, err)
+		}
+	}
+	run, err := db.SimulationRun()
+	if err != nil || run.BalanceStartSOL != 2.5 || run.State != "running" {
+		t.Fatalf("reset session = %+v err=%v", run, err)
+	}
+	var resetLogs int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM operational_logs WHERE event_type='simulation_reset'`).Scan(&resetLogs); err != nil || resetLogs != 1 {
+		t.Fatalf("simulation reset audit logs=%d err=%v", resetLogs, err)
+	}
+}
+
+func TestResetSimulationRejectsUnresolvedTradesWithoutDeletingData(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "simulation-reset-pending.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.EnsureSimulationRun(1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.InsertTrade(Trade{ID: "unresolved-trade", Mint: "pending-mint", Side: "buy", Quantity: "0.1", Requested: 0.1, State: "unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = db.ResetSimulation(context.Background(), 3); !errors.Is(err, ErrSimulationResetPending) {
+		t.Fatalf("reset error=%v, want unresolved trade guard", err)
+	}
+	var remaining int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM trades WHERE id='unresolved-trade'`).Scan(&remaining); err != nil || remaining != 1 {
+		t.Fatalf("unresolved trade count=%d err=%v after rejected reset", remaining, err)
+	}
+	run, err := db.SimulationRun()
+	if err != nil || run.BalanceStartSOL != 1 {
+		t.Fatalf("session changed after rejected reset: %+v err=%v", run, err)
 	}
 }
 
