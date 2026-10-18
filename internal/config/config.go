@@ -11,8 +11,9 @@ import (
 
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
-	Simulation, EnableLiveTrading                                                                                                                                                                           bool
+	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, AsyncRugCheckAfterEntry, SkipPreflight                                                                                                           bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct float64
+	SimulationBaseFeeSOL                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
 	RPCEndpoints                                                                                                                                                                                            []string
 }
@@ -24,6 +25,15 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.EnableLiveTrading, err = boolEnv("ENABLE_LIVE_TRADING", false); err != nil {
+		return c, err
+	}
+	if c.LiveUnlockRequiresPaper, err = boolEnv("LIVE_UNLOCK_REQUIRES_PAPER", true); err != nil {
+		return c, err
+	}
+	if c.AsyncRugCheckAfterEntry, err = boolEnv("ASYNC_RUGCHECK_AFTER_ENTRY", true); err != nil {
+		return c, err
+	}
+	if c.SkipPreflight, err = boolEnv("SKIP_PREFLIGHT", true); err != nil {
 		return c, err
 	}
 	if c.SimulationDatabaseURL != "" || c.RealDatabaseURL != "" {
@@ -91,6 +101,9 @@ func Load() (Config, error) {
 	if c.SimulationBalanceSOL, err = floatEnv("SIMULATION_BALANCE_SOL", 1); err != nil {
 		return c, err
 	}
+	if c.SimulationBaseFeeSOL, err = floatEnv("SIMULATION_BASE_FEE_SOL", 0.000005); err != nil {
+		return c, err
+	}
 	if c.TokenMaxAgeSeconds, err = intEnv("TOKEN_MAX_AGE_SECONDS", 5); err != nil {
 		return c, err
 	}
@@ -139,7 +152,7 @@ func Load() (Config, error) {
 	if !c.Simulation && c.TokenMaxAgeSeconds == 0 {
 		return c, fmt.Errorf("live trading requires TOKEN_MAX_AGE_SECONDS > 0")
 	}
-	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct} {
+	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}

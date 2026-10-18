@@ -31,7 +31,7 @@ func TestRPCConnectionFailure(t *testing.T) {
 	}
 }
 
-func TestSendWithMaxRetriesRetainsPreflightAndCapsRetries(t *testing.T) {
+func TestSendWithMaxRetriesCanSkipPreflightAndCapsRetries(t *testing.T) {
 	var skipPreflight bool
 	var retries int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -68,12 +68,12 @@ func TestSendWithMaxRetriesRetainsPreflightAndCapsRetries(t *testing.T) {
 		current:   0,
 		client:    server.Client(),
 	}
-	signature, err := manager.SendWithMaxRetries(context.Background(), []byte{1, 2, 3}, 99)
+	signature, err := manager.SendWithMaxRetries(context.Background(), []byte{1, 2, 3}, 99, true)
 	if err != nil || signature != "signature" {
 		t.Fatalf("send returned signature=%q err=%v", signature, err)
 	}
-	if skipPreflight {
-		t.Fatal("preflight must remain enabled")
+	if !skipPreflight {
+		t.Fatal("skipPreflight option was not forwarded")
 	}
 	if retries != 5 {
 		t.Fatalf("maxRetries = %d; want capped value 5", retries)

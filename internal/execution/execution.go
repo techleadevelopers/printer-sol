@@ -28,7 +28,9 @@ type Request struct {
 }
 type Limits struct {
 	MaxTradeSOL, MaxExposureSOL, MaxDailyLossSOL, MaxSlippagePct, MaxPriorityFeeSOL, FeeReserveSOL float64
+	SimulationBaseFeeSOL                                                                         float64
 	MaxOpenPositions, MaxWaitSeconds, MaxAttempts                                                  int
+	SkipPreflight                                                                                 bool
 }
 type Engine struct {
 	db                *database.DB
@@ -122,7 +124,7 @@ func (e *Engine) ClosePaperPosition(ctx context.Context, mint string, returnPct 
 	if value <= 0 {
 		return "", fmt.Errorf("invalid paper exit value")
 	}
-	return e.Execute(ctx, Request{Mint: mint, Side: "sell", Amount: value, DenominatedInSOL: true, Reason: reason})
+	return e.Execute(ctx, Request{Mint: mint, Side: "sell", Amount: value, DenominatedInSOL: true, PriorityFee: e.Limits().MaxPriorityFeeSOL, Reason: reason})
 }
 
 // CloseLivePosition sells the full balance of a confirmed live position.
@@ -300,6 +302,11 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	if r.Mint == "" || (r.Side != "buy" && r.Side != "sell") || r.Amount <= 0 || r.Slippage < 0 || r.PriorityFee < 0 {
 		return "", fmt.Errorf("invalid trade request")
 	}
+	if r.Side == "sell" {
+		if _, err := e.db.PositionCost(r.Mint); err != nil {
+			return "", fmt.Errorf("sell requires an open position: %w", err)
+		}
+	}
 	if r.Side == "buy" {
 		if e.controller != nil && !e.controller.AllowsEntries() {
 			return "", fmt.Errorf("bot is not accepting new entries")
@@ -344,7 +351,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		if l.MaxExposureSOL > 0 && exposure+pendingExposure+r.Amount > l.MaxExposureSOL {
 			return "", fmt.Errorf("maximum exposure exceeded")
 		}
-		if loss, err := e.db.DailyRealizedLossSOL(); err != nil {
+		if loss, err := e.db.DailyRealizedLossSOL(e.simulation); err != nil {
 			return "", err
 		} else if l.MaxDailyLossSOL > 0 && loss >= l.MaxDailyLossSOL {
 			return "", fmt.Errorf("daily loss limit reached")
@@ -380,17 +387,21 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		}
 	}
 	id := fmt.Sprintf("tr_%d", time.Now().UTC().UnixNano())
-	t := database.Trade{ID: id, Mint: r.Mint, Side: r.Side, Quantity: fmt.Sprint(r.Amount), Requested: r.Amount, Slippage: r.Slippage, State: "prepared", EntryReason: r.Reason}
+	simulationFees := 0.0
+	if e.simulation {
+		simulationFees = r.PriorityFee + e.Limits().SimulationBaseFeeSOL
+	}
+	t := database.Trade{ID: id, Mint: r.Mint, Side: r.Side, Quantity: fmt.Sprint(r.Amount), Requested: r.Amount, Fees: simulationFees, Slippage: r.Slippage, State: "prepared", EntryReason: r.Reason, ExitReason: r.Reason}
 	if err := e.db.InsertTrade(t); err != nil {
 		return "", err
 	}
 	if e.simulation {
 		if r.Side == "buy" {
-			if err := e.db.FinalizeSimulationBuy(id, r.Mint, r.Amount); err != nil {
+			if err := e.db.FinalizeSimulationBuy(id, r.Mint, r.Amount, simulationFees); err != nil {
 				return id, fmt.Errorf("record simulated position: %w", err)
 			}
 		} else {
-			if err := e.db.FinalizeSimulationSell(id, r.Mint, r.Amount); err != nil {
+			if err := e.db.FinalizeSimulationSell(id, r.Mint, r.Amount, simulationFees); err != nil {
 				_ = e.db.MarkTradeFailed(id)
 				return id, fmt.Errorf("close simulated position: %w", err)
 			}
@@ -440,7 +451,8 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	if attempts < 1 {
 		attempts = 1
 	}
-	submitted, err := e.rpcs.SendWithMaxRetries(ctx, raw, attempts-1)
+	limits := e.Limits()
+	submitted, err := e.rpcs.SendWithMaxRetries(ctx, raw, attempts-1, limits.SkipPreflight)
 	if err != nil {
 		_ = e.db.UpdateTradeState(id, "unknown", signature, false)
 		e.emit(r.Side+"_failed", map[string]any{"tradeId": id, "mint": r.Mint, "reason": "submission outcome unknown"})

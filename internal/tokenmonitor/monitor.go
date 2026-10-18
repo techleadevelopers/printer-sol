@@ -50,6 +50,7 @@ type Monitor struct {
 	trailingStop                    float64
 	maxHold                         time.Duration
 	simulation                      bool
+	asyncRiskScreen                 bool
 	subscriptions                   chan string
 	tracked                         sync.Map
 	seenMu                          sync.Mutex
@@ -74,6 +75,7 @@ func (m *Monitor) SetTrailingStopPct(pct float64) {
 		m.trailingStop = pct
 	}
 }
+func (m *Monitor) SetAsyncRugCheckAfterEntry(enabled bool) { m.asyncRiskScreen = enabled }
 func (m *Monitor) Run(ctx context.Context) {
 	// The selected database is mode-isolated, so restoring its open positions
 	// keeps live and paper marks separate while resuming exits after a restart.
@@ -218,12 +220,14 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 
 		holdExpired := now.Sub(openedAt) >= m.maxHold
 		var returnPct float64
+		var exitMarketCap float64
 		var known bool
 		if m.simulation {
 			returnPct, known, err = m.db.PaperReturnPct(mint)
 		} else {
 			returnPct, known, err = m.db.LiveReturnPct(mint)
 		}
+		_, exitMarketCap, _, _, _ = m.db.MarkMarketCaps(mint, m.simulation)
 		if err != nil {
 			m.log.Warn("read last position mark; using safe timed-exit fallback", zap.String("mint", mint), zap.Error(err))
 			returnPct = 0
@@ -249,7 +253,7 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 			reason = "max hold time"
 		}
 		if reason != "" {
-			m.submitExit(ctx, mint, returnPct, reason)
+			m.submitExit(ctx, mint, exitMarketCap, returnPct, reason)
 		}
 	}
 }
@@ -388,7 +392,13 @@ func (m *Monitor) consume(ctx context.Context) {
 				m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 				continue
 			}
-			ok, reason := m.strategy.Evaluate(ctx, e.Mint, e.Created)
+			var ok bool
+			var reason string
+			if m.asyncRiskScreen && !m.simulation {
+				ok, reason = m.strategy.EvaluateFast(e.Mint, e.Created)
+			} else {
+				ok, reason = m.strategy.Evaluate(ctx, e.Mint, e.Created)
+			}
 			m.log.Info("token evaluated", zap.String("mint", e.Mint), zap.Bool("eligible", ok), zap.String("reason", reason), zap.Int64("latency_ms", latency))
 			if !ok || m.entry == nil {
 				_ = m.db.RecordAssessment(e.Mint, false, reason)
@@ -401,6 +411,9 @@ func (m *Monitor) consume(ctx context.Context) {
 				m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": entryErr.Error()})
 				m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.Error(entryErr))
 				continue
+			}
+			if m.asyncRiskScreen && !m.simulation {
+				m.screenAfterEntry(ctx, e.Mint)
 			}
 			if assessmentErr := m.db.RecordAssessment(e.Mint, true, reason); assessmentErr != nil {
 				m.log.Warn("record entered-token assessment", zap.Error(assessmentErr))
@@ -422,6 +435,37 @@ func (m *Monitor) consume(ctx context.Context) {
 			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": m.simulation})
 		}
 	}
+}
+
+func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+		defer cancel()
+		reason, err := m.strategy.Screen(ctx, mint)
+		if err == nil && strings.HasPrefix(reason, "RugCheck passed") {
+			return
+		}
+		detail := reason
+		if err != nil {
+			detail = err.Error()
+		}
+		if detail == "" {
+			detail = "risk screen did not return an explicit pass"
+		}
+		assessment := "post-entry risk screen: " + detail
+		if recordErr := m.db.RecordAssessment(mint, false, assessment); recordErr != nil {
+			m.log.Warn("record post-entry risk assessment", zap.String("mint", mint), zap.Error(recordErr))
+		}
+		payload, _ := json.Marshal(map[string]string{"mint": mint, "reason": detail})
+		if logErr := m.db.LogOperational("warn", "post_entry_risk_screen", assessment, string(payload)); logErr != nil {
+			m.log.Warn("record post-entry risk alert", zap.String("mint", mint), zap.Error(logErr))
+		}
+		m.log.Warn("post-entry risk flagged", zap.String("mint", mint), zap.String("reason", detail))
+		m.bus.Publish("risk_alert", map[string]any{
+			"mint": mint, "reason": "post-entry risk screen", "detail": detail,
+			"positionRemainsOpen": true,
+		})
+	}()
 }
 
 func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float64) {
@@ -490,7 +534,7 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 	if reason == "" {
 		return
 	}
-	m.submitExit(ctx, mint, returnPct, reason)
+	m.submitExit(ctx, mint, marketCapSOL, returnPct, reason)
 }
 
 func (m *Monitor) positionExitReason(mint string, returnPct float64, openedAt, now time.Time) string {
@@ -516,7 +560,7 @@ func (m *Monitor) positionExitReason(mint string, returnPct float64, openedAt, n
 	)
 }
 
-func (m *Monitor) submitExit(ctx context.Context, mint string, returnPct float64, reason string) {
+func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, returnPct float64, reason string) {
 	m.exitMu.Lock()
 	defer m.exitMu.Unlock()
 
@@ -561,6 +605,33 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, returnPct float64
 			"simulation": m.simulation,
 		})
 		return
+	}
+	entryMarketCap, markedMarketCap, peakMarketCap, markKnown, markErr := m.db.MarkMarketCaps(mint, m.simulation)
+	if markErr != nil {
+		m.log.Warn("load exit audit market caps", zap.String("mint", mint), zap.Error(markErr))
+	}
+	if exitMarketCap <= 0 {
+		exitMarketCap = markedMarketCap
+	}
+	exitAudit := map[string]any{
+		"mint": mint, "tradeId": id, "reason": reason, "returnPct": returnPct,
+		"entryMarketCapSol": nil, "peakMarketCapSol": nil, "exitMarketCapSol": nil,
+		"simulation": m.simulation,
+	}
+	if markKnown {
+		exitAudit["entryMarketCapSol"] = entryMarketCap
+		exitAudit["peakMarketCapSol"] = peakMarketCap
+	}
+	if exitMarketCap > 0 {
+		exitAudit["exitMarketCapSol"] = exitMarketCap
+	}
+	auditJSON, marshalErr := json.Marshal(exitAudit)
+	if marshalErr == nil {
+		if logErr := m.db.LogOperational("info", "position_exit_submitted", reason, string(auditJSON)); logErr != nil {
+			m.log.Warn("write position exit audit", zap.String("mint", mint), zap.Error(logErr))
+		}
+	} else {
+		m.log.Warn("encode position exit audit", zap.String("mint", mint), zap.Error(marshalErr))
 	}
 	if m.simulation {
 		m.tracked.Delete(mint)

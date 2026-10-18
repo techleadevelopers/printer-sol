@@ -44,6 +44,7 @@ func New(db *database.DB, w *wallet.Wallet, r *rpcmanager.Manager, e *execution.
 	mux.HandleFunc("/api/health", s.health)
 	mux.HandleFunc("/api/auth/login", s.login)
 	mux.HandleFunc("/api/dashboard", s.dashboard)
+	mux.HandleFunc("/api/simulation/report", s.simulationReport)
 	mux.HandleFunc("/api/tokens", s.tokens)
 	mux.HandleFunc("/api/positions", s.positions)
 	mux.HandleFunc("/api/trades", s.trades)
@@ -115,12 +116,12 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load transaction costs")
 		return
 	}
-	performance, err := s.db.Performance()
+	performance, err := s.db.Performance(s.cfg.Simulation)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load realized trade performance")
 		return
 	}
-	trades, err := s.tradeItems()
+	trades, err := s.tradeItems(s.cfg.Simulation)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load recent trades")
 		return
@@ -138,47 +139,95 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load daily trade results")
 		return
 	}
-	cumulativeResult, err := s.cumulativeResult()
+	if s.cfg.Simulation {
+		periodTrades, periodErr := s.db.SimulationTrades(periodStart, periodEnd)
+		if periodErr != nil {
+			fail(w, http.StatusInternalServerError, "database_unavailable", "could not load daily paper trade results")
+			return
+		}
+		periodTotal, positive, negative = 0, 0, 0
+		for _, trade := range periodTrades {
+			periodTotal++
+			if trade.NetPnLSOL > 0 {
+				positive++
+			} else if trade.NetPnLSOL < 0 {
+				negative++
+			}
+		}
+	}
+	cumulativeResult, err := s.cumulativeResult(s.cfg.Simulation)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load P&L history")
 		return
 	}
 	balance := s.balanceSOL()
 	virtualEquity := balance
+	var simSummary *database.SimulationSummary
 	if s.cfg.Simulation {
-		virtualEquity = s.engine.SimulationBalanceSOL() + realizedPnl + openPnl
-		if virtualEquity < 0 {
-			virtualEquity = 0
+		run, runErr := s.db.SimulationRun()
+		if runErr != nil {
+			fail(w, http.StatusServiceUnavailable, "simulation_not_started", "simulation session is not initialized")
+			return
 		}
+		summary, _, summaryErr := s.simulationReportData(run, run.StartedAt, now.Add(time.Nanosecond))
+		if summaryErr != nil {
+			fail(w, http.StatusInternalServerError, "database_unavailable", "could not load paper performance")
+			return
+		}
+		simSummary = &summary
+		virtualEquity = summary.BalanceNowSOL
 	}
-	totalEstimatedPnl := realizedPnl + openPnl
+	netRealizedPnl := performance.NetRealizedPnlSOL
+	grossRealizedPnl := performance.GrossRealizedPnlSOL
+	feesPaid := costs
+	totalEstimatedPnl := netRealizedPnl + openPnl
+	if simSummary != nil {
+		netRealizedPnl = simSummary.NetPnLSOL
+		grossRealizedPnl = simSummary.GrossPnLSOL
+		feesPaid = simSummary.FeesPaidSOL
+		totalEstimatedPnl = simSummary.NetPnLSOL + openPnl
+	}
 	var winRate any
 	if performance.ClosedTrades > 0 {
 		winRate = performance.WinRatePct
+	}
+	performancePayload := map[string]any{
+		"closedTrades": performance.ClosedTrades, "winners": performance.Winners,
+		"losers": performance.Losers, "winRatePct": winRate,
+		"avgWinSol": performance.AvgWinSOL, "avgLossSol": performance.AvgLossSOL,
+		"avgHoldSeconds": performance.AvgHoldSeconds, "feesPaidSol": performance.FeesSOL,
+		"netRealizedPnlSol": performance.NetRealizedPnlSOL,
+		"grossRealizedPnlSol": performance.GrossRealizedPnlSOL,
+		"grossPnlBasis": "net realized PnL plus recorded fees for closed positions",
+	}
+	if simSummary != nil {
+		winRate = simSummary.WinRate
+		performancePayload = map[string]any{
+			"closedTrades": simSummary.TotalTrades, "winners": simSummary.Wins,
+			"losers": simSummary.Losses, "winRatePct": winRate,
+			"avgWinSol": simSummary.AvgWinSOL, "avgLossSol": simSummary.AvgLossSOL,
+			"avgHoldSeconds": simSummary.AvgHoldSeconds, "feesPaidSol": simSummary.FeesPaidSOL,
+			"netRealizedPnlSol": simSummary.NetPnLSOL, "grossRealizedPnlSol": simSummary.GrossPnLSOL,
+			"grossPnlBasis": "gross closed PnL; net includes modeled paper transaction fees",
+		}
 	}
 	dashboard := map[string]any{
 		"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance,
 		"walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL,
 		"detectedTokens": detected, "analyzedTokens": analyzed, "tradesCount": tradeCount, "openPositions": positions,
-		"realizedPnlSol": realizedPnl, "estimatedOpenPnlSol": openPnl, "totalEstimatedPnlSol": totalEstimatedPnl,
+		"realizedPnlSol": netRealizedPnl, "grossRealizedPnlSol": grossRealizedPnl,
+		"estimatedOpenPnlSol": openPnl, "totalEstimatedPnlSol": totalEstimatedPnl,
 		"netPnlSol": totalEstimatedPnl, "estimatedOpenPnlComplete": unmarkedPositions == 0,
-		"unmarkedOpenPositions": unmarkedPositions, "costsSol": costs,
+		"unmarkedOpenPositions": unmarkedPositions, "costsSol": feesPaid, "feesPaidSol": feesPaid,
 		"openPnlBasis": "pumpportal_market_cap_ratio_estimate",
-		"performance": map[string]any{
-			"closedTrades": performance.ClosedTrades, "winners": performance.Winners,
-			"losers": performance.Losers, "winRatePct": winRate,
-			"avgWinSol": performance.AvgWinSOL, "avgLossSol": performance.AvgLossSOL,
-			"avgHoldSeconds": performance.AvgHoldSeconds, "feesPaidSol": performance.FeesSOL,
-			"netRealizedPnlSol": performance.NetRealizedPnlSOL,
-			"grossRealizedPnlSol": performance.NetRealizedPnlSOL + performance.FeesSOL,
-			"grossPnlBasis": "net realized PnL plus recorded fees for closed positions",
-		},
+		"performance": performancePayload,
 		"cumulativeResult": cumulativeResult,
 		"tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": periodTotal, "positive": positive, "negative": negative}},
 		"balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades,
 	}
 	if s.cfg.Simulation {
 		dashboard["virtualEquitySol"] = virtualEquity
+		dashboard["simulation"] = simSummary
 	}
 	write(w, 200, dashboard)
 }
@@ -267,20 +316,34 @@ func (s *Server) trades(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
-	items, err := s.tradeItems()
+	items, err := s.tradeItems(s.cfg.Simulation)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load trades")
 		return
 	}
 	write(w, 200, map[string]any{"items": items, "nextCursor": nil})
 }
-func (s *Server) tradeItems() ([]map[string]any, error) {
+func (s *Server) tradeItems(simulation bool) ([]map[string]any, error) {
 	rows, err := s.db.ListTrades()
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	items := []map[string]any{}
+	simNetByID := make(map[string]database.SimulationTrade)
+	if simulation {
+		run, runErr := s.db.SimulationRun()
+		if runErr != nil {
+			return nil, runErr
+		}
+		simTrades, simErr := s.db.SimulationTrades(run.StartedAt, time.Now().UTC().Add(time.Nanosecond))
+		if simErr != nil {
+			return nil, simErr
+		}
+		for _, trade := range simTrades {
+			simNetByID[trade.ID] = trade
+		}
+	}
 	for rows.Next() {
 		var id, mint, side, quantityText, signature, state, createdAt string
 		var requested, executed, fees, slippage float64
@@ -316,10 +379,15 @@ func (s *Server) tradeItems() ([]map[string]any, error) {
 			item["sellValueSol"] = value
 		}
 		if realized.Valid {
-			// realized_pnl_sol already uses wallet deltas after transaction fees;
-			// subtracting fees here would count them twice.
+			item["grossPnlSol"] = realized.Float64 + fees
 			item["netPnlSol"] = realized.Float64
 			item["realizedPnlSol"] = realized.Float64
+			if simTrade, exists := simNetByID[id]; exists {
+				item["grossPnlSol"] = simTrade.GrossPnLSOL
+				item["feesSol"] = simTrade.FeesSOL
+				item["netPnlSol"] = simTrade.NetPnLSOL
+				item["realizedPnlSol"] = simTrade.NetPnLSOL
+			}
 		}
 		if signature != "" {
 			item["transactionId"] = signature
@@ -332,7 +400,24 @@ func (s *Server) tradeItems() ([]map[string]any, error) {
 	}
 	return items, nil
 }
-func (s *Server) cumulativeResult() ([]map[string]any, error) {
+func (s *Server) cumulativeResult(simulation bool) ([]map[string]any, error) {
+	if simulation {
+		run, err := s.db.SimulationRun()
+		if err != nil {
+			return nil, err
+		}
+		trades, err := s.db.SimulationTrades(run.StartedAt, time.Now().UTC().Add(time.Nanosecond))
+		if err != nil {
+			return nil, err
+		}
+		result := make([]map[string]any, 0, len(trades))
+		var cumulative float64
+		for _, trade := range trades {
+			cumulative += trade.NetPnLSOL
+			result = append(result, map[string]any{"timestamp": trade.ConfirmedAt, "value": cumulative})
+		}
+		return result, nil
+	}
 	rows, err := s.db.RealizedPnlHistory()
 	if err != nil {
 		return nil, err

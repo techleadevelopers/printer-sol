@@ -125,7 +125,8 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 		"MAX_TRADE_SOL", "MAX_DAILY_LOSS_SOL", "FEE_RESERVE_SOL", "MAX_EXPOSURE_SOL",
 		"MAX_SLIPPAGE_PCT", "MAX_PRIORITY_FEE_SOL", "TOKEN_QUEUE_SIZE",
 		"MAX_OPEN_POSITIONS", "MAX_CONFIRMATION_WAIT_SECONDS", "MAX_SUBMISSION_ATTEMPTS",
-		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "TRADE_USD", "SIMULATION_BALANCE_SOL",
+		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
+		"LIVE_UNLOCK_REQUIRES_PAPER", "ASYNC_RUGCHECK_AFTER_ENTRY", "SKIP_PREFLIGHT",
 		"TOKEN_MAX_AGE_SECONDS", "TAKE_PROFIT_GROSS_PCT", "STOP_LOSS_PCT", "TRAILING_STOP_PCT", "MAX_HOLD_SECONDS",
 	}
 	type previousValue struct {
@@ -160,8 +161,8 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxSubmissionAttempts != 3 {
-		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f attempts=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxSubmissionAttempts)
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || !cfg.LiveUnlockRequiresPaper || !cfg.AsyncRugCheckAfterEntry || !cfg.SkipPreflight {
+		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f attempts=%d baseFee=%.9f liveGate=%v asyncScreen=%v skipPreflight=%v", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.AsyncRugCheckAfterEntry, cfg.SkipPreflight)
 	}
 
 	_ = os.Setenv("STOP_LOSS_PCT", "0")

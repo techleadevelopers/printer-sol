@@ -35,6 +35,18 @@ func main() {
 	}
 	log, closeLog := logging.New()
 	defer closeLog()
+	if !cfg.Simulation && cfg.LiveUnlockRequiresPaper {
+		paperDB, openErr := database.Open(cfg.SimulationDatabaseURL)
+		if openErr != nil {
+			log.Fatal("paper live-unlock database", logging.Err(openErr))
+		}
+		_, unlockErr := paperDB.RequireLiveUnlock()
+		_ = paperDB.Close()
+		if unlockErr != nil {
+			log.Fatal("live trading blocked by paper evidence", logging.Err(unlockErr))
+		}
+		log.Info("paper evidence accepted for live mode")
+	}
 	databaseTarget := cfg.DatabaseURL
 	if databaseTarget == "" {
 		databaseTarget = cfg.DatabasePath
@@ -46,6 +58,13 @@ func main() {
 	defer db.Close()
 	if err := db.Migrate(); err != nil {
 		log.Fatal("migration", logging.Err(err))
+	}
+	if cfg.Simulation {
+		run, runErr := db.EnsureSimulationRun(cfg.SimulationBalanceSOL)
+		if runErr != nil {
+			log.Fatal("simulation session", logging.Err(runErr))
+		}
+		cfg.SimulationBalanceSOL = run.BalanceStartSOL
 	}
 	w, err := wallet.Load(cfg.PrivateKey, cfg.Simulation, cfg.FeeReserveSOL)
 	if err != nil {
@@ -60,7 +79,7 @@ func main() {
 	controller := bot.New(bus)
 	// The worker is autonomous. Console credentials do not control its startup.
 	controller.Start()
-	limits := execution.Limits{MaxTradeSOL: cfg.MaxTradeSOL, MaxExposureSOL: cfg.MaxExposureSOL, MaxDailyLossSOL: cfg.MaxDailyLossSOL, MaxSlippagePct: cfg.MaxSlippagePct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL, MaxOpenPositions: cfg.MaxOpenPositions, MaxWaitSeconds: cfg.MaxConfirmationWaitSeconds, MaxAttempts: cfg.MaxSubmissionAttempts}
+	limits := execution.Limits{MaxTradeSOL: cfg.MaxTradeSOL, MaxExposureSOL: cfg.MaxExposureSOL, MaxDailyLossSOL: cfg.MaxDailyLossSOL, MaxSlippagePct: cfg.MaxSlippagePct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL, SimulationBaseFeeSOL: cfg.SimulationBaseFeeSOL, MaxOpenPositions: cfg.MaxOpenPositions, MaxWaitSeconds: cfg.MaxConfirmationWaitSeconds, MaxAttempts: cfg.MaxSubmissionAttempts, SkipPreflight: cfg.SkipPreflight}
 	prices := pricefeed.New(cfg.SOLUSDPriceURL)
 	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, cfg.SimulationBalanceSOL, controller, bus, limits)
 	strat := strategy.New(db, time.Duration(cfg.TokenMaxAgeSeconds)*time.Second)
@@ -72,6 +91,7 @@ func main() {
 	defer cancel()
 	engine.SetRootContext(ctx)
 	monitor.SetTrailingStopPct(cfg.TrailingStopPct)
+	monitor.SetAsyncRugCheckAfterEntry(cfg.AsyncRugCheckAfterEntry)
 	startupRPC, startupCancel := context.WithTimeout(ctx, 12*time.Second)
 	rpcs.Check(startupRPC)
 	startupCancel()

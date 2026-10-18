@@ -102,7 +102,7 @@ func (d *DB) InsertTrade(t Trade) error {
 	if e != nil {
 		return e
 	}
-	if _, e = tx.Exec(d.bind(`INSERT INTO trades(id,mint,side,quantity,requested_value_sol,slippage_pct,state,entry_reason,exit_reason,reconciliation_needed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`), t.ID, t.Mint, t.Side, t.Quantity, t.Requested, t.Slippage, t.State, t.EntryReason, t.ExitReason, true, now, now); e == nil {
+	if _, e = tx.Exec(d.bind(`INSERT INTO trades(id,mint,side,quantity,requested_value_sol,fees_sol,slippage_pct,state,entry_reason,exit_reason,reconciliation_needed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`), t.ID, t.Mint, t.Side, t.Quantity, t.Requested, t.Fees, t.Slippage, t.State, t.EntryReason, t.ExitReason, true, now, now); e == nil {
 		_, e = tx.Exec(d.bind(`INSERT INTO transactions(id,trade_id,state,created_at,updated_at) VALUES(?,?,?,?,?)`), "tx_"+t.ID, t.ID, t.State, now, now)
 	}
 	if e != nil {
@@ -215,7 +215,7 @@ func (d *DB) OpenSimulationPosition(mint string, amount float64) error {
 	return d.OpenPosition(mint, amount)
 }
 
-func (d *DB) FinalizeSimulationBuy(id, mint string, amount float64) error {
+func (d *DB) FinalizeSimulationBuy(id, mint string, amount float64, feesOpt ...float64) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
@@ -223,18 +223,22 @@ func (d *DB) FinalizeSimulationBuy(id, mint string, amount float64) error {
 	defer tx.Rollback()
 
 	now := time.Now().UTC()
+	fees := 0.0
+	if len(feesOpt) > 0 {
+		fees = feesOpt[0]
+	}
 	if _, err = tx.Exec(d.bind(`INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,updated_at=excluded.updated_at`),
 		mint, fmt.Sprint(amount), amount, "open", now, now); err != nil {
 		return err
 	}
-	if err = setSimulationTradeState(tx, d, id, now); err != nil {
+	if err = setSimulationTradeState(tx, d, id, amount, fees, now); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func (d *DB) FinalizeSimulationSell(id, mint string, value float64) error {
+func (d *DB) FinalizeSimulationSell(id, mint string, value float64, feesOpt ...float64) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
@@ -246,6 +250,10 @@ func (d *DB) FinalizeSimulationSell(id, mint string, value float64) error {
 		return err
 	}
 	now := time.Now().UTC()
+	fees := 0.0
+	if len(feesOpt) > 0 {
+		fees = feesOpt[0]
+	}
 	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=? AND status='open'`), now, mint)
 	if err != nil {
 		return err
@@ -255,8 +263,8 @@ func (d *DB) FinalizeSimulationSell(id, mint string, value float64) error {
 	} else if affected != 1 {
 		return fmt.Errorf("simulated position %q is no longer open", mint)
 	}
-	result, err = tx.Exec(d.bind(`UPDATE trades SET state='simulated',executed_value_sol=?,realized_pnl_sol=?,confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='sell'`),
-		value, value-cost, now, false, now, id)
+	result, err = tx.Exec(d.bind(`UPDATE trades SET state='simulated',executed_value_sol=?,fees_sol=?,realized_pnl_sol=?,confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='sell'`),
+		value, fees, value-cost, now, false, now, id)
 	if err != nil {
 		return err
 	}
@@ -349,8 +357,8 @@ func updateExecutedTrade(tx *sql.Tx, d *DB, id, state, signature string, execute
 	return nil
 }
 
-func setSimulationTradeState(tx *sql.Tx, d *DB, id string, now time.Time) error {
-	result, err := tx.Exec(d.bind(`UPDATE trades SET state='simulated',confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='buy'`), now, false, now, id)
+func setSimulationTradeState(tx *sql.Tx, d *DB, id string, amount, fees float64, now time.Time) error {
+	result, err := tx.Exec(d.bind(`UPDATE trades SET state='simulated',executed_value_sol=?,fees_sol=?,confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='buy'`), amount, fees, now, false, now, id)
 	if err != nil {
 		return err
 	}
@@ -391,6 +399,17 @@ func (d *DB) UpdatePaperMark(mint string, marketCapSOL float64) error {
 }
 func (d *DB) UpdateLiveMark(mint string, marketCapSOL float64) error {
 	return d.updateMark("live_marks", mint, marketCapSOL)
+}
+func (d *DB) MarkMarketCaps(mint string, simulation bool) (entry, current, peak float64, known bool, err error) {
+	table := "live_marks"
+	if simulation {
+		table = "paper_marks"
+	}
+	err = d.QueryRow(d.bind(`SELECT entry_market_cap_sol,current_market_cap_sol,peak_market_cap_sol FROM `+table+` WHERE mint=?`), mint).Scan(&entry, &current, &peak)
+	if err == sql.ErrNoRows {
+		return 0, 0, 0, false, nil
+	}
+	return entry, current, peak, err == nil, err
 }
 func (d *DB) updateMark(table, mint string, marketCapSOL float64) error {
 	if marketCapSOL <= 0 {
@@ -503,7 +522,7 @@ func (d *DB) UnmarkedOpenPositionCount(simulation bool) (int, error) {
 }
 func (d *DB) TradeCostsSOL() (float64, error) {
 	var costs float64
-	err := d.QueryRow(`SELECT COALESCE(SUM(fees_sol),0) FROM trades WHERE fees_sol IS NOT NULL`).Scan(&costs)
+	err := d.QueryRow(`SELECT COALESCE(SUM(fees_sol),0) FROM trades WHERE fees_sol IS NOT NULL AND state IN ('simulated','confirmed','finalized')`).Scan(&costs)
 	return costs, err
 }
 func (d *DB) TradeCount() (int, error) {
@@ -513,10 +532,11 @@ func (d *DB) TradeCount() (int, error) {
 }
 type PerformanceStats struct {
 	ClosedTrades, Winners, Losers int
-	WinRatePct, AvgWinSOL, AvgLossSOL, AvgHoldSeconds, FeesSOL, NetRealizedPnlSOL float64
+	WinRatePct, AvgWinSOL, AvgLossSOL, AvgHoldSeconds, FeesSOL, GrossRealizedPnlSOL, NetRealizedPnlSOL float64
 }
 
-func (d *DB) Performance() (PerformanceStats, error) {
+func (d *DB) Performance(simulationMode ...bool) (PerformanceStats, error) {
+	simulation := len(simulationMode) > 0 && simulationMode[0]
 	var stats PerformanceStats
 	err := d.QueryRow(`SELECT
 		COUNT(*),
@@ -526,7 +546,7 @@ func (d *DB) Performance() (PerformanceStats, error) {
 		COALESCE(AVG(CASE WHEN realized_pnl_sol<0 THEN realized_pnl_sol END),0),
 		COALESCE(SUM(realized_pnl_sol),0)
 		FROM trades WHERE side='sell' AND realized_pnl_sol IS NOT NULL`).Scan(
-		&stats.ClosedTrades, &stats.Winners, &stats.Losers, &stats.AvgWinSOL, &stats.AvgLossSOL, &stats.NetRealizedPnlSOL)
+		&stats.ClosedTrades, &stats.Winners, &stats.Losers, &stats.AvgWinSOL, &stats.AvgLossSOL, &stats.GrossRealizedPnlSOL)
 	if err != nil {
 		return stats, err
 	}
@@ -546,6 +566,13 @@ func (d *DB) Performance() (PerformanceStats, error) {
 	}
 	if stats.ClosedTrades > 0 {
 		stats.WinRatePct = float64(stats.Winners) * 100 / float64(stats.ClosedTrades)
+	}
+	stats.NetRealizedPnlSOL = stats.GrossRealizedPnlSOL
+	if simulation {
+		stats.NetRealizedPnlSOL -= stats.FeesSOL
+	} else {
+		// Confirmed live realized P&L already uses wallet deltas net of fees.
+		stats.GrossRealizedPnlSOL += stats.FeesSOL
 	}
 	return stats, nil
 }
@@ -576,7 +603,8 @@ func (d *DB) RealizedPnlSOL() (float64, error) {
 // realized results and the cost of currently open paper positions.
 func (d *DB) SimulationAvailableBalanceSOL(initialBalance float64) (float64, error) {
 	var balance float64
-	err := d.QueryRow(d.bind(`SELECT ? + COALESCE((SELECT SUM(realized_pnl_sol) FROM trades WHERE realized_pnl_sol IS NOT NULL),0)
+	err := d.QueryRow(d.bind(`SELECT ? + COALESCE((SELECT SUM(realized_pnl_sol) FROM trades WHERE state='simulated' AND realized_pnl_sol IS NOT NULL),0)
+		- COALESCE((SELECT SUM(fees_sol) FROM trades WHERE state='simulated'),0)
 		- COALESCE((SELECT SUM(cost_sol) FROM positions WHERE status='open'),0)`), initialBalance).Scan(&balance)
 	return balance, err
 }
@@ -650,10 +678,26 @@ func (d *DB) OpenExposureSOL() (float64, error) {
 	e := d.QueryRow(`SELECT COALESCE(SUM(cost_sol),0) FROM positions WHERE status='open'`).Scan(&n)
 	return n.Float64, e
 }
-func (d *DB) DailyRealizedLossSOL() (float64, error) {
+func (d *DB) DailyRealizedLossSOL(simulationMode ...bool) (float64, error) {
 	var n sql.NullFloat64
 	now := time.Now().UTC()
+	// Risk limits reset at UTC midnight (calendar day), not on a rolling 24-hour window.
 	utcDayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	if len(simulationMode) > 0 && simulationMode[0] {
+		var gross, fees float64
+		if err := d.QueryRow(d.bind(`SELECT COALESCE(SUM(realized_pnl_sol),0) FROM trades
+			WHERE state='simulated' AND side='sell' AND confirmed_at>=?`), utcDayStart).Scan(&gross); err != nil {
+			return 0, err
+		}
+		if err := d.QueryRow(d.bind(`SELECT COALESCE(SUM(fees_sol),0) FROM trades
+			WHERE state='simulated' AND confirmed_at>=?`), utcDayStart).Scan(&fees); err != nil {
+			return 0, err
+		}
+		if net := gross - fees; net < 0 {
+			return -net, nil
+		}
+		return 0, nil
+	}
 	e := d.QueryRow(d.bind(`SELECT COALESCE(SUM(CASE WHEN realized_pnl_sol < 0 THEN -realized_pnl_sol ELSE 0 END),0) FROM trades WHERE confirmed_at >= ?`), utcDayStart).Scan(&n)
 	return n.Float64, e
 }
