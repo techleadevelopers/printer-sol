@@ -380,7 +380,7 @@ func TestSimulationExitUsesConfiguredMaxHold(t *testing.T) {
 	}
 }
 
-func TestSimulationMaxHoldClosesWithoutPriceUpdatesAfterFiveMinutes(t *testing.T) {
+func TestSimulationMaxHoldClosesWithoutPriceUpdatesAfterExtendedWindow(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "paper-max-hold-no-feed.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -392,13 +392,13 @@ func TestSimulationMaxHoldClosesWithoutPriceUpdatesAfterFiveMinutes(t *testing.T
 	if err = db.OpenSimulationPosition("stale-paper-mint", 0.05); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-6*time.Minute), "stale-paper-mint"); err != nil {
+	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-11*time.Minute), "stale-paper-mint"); err != nil {
 		t.Fatal(err)
 	}
 
 	bus := events.New()
 	engine := execution.New(db, nil, nil, nil, nil, zap.NewNop(), true, 1, nil, bus, execution.Limits{})
-	monitor := New("", "", 8, db, nil, engine, 0, 0, 0, 50, 30, 10*time.Minute, true, bus, zap.NewNop())
+	monitor := New("", "", 8, db, nil, engine, 0, 0, 0, 50, 30, 5*time.Minute, true, bus, zap.NewNop())
 	monitor.expireOpenPositions(context.Background())
 
 	open, err := db.OpenPositionCount()
@@ -406,7 +406,7 @@ func TestSimulationMaxHoldClosesWithoutPriceUpdatesAfterFiveMinutes(t *testing.T
 		t.Fatal(err)
 	}
 	if open != 0 {
-		t.Fatalf("simulation position remained open past the five-minute maximum: %d", open)
+		t.Fatalf("simulation position remained open past the extended maximum: %d", open)
 	}
 	var side, state string
 	var pnl float64

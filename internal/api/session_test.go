@@ -1,6 +1,8 @@
 package api
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -23,5 +25,29 @@ func TestSessionTokenExpiresAndCannotBeTamperedWith(t *testing.T) {
 	}
 	if server.validSessionToken(server.sessionTokenAt(now.Add(time.Minute)), now) {
 		t.Fatal("session issued too far in the future was accepted")
+	}
+}
+
+func TestPrivateReadRoutesRequireAdminToken(t *testing.T) {
+	handler := New(nil, nil, nil, nil, nil, nil, nil, config.Config{AdminPassword: "test-admin-password"}, nil)
+	paths := []string{
+		"/api/dashboard",
+		"/api/tokens",
+		"/api/positions",
+		"/api/trades",
+		"/api/rpcs",
+		"/api/config",
+		"/api/wallet",
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("unauthenticated GET %s returned %d; want %d", path, response.Code, http.StatusUnauthorized)
+			}
+		})
 	}
 }

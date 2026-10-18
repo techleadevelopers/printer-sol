@@ -6,14 +6,13 @@ Portuguese-language operations UI for the independently hosted Go API. This arti
 
 Install dependencies with `npm install`, then start the dashboard with `npm run dev`. Run `npm run typecheck` to validate the frontend types.
 
-Copy `.env.example` to a local `.env` only when configuring a separate Go API. `VITE_API_BASE_URL` is the API origin without the `/api` suffix; leave it empty for same-origin routing. Set `VITE_WS_URL` only when the event service is not reachable at the API host's `/ws/events`. Clerk publishable configuration is managed by Replit Auth; never place `CLERK_SECRET_KEY` in this file.
+`VITE_API_BASE_URL` is the Go API origin without the `/api` suffix. When unset, the frontend uses the production Railway API at `https://quantum-sniper-sol-production.up.railway.app`. Set it explicitly when connecting this frontend to another Go API. Vercel currently rewrites unmatched paths to `index.html`; it does not proxy same-origin `/api` requests. Set `VITE_WS_URL` only when the event service is not reachable at the API host's `/ws/events`.
 
 ## Authentication and runtime
 
-- Clerk is mounted in the web app with Wouter's `import.meta.env.BASE_URL` base path. The public landing page remains available signed out; authenticated visitors at `/` go to `/user-portal`; signed-out portal routes return to `/`.
-- Clerk's sign-in and sign-up routes intentionally use the exact optional callback paths `/sign-in/*?` and `/sign-up/*?`. The browser uses the host-resolved publishable key and unconditionally passes `VITE_CLERK_PROXY_URL` to `ClerkProvider`.
-- The API client base is initialized in `src/services/api.ts` from `VITE_API_BASE_URL`. When unset, generated API requests stay same-origin and use Clerk's browser session cookie. No bearer token, auth token getter, or browser storage is used.
-- Configure `VITE_CLERK_PUBLISHABLE_KEY` and the deployment-managed `VITE_CLERK_PROXY_URL` as described by the Clerk integration. The parent workspace configures the server-side Clerk proxy.
+- The active web entry point uses the administrator password form at `/sign-in` and stores the one-hour bearer session issued by `/api/auth/login` in browser local storage. Protected API and WebSocket requests send this bearer token.
+- The source still contains an unmounted Clerk route implementation, but the active `App()` renders `MasterRoutes`; Clerk is not the current login flow.
+- The API client base is initialized in `src/services/api.ts` from `VITE_API_BASE_URL` or the production API default above.
 
 ## Go API contract expected by this UI
 

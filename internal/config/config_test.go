@@ -209,8 +209,17 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || !cfg.LiveUnlockRequiresPaper || !cfg.AsyncRugCheckAfterEntry || !cfg.SkipPreflight {
-		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f attempts=%d baseFee=%.9f liveGate=%v asyncScreen=%v skipPreflight=%v", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.AsyncRugCheckAfterEntry, cfg.SkipPreflight)
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 90 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || !cfg.LiveUnlockRequiresPaper || !cfg.AsyncRugCheckAfterEntry || !cfg.SkipPreflight {
+		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f liveGate=%v asyncScreen=%v skipPreflight=%v", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.AsyncRugCheckAfterEntry, cfg.SkipPreflight)
+	}
+
+	_ = os.Setenv("MAX_HOLD_SECONDS", `"120"`)
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxHoldSeconds != 120 {
+		t.Fatalf("quoted MAX_HOLD_SECONDS override was not applied: got %d, want 120", cfg.MaxHoldSeconds)
 	}
 
 	_ = os.Setenv("STOP_LOSS_PCT", "0")

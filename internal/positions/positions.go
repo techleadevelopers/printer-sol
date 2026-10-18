@@ -3,9 +3,15 @@ package positions
 
 import "time"
 
+const (
+	simulationHoldProfitExitPct = 5.0
+	simulationHoldLossExitPct   = -10.0
+)
+
 type Limits struct {
 	TakeProfitPct, StopLossPct, TrailingStopPct, MaxSlippagePct, MaxExposureSOL, MaxDailyLossSOL float64
 	MaxHold                                                                                      time.Duration
+	Simulation                                                                                   bool
 }
 type Position struct {
 	Mint                         string
@@ -38,8 +44,16 @@ func ExitReason(p Position, currentSOL float64, liquid bool, l Limits, now time.
 	if l.TakeProfitPct > 0 && change >= l.TakeProfitPct {
 		return "take profit"
 	}
-	if l.MaxHold > 0 && now.Sub(p.OpenedAt) >= l.MaxHold {
-		return "max hold time"
+	if l.MaxHold > 0 {
+		age := now.Sub(p.OpenedAt)
+		if age >= l.MaxHold {
+			if !l.Simulation || change >= simulationHoldProfitExitPct || change <= simulationHoldLossExitPct {
+				return "max hold time"
+			}
+			if age-l.MaxHold >= l.MaxHold {
+				return "max hold time (extended)"
+			}
+		}
 	}
 	return ""
 }

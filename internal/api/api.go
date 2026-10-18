@@ -47,15 +47,15 @@ func New(db *database.DB, w *wallet.Wallet, r *rpcmanager.Manager, e *execution.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.health)
 	mux.HandleFunc("/api/auth/login", s.login)
-	mux.HandleFunc("/api/dashboard", s.dashboard)
+	mux.HandleFunc("/api/dashboard", s.admin(s.dashboard))
 	mux.HandleFunc("/api/simulation/report", s.admin(s.simulationReport))
 	mux.HandleFunc("/api/performance/report", s.admin(s.performanceReport))
-	mux.HandleFunc("/api/tokens", s.tokens)
-	mux.HandleFunc("/api/positions", s.positions)
-	mux.HandleFunc("/api/trades", s.trades)
-	mux.HandleFunc("/api/rpcs", s.rpcsList)
-	mux.HandleFunc("/api/config", s.config)
-	mux.HandleFunc("/api/wallet", s.walletInfo)
+	mux.HandleFunc("/api/tokens", s.admin(s.tokens))
+	mux.HandleFunc("/api/positions", s.admin(s.positions))
+	mux.HandleFunc("/api/trades", s.admin(s.trades))
+	mux.HandleFunc("/api/rpcs", s.admin(s.rpcsList))
+	mux.HandleFunc("/api/config", s.admin(s.config))
+	mux.HandleFunc("/api/wallet", s.admin(s.walletInfo))
 	mux.HandleFunc("/api/bot/stop", s.admin(s.stop))
 	mux.HandleFunc("/api/bot/pause", s.admin(s.pause))
 	mux.HandleFunc("/api/bot/resume", s.admin(s.resume))
@@ -586,10 +586,6 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != "POST" {
 		fail(w, 405, "method_not_allowed", "method not allowed")
-		return
-	}
-	if !s.authorized(r) {
-		fail(w, 401, "unauthorized", "administrator authentication required")
 		return
 	}
 	var l execution.Limits

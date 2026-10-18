@@ -250,7 +250,12 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 		case known:
 			reason = m.positionExitReason(mint, returnPct, openedAt, now)
 		case holdExpired:
-			reason = "max hold time"
+			switch {
+			case !m.simulation:
+				reason = "max hold time"
+			case now.Sub(openedAt)-m.maxHold >= m.maxHold:
+				reason = "max hold time (extended)"
+			}
 		}
 		if reason != "" {
 			m.submitExit(ctx, mint, exitMarketCap, returnPct, reason)
@@ -556,7 +561,7 @@ func (m *Monitor) positionExitReason(mint string, returnPct float64, openedAt, n
 		positions.Position{Mint: mint, CostSOL: cost, PeakSOL: peakValue, OpenedAt: openedAt},
 		currentValue,
 		true,
-		positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, TrailingStopPct: m.trailingStop, MaxHold: m.maxHold},
+		positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, TrailingStopPct: m.trailingStop, MaxHold: m.maxHold, Simulation: m.simulation},
 		now,
 	)
 }
