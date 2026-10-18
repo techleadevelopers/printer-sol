@@ -75,7 +75,11 @@ func (d *DB) Migrate() error {
 			if d.postgres {
 				appliedAt = time.Now().UTC()
 			}
-			_, e = tx.Exec(d.bind("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)"), n, appliedAt)
+		recordMigration := "INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)"
+		if d.postgres {
+			recordMigration += " ON CONFLICT(version) DO NOTHING"
+		}
+		_, e = tx.Exec(d.bind(recordMigration), n, appliedAt)
 		}
 		if e != nil {
 			_ = tx.Rollback()
