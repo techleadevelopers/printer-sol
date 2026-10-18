@@ -204,10 +204,12 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 		return
 	}
 	event.MarketCapSOL = rpcMarketCapSOL
-	m.log.Info("candidate passed entry activity gate",
-		zap.String("mint", mint),
-		zap.Float64("real_sol_reserves_sol_proxy", realSOLReservesSOL),
-		zap.Float64("market_cap_sol", rpcMarketCapSOL))
+	m.log.Info(fmt.Sprintf(
+		"ENTRY APPROVED: mint=%s mcap=%.2f SOL, volume=%.2f SOL",
+		mint,
+		rpcMarketCapSOL,
+		realSOLReservesSOL,
+	))
 	queued, enqueueReason := m.enqueueSnipe(event)
 	if !queued {
 		m.rejectCandidate(event, enqueueReason)
