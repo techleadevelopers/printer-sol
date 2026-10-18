@@ -465,6 +465,13 @@ components:
         estimatedOpenPnlSol: { type: ["number", "null"] }
         netPnlSol: { type: ["number", "null"] }
         costsSol: { type: ["number", "null"] }
+        staleMarks:
+          type: object
+          required: [total, flat, pctFlat]
+          properties:
+            total: { type: integer }
+            flat: { type: integer }
+            pctFlat: { type: number }
         cumulativeResult:
           type: array
           items: { $ref: "#/components/schemas/TimeValue" }

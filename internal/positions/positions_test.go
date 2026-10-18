@@ -34,18 +34,17 @@ func TestTrailingStopDoesNotArmBeforeTenPercentGain(t *testing.T) {
 	}
 }
 
-func TestMaxHoldExtendsFlatPositionsOnceInSimulationAndLive(t *testing.T) {
+func TestMaxHoldDoesNotForceExitInsideDeadzone(t *testing.T) {
 	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
 
 	for _, mode := range []string{"simulation", "live"} {
 		t.Run(mode, func(t *testing.T) {
 			limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second}
-			if got := ExitReason(position, 1, true, limits, openedAt.Add(90*time.Second)); got != "" {
-				t.Fatalf("flat position should receive one hold extension; got %q", got)
-			}
-			if got := ExitReason(position, 1, true, limits, openedAt.Add(180*time.Second)); got != "max hold time (extended)" {
-				t.Fatalf("flat position should close after the extension; got %q", got)
+			for _, age := range []time.Duration{90 * time.Second, 180 * time.Second, 30 * time.Minute} {
+				if got := ExitReason(position, 1, true, limits, openedAt.Add(age)); got != "" {
+					t.Fatalf("flat position should not be force-sold after %s; got %q", age, got)
+				}
 			}
 		})
 	}

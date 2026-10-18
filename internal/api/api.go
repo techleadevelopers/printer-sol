@@ -160,6 +160,15 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load P&L history")
 		return
 	}
+	var staleMarks map[string]any
+	if s.cfg.Simulation {
+		total, flat, pctFlat, statsErr := s.db.PaperMarkStats()
+		if statsErr != nil {
+			fail(w, http.StatusInternalServerError, "database_unavailable", "could not load paper mark statistics")
+			return
+		}
+		staleMarks = map[string]any{"total": total, "flat": flat, "pctFlat": pctFlat}
+	}
 	balance, balanceAvailable := s.balanceSOL(r.Context())
 	var walletBalance any
 	if balanceAvailable {
@@ -244,6 +253,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		dashboard["virtualEquitySol"] = virtualEquity
 		dashboard["simulation"] = simSummary
 		dashboard["closedTrades"] = simSummary.TotalTrades
+		dashboard["staleMarks"] = staleMarks
 	}
 	dashboard["transactionsCount"] = tradeCount
 	write(w, 200, dashboard)

@@ -6,6 +6,36 @@ import (
 	"testing"
 )
 
+func TestPaperMarkStatsCountsFlatMarks(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "paper-mark-stats.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+
+	total, flat, pctFlat, err := db.PaperMarkStats()
+	if err != nil || total != 0 || flat != 0 || pctFlat != 0 {
+		t.Fatalf("empty mark stats = (%d, %d, %.2f), err=%v; want (0, 0, 0)", total, flat, pctFlat, err)
+	}
+	if err = db.RecordPaperMark("flat-mint", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordPaperMark("moving-mint", 200); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdatePaperMark("moving-mint", 250); err != nil {
+		t.Fatal(err)
+	}
+
+	total, flat, pctFlat, err = db.PaperMarkStats()
+	if err != nil || total != 2 || flat != 1 || pctFlat != 50 {
+		t.Fatalf("mark stats = (%d, %d, %.2f), err=%v; want (2, 1, 50)", total, flat, pctFlat, err)
+	}
+}
+
 func TestTradeAndTransactionAreAtomicAndRequireReconciliation(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

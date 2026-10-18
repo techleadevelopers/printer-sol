@@ -1,0 +1,194 @@
+BUG CRÍTICO — PAPER TRADING VENDE 100% DOS TRADES A 0%
+
+EVIDÊNCIA DOS DADOS (não é opinião, é o painel de produção):
+
+Em ~50 minutos rodando SIMULATION=true:
+- 807 operações, 401 trades fechados
+- 75 positivas = 0
+- 75 negativas = -0.002 (só taxa)
+- TODAS as vendas com resultado bruto = 0
+- TODAS as vendas acontecem ~10min após a compra
+- MAX_HOLD_SECONDS=300, extensão 2x=600s = 10min ✅ bate
+
+Diagnóstico: o MaxHold está disparando corretamente (10min = 2x300s),
+MAS o preço do token NUNCA MUDA entre compra e venda. Estatisticamente
+impossível 401 trades fecharem exatamente a 0% se houver feed de preço.
+Conclusão: paper_marks não está sendo atualizado.
+
+═══════════════════════════════════════════════════════════════
+TAREFA 1 — PROVAR ONDE O FEED DE PREÇO QUEBRA (sem alterar nada)
+═══════════════════════════════════════════════════════════════
+
+Investigar o caminho completo de atualização de preço em paper mode:
+
+1.1 No monitor.go, mostre as 3 partes exatas:
+    a) Onde RecordPaperMark é chamado no entry (após BuyNewTokenUSD)
+    b) Onde markTrade é chamado quando trade event chega do WS
+    c) Onde a subscription é adicionada (subscriptions <- e.Mint)
+
+    Cole o código real com números de linha.
+
+1.2 Mostre a condição exata que dispara markTrade:
+    grep -n "tracked.Load\|markTrade" internal/tokenmonitor/monitor.go
+    Se for `if _, tracked := m.tracked.Load(d.Mint); tracked && d.MarketCapSol > 0`
+    prove que:
+    - d.MarketCapSol nunca vem 0 (log ou teste)
+    - trade events realmente chegam para tokens recém-criados em pump.fun
+
+1.3 Mostre o consumer da fila subscriptions:
+    grep -n "subscriptions <- \|case mint := <-m.subscriptions" internal/tokenmonitor/monitor.go
+    Se a fila enche (TOKEN_QUEUE_SIZE=1024), mints são DESCARTADOS
+    silenciosamente. Prove que isso não está acontecendo com 16 buys/minuto.
+
+1.4 Rode este SQL no banco de simulação e cole o resultado:
+    SELECT
+      COUNT(*) as total_marks,
+      SUM(CASE WHEN peak_market_cap_sol > entry_market_cap_sol THEN 1 ELSE 0 END) as com_pico,
+      SUM(CASE WHEN current_market_cap_sol = entry_market_cap_sol THEN 1 ELSE 0 END) as flat,
+      SUM(CASE WHEN current_market_cap_sol = 0 THEN 1 ELSE 0 END) as zero
+    FROM paper_marks;
+
+    Se com_pico = 0: CONFIRMA que preço nunca atualiza.
+    Se flat = total: CONFIRMA que todos ficam no entry.
+
+1.5 Mostre TODOS os logs da coluna operational_logs das últimas 2 horas:
+    SELECT event_type, COUNT(*) FROM operational_logs
+    WHERE created_at >= datetime('now','-2 hours')
+    GROUP BY event_type ORDER BY COUNT(*) DESC;
+
+    Procure por "token trade subscription queue full" ou
+    "record take-profit mark" com erro.
+
+ENTREGUE: as 5 provas acima em formato tabela. NÃO altere código na tarefa 1.
+
+═══════════════════════════════════════════════════════════════
+TAREFA 2 — CORRIGIR (só depois da Tarefa 1 provar o ponto de falha)
+═══════════════════════════════════════════════════════════════
+
+2.1 FIX DEFINITIVO DO MAX_HOLD — NUNCA VENDER FLAT
+
+Substituir em internal/positions/positions.go o bloco MaxHold por:
+
+    if l.MaxHold > 0 {
+        age := now.Sub(p.OpenedAt)
+        if age >= l.MaxHold {
+            // Só vende se resultado material (>+5% ou <-10%).
+            // Zona morta (-10% a +5%): NÃO vende por tempo. Aguarda
+            // TP/SL/trailing decidirem. Flat = perda garantida de taxa.
+            if change >= holdProfitExitPct || change <= holdLossExitPct {
+                return "max hold time"
+            }
+        }
+    }
+
+REMOVIDO: o `if age-l.MaxHold >= l.MaxHold { return "extended" }`.
+Motivo: com feed quebrado, extensão só dobra o tempo até perder taxa.
+Se o feed está OK, TP/SL/trailing resolvem antes de 2x MaxHold.
+Nunca é correto vender a 0%.
+
+2.2 CORRIGIR O FEED (depende do que a Tarefa 1 revelar)
+
+Se 1.1b/1.2 provar que markTrade não é chamado: investigar por que
+trade events não chegam. Possibilidades:
+- subscribeTokenTrade não está sendo enviado corretamente
+- pump.fun não emite trades para tokens sem liquidez (provável)
+- d.MarketCapSol chega 0 e a condição `> 0` falha silenciosamente
+
+Se 1.3 provar que fila enche: aumentar TOKEN_QUEUE_SIZE para 4096,
+OU não subscrever trade events para tokens sem volume inicial,
+OU usar um worker pool para subscriptions paralelas.
+
+Se 1.2 provar que mcap chega 0: usar outro campo do trade event
+(ex: virtualSolReserves, priceInSol) ou buscar via RPC getAccountInfo.
+
+2.3 LOG DE DIAGNÓSTICO PERMANENTE
+
+Em markTrade, adicionar no INÍCIO:
+
+    m.log.Info("mark update",
+        zap.String("mint", mint),
+        zap.Float64("mcap_sol", marketCapSOL),
+        zap.Float64("return_pct", returnPct),
+        zap.Bool("simulation", m.simulation))
+
+Isso permite ao operador VER se preço está mudando em produção.
+Sem isso, o bug volta invisível.
+
+2.4 MÉTRICA DE "STALE MARKS" no /api/dashboard
+
+Adicionar ao JSON do dashboard:
+    "staleMarks": {
+      "total": <count de paper_marks>,
+      "flat": <count com current == entry>,
+      "pct_flat": <float>
+    }
+
+Se pct_flat > 80%, o painel exibe ALERTA: "Feed de preço suspeito".
+
+═══════════════════════════════════════════════════════════════
+TAREFA 3 — AUDITORIA ADICIONAL (o que mais estiver quebrado)
+═══════════════════════════════════════════════════════════════
+
+Checar cada item, mostrar PASS/FAIL, corrigir se FAIL:
+
+3.1 PeakSOL está populado em PaperMark?
+    grep -n "peak_market_cap_sol" internal/database/database.go
+    Se o UPDATE não escreve peak, trailing nunca arma. Corrigir.
+
+3.2 UpdatePaperMark atualiza peak também?
+    O UPDATE deve ser:
+    SET current = ?,
+        peak = CASE WHEN peak < ? THEN ? ELSE peak END
+    Se só atualiza current, fix.
+
+3.3 TakeProfit não está em ordem errada?
+    Em ExitReason, verificar se TrailingStop vem antes de TakeProfit.
+    Se TP está certo mas trailing dispara antes por ordem, motivo errado
+    é registrado (funcionalmente vende igual, só dificulta debug).
+
+3.4 MAX_HOLD_SECONDS é lido corretamente do env?
+    grep -n "MaxHoldSeconds\|MAX_HOLD_SECONDS" internal/config/config.go
+    Mostre a linha exata onde intEnv("MAX_HOLD_SECONDS", ...) define o valor.
+    Teste: env=300 → cfg.MaxHoldSeconds=300.
+
+3.5 monitor.go passa MaxHold corretamente pra positions?
+    grep -n "positions.Limits{" internal/tokenmonitor/monitor.go
+    Mostre a construção com MaxHold: m.maxHold. Se for 0, bug.
+
+3.6 maxHoldMinutes da UI (o campo que você disse que consertou)
+    Existe? Se sim, mostra como foi consertado.
+    Se foi removido, mostra o diff.
+
+═══════════════════════════════════════════════════════════════
+TAREFA 4 — VALIDAÇÃO (obrigatório, você NÃO rodou na última vez)
+═══════════════════════════════════════════════════════════════
+
+DEPOIS de todas as mudanças:
+
+    go build ./...
+    go test ./internal/positions/ -v
+    go test ./internal/tokenmonitor/ -v
+    go test ./internal/database/ -v
+    go test ./...
+
+Se qualquer um falhar: NÃO ENTREGUE. Conserte primeiro.
+Se der erro de toolchain (GOSUMDB=off, go1.24 not found):
+NÃO instale Go 1.25. REPORTE o erro e pare. O usuário roda
+os testes na máquina local dele.
+
+═══════════════════════════════════════════════════════════════
+ENTREGA ESPERADA
+═══════════════════════════════════════════════════════════════
+
+A) Tabela: Item | PASS/FAIL | Prova (grep output ou SQL result)
+B) Diffs aplicados (git diff por arquivo)
+C) go build output (deve ser vazio)
+D) go test output (deve mostrar PASS em todos os pacotes)
+E) Se você não conseguiu rodar testes: qual erro exato, e para.
+
+NÃO DESVIE. NÃO adicione autenticação. NÃO mexa em Clerk.
+NÃO atualize dependências. NÃO invente "vou investigar".
+
+RESPONDA: o bug é que o preço nunca muda em paper_marks?
+SIM ou NÃO? Se SIM, onde o feed quebra (linha exata)?
+Se NÃO, qual sua hipótese alternativa baseada nos dados acima?

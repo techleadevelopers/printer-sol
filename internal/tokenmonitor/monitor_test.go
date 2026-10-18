@@ -242,7 +242,7 @@ func TestLivePendingBuyKeepsMarkTrackingUntilConfirmation(t *testing.T) {
 	}
 }
 
-func TestLiveMaxHoldUsesExtensionWithoutFurtherPriceUpdates(t *testing.T) {
+func TestLiveMaxHoldDoesNotForceExitWithoutPriceMark(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "live-max-hold-no-feed.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -262,14 +262,14 @@ func TestLiveMaxHoldUsesExtensionWithoutFurtherPriceUpdates(t *testing.T) {
 	monitor := New("", "", 8, db, nil, entry, 0, 0, 0, 50, 30, 10*time.Minute, false, events.New(), zap.NewNop())
 	monitor.expireOpenPositions(context.Background())
 	if entry.liveExitCalls != 0 {
-		t.Fatalf("live position inside the extension window should remain open, got %d sells", entry.liveExitCalls)
+		t.Fatalf("live position without a price mark should remain open, got %d sells", entry.liveExitCalls)
 	}
 	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-21*time.Minute), "stale-live-mint"); err != nil {
 		t.Fatal(err)
 	}
 	monitor.expireOpenPositions(context.Background())
-	if entry.liveExitCalls != 1 {
-		t.Fatalf("live position past the extension should submit one sell, got %d", entry.liveExitCalls)
+	if entry.liveExitCalls != 0 {
+		t.Fatalf("unknown price after twice max-hold must not submit a sell, got %d", entry.liveExitCalls)
 	}
 
 	if err = db.InsertTrade(database.Trade{ID: "pending-max-hold-sell", Mint: "stale-live-mint", Side: "sell", Quantity: "100", Requested: 100, State: "submitted"}); err != nil {
@@ -354,7 +354,7 @@ func TestLiveFailedSellRetriesEvenAfterPriceFallsBelowTakeProfit(t *testing.T) {
 	}
 }
 
-func TestSimulationExitUsesConfiguredMaxHold(t *testing.T) {
+func TestSimulationMaxHoldExitsWhenMarkedOutsideDeadzone(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "paper-max-hold.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -376,7 +376,7 @@ func TestSimulationExitUsesConfiguredMaxHold(t *testing.T) {
 	bus := events.New()
 	engine := execution.New(db, nil, nil, nil, nil, zap.NewNop(), true, 1, nil, bus, execution.Limits{})
 	monitor := New("", "", 8, db, nil, engine, 0, 0, 0, 70, 30, time.Minute, true, bus, zap.NewNop())
-	monitor.markTrade(context.Background(), "paper-mint", 100)
+	monitor.markTrade(context.Background(), "paper-mint", 106)
 
 	open, err := db.OpenPositionCount()
 	if err != nil {
@@ -387,7 +387,7 @@ func TestSimulationExitUsesConfiguredMaxHold(t *testing.T) {
 	}
 }
 
-func TestSimulationMaxHoldUsesExtensionWithoutPriceUpdates(t *testing.T) {
+func TestSimulationMaxHoldDoesNotForceExitWithoutPriceUpdates(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "paper-max-hold-no-feed.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -413,7 +413,7 @@ func TestSimulationMaxHoldUsesExtensionWithoutPriceUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	if open != 1 {
-		t.Fatalf("simulation position should remain open during the extension: %d", open)
+		t.Fatalf("simulation position without a price mark should remain open: %d", open)
 	}
 	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-11*time.Minute), "stale-paper-mint"); err != nil {
 		t.Fatal(err)
@@ -423,15 +423,7 @@ func TestSimulationMaxHoldUsesExtensionWithoutPriceUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if open != 0 {
-		t.Fatalf("simulation position remained open past the extension: %d", open)
-	}
-	var side, state string
-	var pnl float64
-	if err = db.QueryRow(`SELECT side,state,realized_pnl_sol FROM trades WHERE side='sell'`).Scan(&side, &state, &pnl); err != nil {
-		t.Fatalf("timed simulation close was not persisted: %v", err)
-	}
-	if side != "sell" || state != "simulated" || pnl != 0 {
-		t.Fatalf("unexpected no-mark timed exit: side=%q state=%q pnl=%f", side, state, pnl)
+	if open != 1 {
+		t.Fatalf("unknown price after twice max-hold must not force-close simulation position: %d", open)
 	}
 }

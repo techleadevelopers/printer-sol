@@ -49,9 +49,6 @@ func ExitReason(p Position, currentSOL float64, liquid bool, l Limits, now time.
 			if change >= holdProfitExitPct || change <= holdLossExitPct {
 				return "max hold time"
 			}
-			if age-l.MaxHold >= l.MaxHold {
-				return "max hold time (extended)"
-			}
 		}
 	}
 	return ""

@@ -224,7 +224,6 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 			continue
 		}
 
-		holdExpired := now.Sub(openedAt) >= m.maxHold
 		var returnPct float64
 		var exitMarketCap float64
 		var known bool
@@ -255,10 +254,6 @@ func (m *Monitor) expireOpenPositions(ctx context.Context) {
 			reason = "retry failed exit"
 		case known:
 			reason = m.positionExitReason(mint, returnPct, openedAt, now)
-		case holdExpired:
-			if now.Sub(openedAt)-m.maxHold >= m.maxHold {
-				reason = "max hold time (extended)"
-			}
 		}
 		if reason != "" {
 			m.submitExit(ctx, mint, exitMarketCap, returnPct, reason)
@@ -339,6 +334,8 @@ func (m *Monitor) connect(ctx context.Context) error {
 		select {
 		case m.subscriptions <- key.(string):
 		default:
+			m.tracked.Delete(key)
+			m.log.Warn("open-position subscription queue full during reconnect", zap.String("mint", key.(string)))
 		}
 		return true
 	})
@@ -356,8 +353,15 @@ func (m *Monitor) connect(ctx context.Context) error {
 			m.log.Warn("invalid token event", zap.Error(err))
 			continue
 		}
-		if _, tracked := m.tracked.Load(d.Mint); tracked && d.MarketCapSol > 0 {
-			m.markTrade(ctx, d.Mint, d.MarketCapSol)
+		if _, tracked := m.tracked.Load(d.Mint); tracked {
+			if d.MarketCapSol > 0 {
+				m.markTrade(ctx, d.Mint, d.MarketCapSol)
+			} else {
+				m.log.Warn("tracked token trade skipped without positive market cap",
+					zap.String("mint", d.Mint),
+					zap.Float64("mcap_sol", d.MarketCapSol),
+					zap.Bool("simulation", m.simulation))
+			}
 			continue
 		}
 		creator := d.Creator
@@ -437,6 +441,7 @@ func (m *Monitor) consume(ctx context.Context) {
 			select {
 			case m.subscriptions <- e.Mint:
 			default:
+				m.tracked.Delete(e.Mint)
 				m.log.Warn("token trade subscription queue full", zap.String("mint", e.Mint))
 			}
 			m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
@@ -504,9 +509,26 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 	} else {
 		returnPct, known, err = m.db.LiveReturnPct(mint)
 	}
-	if err != nil || !known {
+	if err != nil {
+		m.log.Warn("read return after mark update",
+			zap.String("mint", mint),
+			zap.Float64("mcap_sol", marketCapSOL),
+			zap.Bool("simulation", m.simulation),
+			zap.Error(err))
 		return
 	}
+	if !known {
+		m.log.Warn("mark row missing after update",
+			zap.String("mint", mint),
+			zap.Float64("mcap_sol", marketCapSOL),
+			zap.Bool("simulation", m.simulation))
+		return
+	}
+	m.log.Info("mark update",
+		zap.String("mint", mint),
+		zap.Float64("mcap_sol", marketCapSOL),
+		zap.Float64("return_pct", returnPct),
+		zap.Bool("simulation", m.simulation))
 	if !m.simulation {
 		active, activeErr := m.db.ActiveForMint(mint)
 		if activeErr != nil || active {

@@ -408,6 +408,18 @@ func (d *DB) UpdatePaperMark(mint string, marketCapSOL float64) error {
 func (d *DB) UpdateLiveMark(mint string, marketCapSOL float64) error {
 	return d.updateMark("live_marks", mint, marketCapSOL)
 }
+func (d *DB) PaperMarkStats() (total, flat int, pctFlat float64, err error) {
+	err = d.QueryRow(`SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN current_market_cap_sol=entry_market_cap_sol THEN 1 ELSE 0 END),0)
+		FROM paper_marks`).Scan(&total, &flat)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if total > 0 {
+		pctFlat = float64(flat) * 100 / float64(total)
+	}
+	return total, flat, pctFlat, nil
+}
 func (d *DB) MarkMarketCaps(mint string, simulation bool) (entry, current, peak float64, known bool, err error) {
 	table := "live_marks"
 	if simulation {
