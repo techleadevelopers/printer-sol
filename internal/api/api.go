@@ -56,7 +56,7 @@ func New(db *database.DB, w *wallet.Wallet, r *rpcmanager.Manager, e *execution.
 	mux.HandleFunc("/api/rpcs/test", s.admin(s.rpcTest))
 	mux.HandleFunc("/api/rpcs/select", s.admin(s.rpcSelect))
 	mux.HandleFunc("/ws/events", s.ws)
-	return cors(mux)
+	return corsPolicy(mux)
 }
 func method(w http.ResponseWriter, r *http.Request, m string) bool {
 	if r.Method != m {
@@ -327,7 +327,7 @@ func (s *Server) emergency(w http.ResponseWriter, r *http.Request) {
 
 // cors handles browser preflight before routes perform method or auth checks.
 // Origins are explicit: credentials are never combined with a wildcard origin.
-func cors(next http.Handler) http.Handler {
+func corsPolicy(next http.Handler) http.Handler {
 	allowed := map[string]struct{}{
 		"https://solana-sniper-bot-dashboard.vercel.app": {},
 		"http://localhost:5173":                          {},
