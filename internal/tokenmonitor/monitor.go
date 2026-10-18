@@ -621,6 +621,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+			m.logWebSocketRaw(b)
 			var d struct {
 				Mint             string          `json:"mint"`
 				Creator          string          `json:"creator"`
@@ -791,6 +792,26 @@ func (m *Monitor) websocketPayloadPreview(raw []byte) string {
 		preview = preview[:512] + "..."
 	}
 	return preview
+}
+
+func (m *Monitor) logWebSocketRaw(raw []byte) {
+	var control struct {
+		Type    string `json:"type"`
+		Method  string `json:"method"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &control) == nil {
+		for _, value := range []string{control.Type, control.Method, control.Message} {
+			if strings.Contains(strings.ToLower(value), "subscrib") {
+				return
+			}
+		}
+	}
+	payload := string(raw)
+	if m.key != "" {
+		payload = strings.ReplaceAll(payload, m.key, "[redacted]")
+	}
+	m.log.Debug("[WS-RAW] " + payload)
 }
 
 func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
