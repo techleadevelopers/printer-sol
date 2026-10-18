@@ -208,3 +208,41 @@ func (m *Manager) Balance(ctx context.Context, address string) (uint64, error) {
 	}
 	return r.Value, nil
 }
+
+// Execution reads the confirmed transaction receipt and returns the SOL delta
+// for the operational wallet plus the network fee. Live P&L must use this
+// ledger data rather than a market-cap estimate.
+func (m *Manager) Execution(ctx context.Context, signature, address string) (float64, float64, error) {
+	u, err := m.currentURL()
+	if err != nil {
+		return 0, 0, err
+	}
+	var receipt struct {
+		Meta *struct {
+			Fee          uint64   `json:"fee"`
+			PreBalances  []uint64 `json:"preBalances"`
+			PostBalances []uint64 `json:"postBalances"`
+		} `json:"meta"`
+		Transaction struct {
+			Message struct {
+				AccountKeys []string `json:"accountKeys"`
+			} `json:"message"`
+		} `json:"transaction"`
+	}
+	err = m.call(ctx, u, "getTransaction", []any{signature, map[string]any{
+		"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0,
+	}}, &receipt)
+	if err != nil {
+		return 0, 0, err
+	}
+	if receipt.Meta == nil || len(receipt.Meta.PreBalances) != len(receipt.Meta.PostBalances) || len(receipt.Meta.PreBalances) != len(receipt.Transaction.Message.AccountKeys) {
+		return 0, 0, fmt.Errorf("incomplete confirmed transaction metadata")
+	}
+	for i, key := range receipt.Transaction.Message.AccountKeys {
+		if key == address {
+			delta := int64(receipt.Meta.PostBalances[i]) - int64(receipt.Meta.PreBalances[i])
+			return float64(delta) / 1e9, float64(receipt.Meta.Fee) / 1e9, nil
+		}
+	}
+	return 0, 0, fmt.Errorf("operational wallet missing from confirmed transaction")
+}
