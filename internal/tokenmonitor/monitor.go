@@ -4,18 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/gorilla/websocket"
-	"go.uber.org/zap"
 	"net/url"
-	"solana-sniper-backend/internal/database"
-	"solana-sniper-backend/internal/events"
-	"solana-sniper-backend/internal/positions"
-	"solana-sniper-backend/internal/strategy"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
+	"solana-sniper-backend/internal/database"
+	"solana-sniper-backend/internal/events"
+	"solana-sniper-backend/internal/positions"
+	"solana-sniper-backend/internal/pumpportal"
+	"solana-sniper-backend/internal/strategy"
 )
 
 type Event struct {
@@ -38,6 +40,32 @@ type Entrier interface {
 type unknownTradeReconciler interface {
 	ReconcileUnknown(context.Context) error
 }
+
+type CoinSource interface {
+	Coin(context.Context, string) (pumpportal.CoinSnapshot, error)
+}
+
+type SOLUSDQuoter interface {
+	SOLUSD(context.Context) (float64, error)
+}
+
+type Settings struct {
+	EntryDelay       time.Duration
+	MinTransactions  int
+	MinVolume        float64
+	PricePollInterval time.Duration
+	Coins            CoinSource
+	SOLUSD           SOLUSDQuoter
+}
+
+type candidate struct {
+	event              Event
+	detectedAt         time.Time
+	tradeEvents        int
+	tradeMarketCapSOL  float64
+	checking           bool
+}
+
 type Monitor struct {
 	ws, key                         string
 	q                               chan Event
@@ -65,12 +93,26 @@ type Monitor struct {
 	exitMu                          sync.Mutex
 	exitRetryAfter                  sync.Map
 	exitIntents                     sync.Map
+	candidateMu                     sync.Mutex
+	candidates                      map[string]*candidate
+	entryDelay                      time.Duration
+	minTransactions                 int
+	minVolume                       float64
+	pricePollInterval               time.Duration
+	coins                           CoinSource
+	solUSD                          SOLUSDQuoter
+	coinAPIStatusMu                 sync.Mutex
+	coinAPIFailures                 int
+	coinAPIAlerted                  bool
 }
 
 const exitRetryDelay = 5 * time.Second
 
 func (m *Monitor) runOperation(fn func()) bool {
-	generation := m.resetGeneration.Load()
+	return m.runOperationAt(m.resetGeneration.Load(), fn)
+}
+
+func (m *Monitor) runOperationAt(generation uint64, fn func()) bool {
 	if m.resetting.Load() {
 		return false
 	}
@@ -138,6 +180,9 @@ func (m *Monitor) ResetInMemoryState() {
 		m.missingMarks.Delete(key)
 		return true
 	})
+	m.candidateMu.Lock()
+	m.candidates = make(map[string]*candidate)
+	m.candidateMu.Unlock()
 	for {
 		select {
 		case <-m.q:
@@ -155,12 +200,50 @@ subscriptions:
 	}
 }
 
-func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit, stopLoss float64, maxHold time.Duration, simulation bool, b *events.Bus, l *zap.Logger) *Monitor {
+func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit, stopLoss float64, maxHold time.Duration, simulation bool, b *events.Bus, l *zap.Logger, options ...Settings) *Monitor {
 	const maximumPositionHold = 5 * time.Minute
 	if maxHold <= 0 || maxHold > maximumPositionHold {
 		maxHold = maximumPositionHold
 	}
-	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15, maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size), seen: make(map[string]time.Time), bus: b, log: l}
+	settings := Settings{
+		EntryDelay:        8 * time.Second,
+		MinTransactions:   3,
+		MinVolume:         5,
+		PricePollInterval: 20 * time.Second,
+		Coins:             pumpportal.NewCoinDataClient(),
+	}
+	if len(options) > 0 {
+		option := options[0]
+		if option.EntryDelay > 0 {
+			settings.EntryDelay = option.EntryDelay
+		}
+		if option.MinTransactions > 0 {
+			settings.MinTransactions = option.MinTransactions
+		}
+		if option.MinVolume > 0 {
+			settings.MinVolume = option.MinVolume
+		}
+		if option.PricePollInterval > 0 {
+			settings.PricePollInterval = option.PricePollInterval
+		}
+		if option.Coins != nil {
+			settings.Coins = option.Coins
+		}
+		settings.SOLUSD = option.SOLUSD
+	}
+	if limiter, ok := settings.Coins.(interface{ SetRateLimitBase(time.Duration) }); ok {
+		limiter.SetRateLimitBase(settings.PricePollInterval)
+	}
+	return &Monitor{
+		ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry,
+		tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee,
+		takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15,
+		maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size),
+		seen: make(map[string]time.Time), candidates: make(map[string]*candidate),
+		entryDelay: settings.EntryDelay, minTransactions: settings.MinTransactions,
+		minVolume: settings.MinVolume, pricePollInterval: settings.PricePollInterval,
+		coins: settings.Coins, solUSD: settings.SOLUSD, bus: b, log: l,
+	}
 }
 func (m *Monitor) SetTrailingStopPct(pct float64) {
 	if pct > 0 {
@@ -180,6 +263,8 @@ func (m *Monitor) Run(ctx context.Context) {
 	go m.consume(ctx)
 	go m.runMaxHoldChecker(ctx)
 	go m.runSeenJanitor(ctx)
+	go m.runCandidateChecker(ctx)
+	go m.runPricePoller(ctx)
 	m.runConnections(ctx)
 }
 
@@ -396,7 +481,7 @@ func (m *Monitor) alertMissingMark(mint string, markErr error) {
 		fields = append(fields, zap.Error(markErr))
 	}
 	m.log.Warn("open position has no valid mark; keeping it open", fields...)
-	m.bus.Publish("risk_alert", map[string]any{
+	m.bus.Publish("risk.alert", map[string]any{
 		"mint": mint, "reason": reason, "positionRemainsOpen": true,
 		"simulation": m.simulation,
 	})
@@ -488,7 +573,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 			return err
 		}
 		var d struct {
-			Mint, Creator, User                    string
+			Mint, Creator, User, TxType            string
 			CreatedTimestamp, Timestamp, BlockTime json.RawMessage
 			MarketCapSol                           float64 `json:"marketCapSol"`
 		}
@@ -524,7 +609,13 @@ func (m *Monitor) connect(ctx context.Context) error {
 		if m.resetting.Load() {
 			continue
 		}
-		if _, tracked := m.tracked.Load(d.Mint); tracked {
+		_, tracked := m.tracked.Load(d.Mint)
+		m.log.Debug("PumpPortal websocket market-cap event",
+			zap.String("mint", d.Mint),
+			zap.String("tx_type", d.TxType),
+			zap.Float64("market_cap_sol", d.MarketCapSol),
+			zap.Bool("tracked", tracked))
+		if tracked {
 			if d.MarketCapSol > 0 {
 				m.markTrade(ctx, d.Mint, d.MarketCapSol)
 			} else {
@@ -533,6 +624,9 @@ func (m *Monitor) connect(ctx context.Context) error {
 					zap.Float64("mcap_sol", d.MarketCapSol),
 					zap.Bool("simulation", m.simulation))
 			}
+			continue
+		}
+		if m.recordCandidateTrade(d.Mint, d.TxType, d.MarketCapSol) {
 			continue
 		}
 		creator := d.Creator
@@ -550,12 +644,15 @@ func (m *Monitor) connect(ctx context.Context) error {
 				return
 			}
 			m.bus.Publish("token_detected", map[string]any{"mint": e.Mint, "creator": e.Creator, "receivedAt": e.Received.UTC()})
+			if !m.addCandidate(e) {
+				m.rejectCandidate(e, "candidate queue full")
+				return
+			}
 			select {
-			case m.q <- e:
+			case m.subscriptions <- e.Mint:
+				m.log.Debug("subscribed to candidate trades", zap.String("mint", e.Mint))
 			default:
-				m.log.Warn("token queue full", zap.String("mint", e.Mint))
-				m.bus.Publish("operational_error", map[string]string{"component": "token_monitor", "message": "token queue full"})
-				m.forgetMint(e.Mint)
+				m.log.Warn("candidate subscription queue full; public activity check will continue", zap.String("mint", e.Mint))
 			}
 		})
 	}
@@ -667,12 +764,20 @@ func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {
 }
 
 func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float64) {
-	m.runOperation(func() {
-		m.markTradeLocked(ctx, mint, marketCapSOL)
+	m.markTradeWithSource(ctx, mint, marketCapSOL, "pumpportal_websocket_market_cap")
+}
+
+func (m *Monitor) markTradeWithSource(ctx context.Context, mint string, marketCapSOL float64, source string) {
+	m.markTradeWithSourceAt(m.resetGeneration.Load(), ctx, mint, marketCapSOL, source)
+}
+
+func (m *Monitor) markTradeWithSourceAt(generation uint64, ctx context.Context, mint string, marketCapSOL float64, source string) {
+	m.runOperationAt(generation, func() {
+		m.markTradeLocked(ctx, mint, marketCapSOL, source)
 	})
 }
 
-func (m *Monitor) markTradeLocked(ctx context.Context, mint string, marketCapSOL float64) {
+func (m *Monitor) markTradeLocked(ctx context.Context, mint string, marketCapSOL float64, source string) {
 	var err error
 	if m.simulation {
 		err = m.db.RecordPaperMark(mint, marketCapSOL)
@@ -748,7 +853,7 @@ func (m *Monitor) markTradeLocked(ctx context.Context, mint string, marketCapSOL
 		"currentMarketCapSol": marketCapSOL, "returnPct": returnPct,
 		"estimatedPnlSol": estimatedPnl, "estimatedValueSol": estimatedValue,
 		"markAvailable": true, "markUpdatedAt": time.Now().UTC(),
-		"markSource": "pumpportal_market_cap", "tokenPriceAvailable": false,
+		"markSource": source, "tokenPriceAvailable": false,
 		"pnlBasis": "market_cap_ratio_estimate", "takeProfitPct": m.takeProfit,
 		"stopLossPct": m.stopLoss, "trailingStopPct": m.trailingStop, "simulation": m.simulation,
 	})

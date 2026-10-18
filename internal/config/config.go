@@ -17,6 +17,8 @@ type Config struct {
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
+	EntryDelaySeconds, MinTxnsBeforeBuy, PricePollSeconds                                                                                                                                                 int
+	MinVolumeBeforeBuy                                                                                                                                                                                    float64
 	RPCEndpoints                                                                                                                                                                                            []string
 }
 
@@ -88,6 +90,18 @@ func Load() (Config, error) {
 	if c.RPCHealthCheckIntervalSeconds, err = intEnv("RPC_HEALTH_CHECK_INTERVAL_SECONDS", 45); err != nil {
 		return c, err
 	}
+	if c.EntryDelaySeconds, err = intEnv("ENTRY_DELAY_SECONDS", 8); err != nil {
+		return c, err
+	}
+	if c.MinTxnsBeforeBuy, err = intEnv("MIN_TXNS_BEFORE_BUY", 3); err != nil {
+		return c, err
+	}
+	if c.MinVolumeBeforeBuy, err = floatEnv("MIN_VOLUME_BEFORE_BUY", 5); err != nil {
+		return c, err
+	}
+	if c.PricePollSeconds, err = intEnv("PRICE_POLL_SECONDS", 20); err != nil {
+		return c, err
+	}
 	tradeUSDDefault := 3.0
 	if !c.Simulation {
 		// Live notional must be an explicit operator decision. Do not silently
@@ -103,7 +117,7 @@ func Load() (Config, error) {
 	if c.SimulationBaseFeeSOL, err = floatEnv("SIMULATION_BASE_FEE_SOL", 0.000005); err != nil {
 		return c, err
 	}
-	if c.TokenMaxAgeSeconds, err = intEnv("TOKEN_MAX_AGE_SECONDS", 5); err != nil {
+	if c.TokenMaxAgeSeconds, err = intEnv("TOKEN_MAX_AGE_SECONDS", 30); err != nil {
 		return c, err
 	}
 	if c.TakeProfitGrossPct, err = floatEnv("TAKE_PROFIT_GROSS_PCT", 50); err != nil {
@@ -116,7 +130,7 @@ func Load() (Config, error) {
 	if c.StopLossPct, err = floatEnv("STOP_LOSS_PCT", stopLossDefault); err != nil {
 		return c, err
 	}
-	if c.MaxHoldSeconds, err = intEnv("MAX_HOLD_SECONDS", 90); err != nil {
+	if c.MaxHoldSeconds, err = intEnv("MAX_HOLD_SECONDS", 300); err != nil {
 		return c, err
 	}
 	if c.TrailingStopPct, err = floatEnv("TRAILING_STOP_PCT", 12); err != nil {
@@ -145,13 +159,19 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("RPC_ENDPOINTS: %w", err)
 		}
 	}
-	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 {
-		return c, fmt.Errorf("queue, position, wait and RPC health-check limits must be positive; submission attempts must be 1-6 and token age cannot be negative")
+	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.MinTxnsBeforeBuy < 1 || c.PricePollSeconds < 1 {
+		return c, fmt.Errorf("queue, position, timing, and entry thresholds must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
+	}
+	if math.IsNaN(c.MinVolumeBeforeBuy) || math.IsInf(c.MinVolumeBeforeBuy, 0) || c.MinVolumeBeforeBuy <= 0 {
+		return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY must be a finite number greater than zero")
+	}
+	if c.TokenMaxAgeSeconds > 0 && c.TokenMaxAgeSeconds <= c.EntryDelaySeconds {
+		return c, fmt.Errorf("TOKEN_MAX_AGE_SECONDS must be greater than ENTRY_DELAY_SECONDS")
 	}
 	if !c.Simulation && c.TokenMaxAgeSeconds == 0 {
 		return c, fmt.Errorf("live trading requires TOKEN_MAX_AGE_SECONDS > 0")
 	}
-	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct} {
+	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuy} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}

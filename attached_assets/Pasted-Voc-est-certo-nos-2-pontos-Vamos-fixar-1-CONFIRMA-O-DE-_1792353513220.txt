@@ -1,0 +1,54 @@
+Você está certo nos 2 pontos. Vamos fixar:
+
+1. CONFIRMAÇÃO DE STALE DATA:
+   O painel mostra "extended" nos trades de 14:12 (antes do deploy).
+   Confirme: `grep -n "extended" internal/positions/positions.go`
+   Se vazio → OK, é dado antigo. Se presente → fix não foi aplicado.
+
+2. NOVA REGRA DE ENTRADA — OBRIGATÓRIA:
+   O bot NÃO PODE comprar token que está a 0%. Precisa verificar
+   volume antes de entrar.
+
+   Requisito:
+   - Após subscribeNewToken detectar mint, NÃO comprar imediatamente
+   - Salvar em fila de candidatos com detectedAt timestamp
+   - A cada 1s, verificar candidatos com age >= 8s
+   - Para cada um: consultar pump.fun API pública
+       GET https://frontend-api.pump.fun/coins/{mint}
+       Response: {"txns": N, "volume": X, "marketCap": Y, ...}
+   - Se txns >= 3 AND volume >= 5.0 (configurável):
+       → COMPRA
+   - Senão: descarta (token morto, nunca compra)
+
+   Se a API pública não estiver acessível:
+   - Fallback: contar trade events recebidos pelo WS em 8s
+   - Se >= 2 trades recebidos: COMPRA
+   - Senão: descarta
+
+3. FEED DE PREÇO — FALLBACK CORRETO (não Balance):
+   Após compra, o preço continua sendo problema. WS pode não emitir
+   trades para tokens novos com pouco volume.
+
+   Implementar polling via RPC a cada 20s para cada mint tracked:
+   - Chamar getAccountInfo no endereço do bonding curve PDA
+   - Parsing do bonding curve account retorna virtualSolReserves e
+     virtualTokenReserves
+   - market_cap = (virtualSolReserves * supply) / virtualTokenReserves
+   - Atualizar paper_marks via UpdatePaperMark (mesmo fluxo do WS)
+
+   Endereço do bonding curve PDA:
+   derive: seeds = ["bonding-curve", mint], program = pump.fun program
+   pump.fun program ID: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+
+   Se o rpcs.Manager não tem método para getAccountInfo com parsing,
+   adicionar. Se não for viável, usar pump.fun API pública
+   GET /coins/{mint} que já retorna marketCap e usar isso (mais simples
+   e menos código).
+
+Entregar:
+1. grep do "extended" (prova que o código local está limpo)
+2. Diff do delay de verificação de volume
+3. Diff do fallback de preço (via API ou RPC bonding curve)
+4. Config nova: MIN_TXNS_BEFORE_BUY, MIN_VOLUME_BEFORE_BUY,
+   ENTRY_DELAY_SECONDS, PRICE_POLL_SECONDS
+5. go build ./... e go test (reporte resultado)

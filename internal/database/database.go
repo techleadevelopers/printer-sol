@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,8 @@ var migrations embed.FS
 type DB struct {
 	*sql.DB
 	postgres bool
+	// markMu serializes WebSocket and public-API updates to mark rows.
+	markMu   sync.Mutex
 }
 
 func Open(target string) (*DB, error) {
@@ -40,7 +43,7 @@ func Open(target string) (*DB, error) {
 	if !postgres {
 		d.SetMaxOpenConns(1)
 	}
-	return &DB{d, postgres}, d.Ping()
+	return &DB{DB: d, postgres: postgres}, d.Ping()
 }
 func (d *DB) Migrate() error {
 	pattern := "migrations/*.sql"
@@ -398,6 +401,8 @@ func (d *DB) recordMark(table, mint string, marketCapSOL float64) error {
 	if marketCapSOL <= 0 {
 		return nil
 	}
+	d.markMu.Lock()
+	defer d.markMu.Unlock()
 	now := time.Now().UTC()
 	_, e := d.Exec(d.bind(`INSERT INTO `+table+`(mint,entry_market_cap_sol,current_market_cap_sol,peak_market_cap_sol,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(mint) DO NOTHING`), mint, marketCapSOL, marketCapSOL, marketCapSOL, now)
 	return e
@@ -436,6 +441,10 @@ func (d *DB) updateMark(table, mint string, marketCapSOL float64) error {
 	if marketCapSOL <= 0 {
 		return nil
 	}
+	d.markMu.Lock()
+	defer d.markMu.Unlock()
+	// Current follows real price movement (including declines); peak is
+	// monotonic so an older/lower mark can never erase the trailing-stop high.
 	_, e := d.Exec(d.bind(`UPDATE `+table+` SET current_market_cap_sol=?,peak_market_cap_sol=CASE WHEN ?>peak_market_cap_sol THEN ? ELSE peak_market_cap_sol END,updated_at=? WHERE mint=?`), marketCapSOL, marketCapSOL, marketCapSOL, time.Now().UTC(), mint)
 	return e
 }

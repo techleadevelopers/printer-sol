@@ -34,23 +34,38 @@ func TestTrailingStopDoesNotArmBeforeTenPercentGain(t *testing.T) {
 	}
 }
 
-func TestMaxHoldDoesNotForceExitInsideDeadzone(t *testing.T) {
+func TestMaxHoldReleasesFlatPositionAfterLimit(t *testing.T) {
 	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
 
 	for _, mode := range []string{"simulation", "live"} {
 		t.Run(mode, func(t *testing.T) {
 			limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second}
+			if got := ExitReason(position, 1, true, limits, openedAt.Add(89*time.Second)); got != "" {
+				t.Fatalf("flat position exited before its hold limit: %q", got)
+			}
 			for _, age := range []time.Duration{90 * time.Second, 180 * time.Second, 30 * time.Minute} {
-				if got := ExitReason(position, 1, true, limits, openedAt.Add(age)); got != "" {
-					t.Fatalf("flat position should not be force-sold after %s; got %q", age, got)
+				if got := ExitReason(position, 1, true, limits, openedAt.Add(age)); got != "max hold flat (liberar vaga)" {
+					t.Fatalf("flat position should release its slot after %s; got %q", age, got)
 				}
 			}
 		})
 	}
 }
 
-func TestMaxHoldStillExitsOutsideDeadzone(t *testing.T) {
+func TestMaxHoldKeepsIntermediateDeadzoneOpen(t *testing.T) {
+	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
+	limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second}
+
+	for _, current := range []float64{0.91, 0.99, 1.01, 1.049} {
+		if got := ExitReason(position, current, true, limits, openedAt.Add(90*time.Second)); got != "" {
+			t.Fatalf("intermediate deadzone return %.3f should remain open; got %q", current, got)
+		}
+	}
+}
+
+func TestMaxHoldExitsOtherReturnsAtLimit(t *testing.T) {
 	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
 	limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second}
@@ -62,7 +77,7 @@ func TestMaxHoldStillExitsOutsideDeadzone(t *testing.T) {
 	}
 }
 
-func TestMaxHoldDeadzoneBoundariesExitImmediately(t *testing.T) {
+func TestMaxHoldExitsAtFormerDeadzoneBoundaries(t *testing.T) {
 	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
 	limits := Limits{MaxHold: 90 * time.Second}

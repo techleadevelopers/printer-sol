@@ -407,7 +407,7 @@ func TestLiveFailedSellRetriesEvenAfterPriceFallsBelowTakeProfit(t *testing.T) {
 	}
 }
 
-func TestSimulationMaxHoldExitsWhenMarkedOutsideDeadzone(t *testing.T) {
+func TestSimulationMaxHoldReleasesFlatPosition(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "paper-max-hold.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -429,7 +429,7 @@ func TestSimulationMaxHoldExitsWhenMarkedOutsideDeadzone(t *testing.T) {
 	bus := events.New()
 	engine := execution.New(db, nil, nil, nil, nil, zap.NewNop(), true, 1, nil, bus, execution.Limits{})
 	monitor := New("", "", 8, db, nil, engine, 0, 0, 0, 70, 30, time.Minute, true, bus, zap.NewNop())
-	monitor.markTrade(context.Background(), "paper-mint", 106)
+	monitor.markTrade(context.Background(), "paper-mint", 100)
 
 	open, err := db.OpenPositionCount()
 	if err != nil {

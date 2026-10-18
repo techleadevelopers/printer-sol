@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -46,6 +47,46 @@ func TestPaperMarkStatsCountsFlatMarks(t *testing.T) {
 	total, flat, pctFlat, err = db.PaperMarkStats()
 	if err != nil || total != 1 || flat != 1 || pctFlat != 100 {
 		t.Fatalf("open mark stats after close = (%d, %d, %.2f), err=%v; want (1, 1, 100)", total, flat, pctFlat, err)
+	}
+}
+
+func TestConcurrentPaperMarkUpdatesSerializeAndPreservePeak(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "paper-mark-concurrency.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordPaperMark("concurrent-mint", 100); err != nil {
+		t.Fatal(err)
+	}
+
+	const updates = 40
+	var wait sync.WaitGroup
+	errors := make(chan error, updates)
+	for value := 101; value <= 100+updates; value++ {
+		wait.Add(1)
+		go func(marketCap float64) {
+			defer wait.Done()
+			if updateErr := db.UpdatePaperMark("concurrent-mint", marketCap); updateErr != nil {
+				errors <- updateErr
+			}
+		}(float64(value))
+	}
+	wait.Wait()
+	close(errors)
+	for updateErr := range errors {
+		t.Fatal(updateErr)
+	}
+
+	if err = db.UpdatePaperMark("concurrent-mint", 90); err != nil {
+		t.Fatal(err)
+	}
+	entry, current, peak, known, err := db.MarkMarketCaps("concurrent-mint", true)
+	if err != nil || !known || entry != 100 || current != 90 || peak != 140 {
+		t.Fatalf("marks = (%.0f, %.0f, %.0f, %v), err=%v; want (100, 90, 140, true)", entry, current, peak, known, err)
 	}
 }
 

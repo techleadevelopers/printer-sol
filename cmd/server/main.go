@@ -89,7 +89,20 @@ func main() {
 	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, simulationBalanceSOL, controller, bus, limits)
 	strat := strategy.New(db, time.Duration(cfg.TokenMaxAgeSeconds)*time.Second)
 	strat.SetScreen(screener.RugCheck)
-	monitor := tokenmonitor.New(cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine, cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL, cfg.TakeProfitGrossPct, cfg.StopLossPct, time.Duration(cfg.MaxHoldSeconds)*time.Second, cfg.Simulation, bus, log)
+	monitor := tokenmonitor.New(
+		cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine,
+		cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL,
+		cfg.TakeProfitGrossPct, cfg.StopLossPct,
+		time.Duration(cfg.MaxHoldSeconds)*time.Second, cfg.Simulation, bus, log,
+		tokenmonitor.Settings{
+			EntryDelay:        time.Duration(cfg.EntryDelaySeconds) * time.Second,
+			MinTransactions:   cfg.MinTxnsBeforeBuy,
+			MinVolume:         cfg.MinVolumeBeforeBuy,
+			PricePollInterval: time.Duration(cfg.PricePollSeconds) * time.Second,
+			Coins:             pumpportal.NewCoinDataClient(),
+			SOLUSD:            prices,
+		},
+	)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	engine.SetRootContext(ctx)

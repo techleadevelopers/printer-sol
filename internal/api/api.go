@@ -373,7 +373,7 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 			"returnPct": returnPct, "estimatedValueSol": estimatedValue, "estimatedPnlSol": estimatedPnl,
 			"markAvailable": markAvailable, "pnlEstimateAvailable": pnlEstimateAvailable,
 			"markUpdatedAt": nil, "markAgeSeconds": nil,
-			"markSource": "pumpportal_market_cap", "pnlBasis": "market_cap_ratio_estimate",
+			"markSource": "market_cap_feed", "pnlBasis": "market_cap_ratio_estimate",
 			"realizedPnlSol": realizedPnl, "openedAt": opened, "updatedAt": updated, "status": status,
 			"sellStatus": sellStatus, "simulation": s.cfg.Simulation,
 		}

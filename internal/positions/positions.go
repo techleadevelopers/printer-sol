@@ -46,6 +46,9 @@ func ExitReason(p Position, currentSOL float64, liquid bool, l Limits, now time.
 	if l.MaxHold > 0 {
 		age := now.Sub(p.OpenedAt)
 		if age >= l.MaxHold {
+			if change == 0 {
+				return "max hold flat (liberar vaga)"
+			}
 			if change >= holdProfitExitPct || change <= holdLossExitPct {
 				return "max hold time"
 			}
