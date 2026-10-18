@@ -1,10 +1,58 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"solana-sniper-backend/internal/database"
 )
+
+func TestPaperLiveUnlockBlocksWhenDatabaseHasOnly29ClosedTrades(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "paper.db")
+	db, err := database.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Migrate(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err = db.EnsureSimulationRun(1); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	for i := 0; i < 29; i++ {
+		mint := fmt.Sprintf("paper-mint-%d", i)
+		buyID, sellID := fmt.Sprintf("paper-buy-%d", i), fmt.Sprintf("paper-sell-%d", i)
+		if err = db.InsertTrade(database.Trade{ID: buyID, Mint: mint, Side: "buy", Quantity: "0.1", Requested: 0.1, State: "prepared"}); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err = db.FinalizeSimulationBuy(buyID, mint, 0.1); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err = db.InsertTrade(database.Trade{ID: sellID, Mint: mint, Side: "sell", Quantity: "0.12", Requested: 0.12, ExitReason: "take profit", State: "prepared"}); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err = db.FinalizeSimulationSell(sellID, mint, 0.12); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = validatePaperLiveUnlock(path)
+	if err == nil || !strings.Contains(err.Error(), "at least 30") {
+		t.Fatalf("paper readiness must block live with 29 closed trades, got %v", err)
+	}
+}
 
 func TestSplitEndpointsDropsEmptyValues(t *testing.T) {
 	got := splitEndpoints(" https://one.example, ,https://two.example ")

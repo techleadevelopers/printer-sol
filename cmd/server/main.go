@@ -35,13 +35,17 @@ func main() {
 	}
 	log, closeLog := logging.New()
 	defer closeLog()
+	var paperDB *database.DB
 	if !cfg.Simulation && cfg.LiveUnlockRequiresPaper {
-		paperDB, openErr := database.Open(cfg.SimulationDatabaseURL)
-		if openErr != nil {
-			log.Fatal("paper live-unlock database", logging.Err(openErr))
+		paperDB, err = database.Open(cfg.SimulationDatabaseURL)
+		if err != nil {
+			log.Fatal("paper live-unlock database", logging.Err(err))
+		}
+		defer paperDB.Close()
+		if migrateErr := paperDB.Migrate(); migrateErr != nil {
+			log.Fatal("paper live-unlock migrations", logging.Err(migrateErr))
 		}
 		_, unlockErr := paperDB.RequireLiveUnlock()
-		_ = paperDB.Close()
 		if unlockErr != nil {
 			log.Fatal("live trading blocked by paper evidence", logging.Err(unlockErr))
 		}
@@ -100,7 +104,7 @@ func main() {
 	}
 	go rpcs.Run(ctx, time.Duration(cfg.RPCHealthCheckIntervalSeconds)*time.Second)
 	go monitor.Run(ctx)
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: api.New(db, w, rpcs, engine, controller, monitor, bus, cfg, log), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: api.New(db, w, rpcs, engine, controller, monitor, bus, cfg, log, paperDB), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, c := context.WithTimeout(context.Background(), 10*time.Second)

@@ -8,13 +8,14 @@ import (
 )
 
 type SimulationRun struct {
-	StartedAt      time.Time
+	StartedAt       time.Time
 	BalanceStartSOL float64
 }
 
 type SimulationTrade struct {
 	ID          string    `json:"id"`
 	Mint        string    `json:"mint"`
+	Side        string    `json:"side"`
 	EntrySOL    float64   `json:"entrySol"`
 	ExitSOL     float64   `json:"exitSol"`
 	GrossPnLSOL float64   `json:"grossPnlSol"`
@@ -26,26 +27,26 @@ type SimulationTrade struct {
 }
 
 type SimulationSummary struct {
-	StartedAt          time.Time      `json:"startedAt"`
-	BalanceStartSOL    float64        `json:"balanceStartSol"`
-	BalanceNowSOL      float64        `json:"balanceNowSol"`
-	TotalTrades        int            `json:"totalTrades"`
-	Wins               int            `json:"wins"`
-	Losses             int            `json:"losses"`
-	WinRate            float64        `json:"winRate"`
-	AvgWinSOL          float64        `json:"avgWinSol"`
-	AvgLossSOL         float64        `json:"avgLossSol"`
-	GrossPnLSOL        float64        `json:"grossPnlSol"`
-	FeesPaidSOL        float64        `json:"feesPaidSol"`
-	NetPnLSOL          float64        `json:"netPnlSol"`
-	AvgHoldSeconds     float64        `json:"avgHoldSeconds"`
-	MaxDrawdownSOL     float64        `json:"maxDrawdownSol"`
-	EVPerTradeSOL      float64        `json:"evPerTradeSol"`
-	SharpeRatio        *float64       `json:"sharpeRatio"`
-	ProfitFactor       *float64       `json:"profitFactor"`
-	ExitReasons        map[string]int `json:"exitReasons"`
-	LongestWinStreak   int            `json:"longestWinStreak"`
-	LongestLossStreak  int            `json:"longestLossStreak"`
+	StartedAt         time.Time      `json:"startedAt"`
+	BalanceStartSOL   float64        `json:"balanceStartSol"`
+	BalanceNowSOL     float64        `json:"balanceNowSol"`
+	TotalTrades       int            `json:"totalTrades"`
+	Wins              int            `json:"wins"`
+	Losses            int            `json:"losses"`
+	WinRate           float64        `json:"winRate"`
+	AvgWinSOL         float64        `json:"avgWinSol"`
+	AvgLossSOL        float64        `json:"avgLossSol"`
+	GrossPnLSOL       float64        `json:"grossPnlSol"`
+	FeesPaidSOL       float64        `json:"feesPaidSol"`
+	NetPnLSOL         float64        `json:"netPnlSol"`
+	AvgHoldSeconds    float64        `json:"avgHoldSeconds"`
+	MaxDrawdownSOL    float64        `json:"maxDrawdownSol"`
+	EVPerTradeSOL     float64        `json:"evPerTradeSol"`
+	SharpeRatio       *float64       `json:"sharpeRatio"`
+	ProfitFactor      *float64       `json:"profitFactor"`
+	ExitReasons       map[string]int `json:"exitReasons"`
+	LongestWinStreak  int            `json:"longestWinStreak"`
+	LongestLossStreak int            `json:"longestLossStreak"`
 }
 
 func (d *DB) EnsureSimulationRun(balanceStartSOL float64) (SimulationRun, error) {
@@ -99,6 +100,7 @@ func (d *DB) SimulationTrades(from, to time.Time) ([]SimulationTrade, error) {
 		if err = rows.Scan(&trade.ID, &trade.Mint, &trade.EntrySOL, &trade.ExitSOL, &trade.GrossPnLSOL, &trade.FeesSOL, &openedAt, &closedAt, &trade.ExitReason, &trade.ConfirmedAt); err != nil {
 			return nil, err
 		}
+		trade.Side = "round_trip"
 		trade.HoldSeconds = closedAt.Sub(openedAt).Seconds()
 		if trade.HoldSeconds < 0 {
 			trade.HoldSeconds = 0
@@ -236,37 +238,17 @@ func (d *DB) LiveUnlockSummary() (SimulationSummary, error) {
 }
 
 func (d *DB) RequireLiveUnlock() (SimulationSummary, error) {
-	summary, err := d.LiveUnlockSummary()
+	report, err := d.LiveUnlockReport()
 	if err != nil {
-		return summary, err
+		return report.Summary, err
 	}
-	if summary.TotalTrades < 30 {
-		return summary, fmt.Errorf("paper live-unlock requires at least 30 closed trades; got %d", summary.TotalTrades)
+	if report.Summary.TotalTrades < 30 {
+		return report.Summary, fmt.Errorf("paper live-unlock requires at least 30 closed trades; got %d", report.Summary.TotalTrades)
 	}
-	if summary.WinRate < 45 {
-		return summary, fmt.Errorf("paper live-unlock requires win rate >= 45%%; got %.2f%%", summary.WinRate)
+	if !report.Ready {
+		return report.Summary, fmt.Errorf("paper live-unlock blocked: %s", strings.Join(report.Blockers, "; "))
 	}
-	if summary.NetPnLSOL <= 0 {
-		return summary, fmt.Errorf("paper live-unlock requires net P&L > 0 SOL; got %.9f", summary.NetPnLSOL)
-	}
-	if summary.MaxDrawdownSOL > 0.5*summary.BalanceStartSOL {
-		return summary, fmt.Errorf("paper live-unlock requires max drawdown <= 50%% of starting balance; got %.9f SOL", summary.MaxDrawdownSOL)
-	}
-	openPositions, err := d.OpenPositionCount()
-	if err != nil {
-		return summary, err
-	}
-	if openPositions != 0 {
-		return summary, fmt.Errorf("paper live-unlock requires all paper positions closed; got %d open", openPositions)
-	}
-	unknown, err := d.UnknownTradeCount()
-	if err != nil {
-		return summary, err
-	}
-	if unknown != 0 {
-		return summary, fmt.Errorf("paper live-unlock requires clean reconciliation; got %d pending/unknown trades", unknown)
-	}
-	return summary, nil
+	return report.Summary, nil
 }
 
 func tradesGross(trades []SimulationTrade) float64 {

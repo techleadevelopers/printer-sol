@@ -442,6 +442,7 @@ func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {
 		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 		defer cancel()
 		reason, err := m.strategy.Screen(ctx, mint)
+		m.log.Info("post-entry risk screen completed", zap.String("mint", mint), zap.String("reason", reason), zap.Error(err))
 		if err == nil && strings.HasPrefix(reason, "RugCheck passed") {
 			return
 		}
@@ -590,6 +591,44 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 		m.log.Warn("cannot close position: entry engine unavailable", zap.String("mint", mint))
 		return
 	}
+	entryMarketCap, markedMarketCap, peakMarketCap, markKnown, markErr := m.db.MarkMarketCaps(mint, m.simulation)
+	if markErr != nil {
+		m.log.Warn("load exit audit market caps", zap.String("mint", mint), zap.Error(markErr))
+	}
+	if exitMarketCap <= 0 {
+		exitMarketCap = markedMarketCap
+	}
+	writeExitAudit := func(eventType, tradeID string, exitErr error) {
+		exitAudit := map[string]any{
+			"mint": mint, "tradeId": tradeID, "reason": reason, "returnPct": returnPct,
+			"entryMcap": nil, "peakMcap": nil, "exitMcap": nil,
+			"simulation": m.simulation,
+		}
+		if markKnown {
+			exitAudit["entryMcap"] = entryMarketCap
+			exitAudit["peakMcap"] = peakMarketCap
+		}
+		if exitMarketCap > 0 {
+			exitAudit["exitMcap"] = exitMarketCap
+		}
+		if exitErr != nil {
+			exitAudit["error"] = exitErr.Error()
+		}
+		auditJSON, marshalErr := json.Marshal(exitAudit)
+		if marshalErr != nil {
+			m.log.Warn("encode position exit audit", zap.String("mint", mint), zap.Error(marshalErr))
+			return
+		}
+		level := "info"
+		message := reason
+		if exitErr != nil {
+			level = "warn"
+			message = reason + ": " + exitErr.Error()
+		}
+		if logErr := m.db.LogOperational(level, eventType, message, string(auditJSON)); logErr != nil {
+			m.log.Warn("write position exit audit", zap.String("mint", mint), zap.Error(logErr))
+		}
+	}
 	m.exitRetryAfter.Store(mint, time.Now().Add(exitRetryDelay))
 	m.exitIntents.Store(mint, reason)
 	var id string
@@ -599,6 +638,7 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 		id, err = m.entry.CloseLivePosition(ctx, mint, m.slippage, m.priorityFee, reason+" reached in live operation")
 	}
 	if err != nil {
+		writeExitAudit("position_exit_failed", id, err)
 		m.log.Warn("position exit", zap.String("mint", mint), zap.Error(err))
 		m.bus.Publish("exit_retry_scheduled", map[string]any{
 			"mint": mint, "reason": reason, "retryInSeconds": int(exitRetryDelay.Seconds()),
@@ -606,33 +646,7 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 		})
 		return
 	}
-	entryMarketCap, markedMarketCap, peakMarketCap, markKnown, markErr := m.db.MarkMarketCaps(mint, m.simulation)
-	if markErr != nil {
-		m.log.Warn("load exit audit market caps", zap.String("mint", mint), zap.Error(markErr))
-	}
-	if exitMarketCap <= 0 {
-		exitMarketCap = markedMarketCap
-	}
-	exitAudit := map[string]any{
-		"mint": mint, "tradeId": id, "reason": reason, "returnPct": returnPct,
-		"entryMarketCapSol": nil, "peakMarketCapSol": nil, "exitMarketCapSol": nil,
-		"simulation": m.simulation,
-	}
-	if markKnown {
-		exitAudit["entryMarketCapSol"] = entryMarketCap
-		exitAudit["peakMarketCapSol"] = peakMarketCap
-	}
-	if exitMarketCap > 0 {
-		exitAudit["exitMarketCapSol"] = exitMarketCap
-	}
-	auditJSON, marshalErr := json.Marshal(exitAudit)
-	if marshalErr == nil {
-		if logErr := m.db.LogOperational("info", "position_exit_submitted", reason, string(auditJSON)); logErr != nil {
-			m.log.Warn("write position exit audit", zap.String("mint", mint), zap.Error(logErr))
-		}
-	} else {
-		m.log.Warn("encode position exit audit", zap.String("mint", mint), zap.Error(marshalErr))
-	}
+	writeExitAudit("position_exit_submitted", id, nil)
 	if m.simulation {
 		m.tracked.Delete(mint)
 		m.exitRetryAfter.Delete(mint)

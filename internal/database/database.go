@@ -191,7 +191,9 @@ func (d *DB) RecordAssessment(mint string, approved bool, reason string) error {
 	return e
 }
 func (d *DB) ListTrades() (rows *sql.Rows, err error) {
-	return d.Query(`SELECT id,mint,side,quantity,requested_value_sol,COALESCE(executed_value_sol,0),COALESCE(fees_sol,0),slippage_pct,COALESCE(signature,''),state,created_at,realized_pnl_sol FROM trades ORDER BY created_at DESC LIMIT 200`)
+	return d.Query(`SELECT id,mint,side,quantity,requested_value_sol,COALESCE(executed_value_sol,0),
+		COALESCE(fees_sol,0),slippage_pct,COALESCE(signature,''),state,created_at,realized_pnl_sol,
+		COALESCE(exit_reason,'') FROM trades ORDER BY created_at DESC LIMIT 200`)
 }
 func (d *DB) TokenEventCount() (int, error) {
 	var n int
@@ -203,13 +205,15 @@ func (d *DB) RecordRPC(endpoint string, healthy bool, latency int64, status int,
 	return e
 }
 func (d *DB) ListTokens() (*sql.Rows, error) {
-	// The portal is a high-volume discovery feed. The console intentionally
-	// exposes only candidates the strategy approved, never a mock or the full
-	// Pump.fun firehose.
+	// The console shows persisted detections and their latest real assessment
+	// and operation state; it does not infer that an approved token was bought.
 	return d.Query(d.bind(`SELECT e.mint,COALESCE(e.creator,''),e.received_at,e.latency_ms
+		,r.approved,COALESCE(r.reason,''),COALESCE(t.side,''),COALESCE(t.state,''),COALESCE(p.status,'')
 		FROM token_events e
-		WHERE EXISTS (SELECT 1 FROM risk_assessments r WHERE r.mint=e.mint AND r.id=(SELECT MAX(r2.id) FROM risk_assessments r2 WHERE r2.mint=e.mint) AND r.approved=?)
-		ORDER BY e.id DESC LIMIT 200`), true)
+		LEFT JOIN risk_assessments r ON r.id=(SELECT MAX(r2.id) FROM risk_assessments r2 WHERE r2.mint=e.mint)
+		LEFT JOIN trades t ON t.id=(SELECT t2.id FROM trades t2 WHERE t2.mint=e.mint ORDER BY t2.created_at DESC LIMIT 1)
+		LEFT JOIN positions p ON p.mint=e.mint
+		ORDER BY e.id DESC LIMIT 200`))
 }
 func (d *DB) OpenSimulationPosition(mint string, amount float64) error {
 	return d.OpenPosition(mint, amount)
@@ -621,7 +625,12 @@ func (d *DB) ListPositionsForMode(simulation bool) (*sql.Rows, error) {
 	}
 	query := `SELECT p.mint,p.quantity,COALESCE(p.cost_sol,0),p.status,p.opened_at,p.updated_at,
 		COALESCE(m.entry_market_cap_sol,0),COALESCE(m.current_market_cap_sol,0),COALESCE(CAST(m.updated_at AS TEXT),''),
-		(SELECT SUM(t.realized_pnl_sol) FROM trades t WHERE t.mint=p.mint AND t.side='sell' AND t.realized_pnl_sol IS NOT NULL)
+		COALESCE((SELECT SUM(t.fees_sol) FROM trades t WHERE t.mint=p.mint
+			AND t.state IN ('simulated','confirmed','finalized') AND t.fees_sol IS NOT NULL),0),
+		(SELECT SUM(t.realized_pnl_sol) FROM trades t WHERE t.mint=p.mint AND t.side='sell'
+			AND t.state IN ('simulated','confirmed','finalized') AND t.realized_pnl_sol IS NOT NULL),
+		COALESCE((SELECT t.state FROM trades t WHERE t.mint=p.mint AND t.side='sell'
+			ORDER BY t.created_at DESC LIMIT 1),'')
 		FROM positions p LEFT JOIN ` + marks + ` m ON m.mint=p.mint ORDER BY p.updated_at DESC`
 	return d.Query(query)
 }

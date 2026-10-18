@@ -1,8 +1,8 @@
 import { apiBaseUrl } from '@/services/api';
 
 export type BotEvent =
-  | { type: 'health' | 'bot.status' | 'bot.mode' | 'token.detected' | 'position.updated' | 'trade.updated' | 'rpc.updated' | 'log.created'; timestamp?: string; [key: string]: unknown }
-  | { type: string; timestamp?: string; [key: string]: unknown };
+  | { type: 'health' | 'bot.status' | 'bot.mode' | 'token.detected' | 'position.updated' | 'trade.updated' | 'rpc.updated' | 'log.created'; timestamp?: string; at?: string; [key: string]: unknown }
+  | { type: string; timestamp?: string; at?: string; [key: string]: unknown };
 
 export type EventState = 'connecting' | 'connected' | 'disconnected';
 

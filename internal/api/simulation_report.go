@@ -50,7 +50,7 @@ func (s *Server) simulationReport(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "invalid_period", "from must be earlier than to")
 		return
 	}
-	summary, trades, err := s.simulationReportData(run, from, to)
+	summary, trades, allFeesPaid, err := s.simulationReportData(run, from, to)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not build simulation report")
 		return
@@ -59,9 +59,9 @@ func (s *Server) simulationReport(w http.ResponseWriter, r *http.Request) {
 	curve = append(curve, map[string]any{"timestamp": from, "cumulativePnlSol": 0.0})
 	cumulative := 0.0
 	type hourResult struct {
-		Hour       time.Time
-		Trades     int
-		NetPnLSOL  float64
+		Hour      time.Time
+		Trades    int
+		NetPnLSOL float64
 	}
 	hours := make(map[time.Time]*hourResult)
 	for _, trade := range trades {
@@ -87,40 +87,44 @@ func (s *Server) simulationReport(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	write(w, http.StatusOK, map[string]any{
-		"period": map[string]time.Time{"from": from, "to": to},
-		"summary": summary,
-		"trades": trades,
+		"period":          map[string]time.Time{"from": from, "to": to},
+		"mode":            "simulation",
+		"summary":         summary,
+		"allFeesPaidSol":  allFeesPaid,
+		"trades":          trades,
 		"cumulativeCurve": curve,
-		"byHour": byHour,
-		"feeModel": "paper transaction fees = configured priority-fee cap plus SIMULATION_BASE_FEE_SOL; venue/rent/slippage costs are not fully simulated",
-		"openPnlBasis": "market_cap_ratio_estimate",
+		"byHour":          byHour,
+		"paperReadiness":  s.paperReadiness(),
+		"feeModel":        "paper transaction fees = configured priority-fee cap plus SIMULATION_BASE_FEE_SOL; venue/rent/slippage costs are not fully simulated",
+		"openPnlBasis":    "market_cap_ratio_estimate",
 	})
 }
 
-func (s *Server) simulationReportData(run database.SimulationRun, from, to time.Time) (database.SimulationSummary, []database.SimulationTrade, error) {
+func (s *Server) simulationReportData(run database.SimulationRun, from, to time.Time) (database.SimulationSummary, []database.SimulationTrade, float64, error) {
 	trades, err := s.db.SimulationTrades(from, to)
 	if err != nil {
-		return database.SimulationSummary{}, nil, err
+		return database.SimulationSummary{}, nil, 0, err
 	}
-	fees, err := s.db.SimulationFees(from, to)
+	allFeesPaid, err := s.db.SimulationFees(from, to)
 	if err != nil {
-		return database.SimulationSummary{}, nil, err
+		return database.SimulationSummary{}, nil, 0, err
 	}
 	now := time.Now().UTC()
 	allTrades, err := s.db.SimulationTrades(run.StartedAt, now.Add(time.Nanosecond))
 	if err != nil {
-		return database.SimulationSummary{}, nil, err
+		return database.SimulationSummary{}, nil, 0, err
 	}
-	allFees, err := s.db.SimulationFees(run.StartedAt, now.Add(time.Nanosecond))
+	sessionFees, err := s.db.SimulationFees(run.StartedAt, now.Add(time.Nanosecond))
 	if err != nil {
-		return database.SimulationSummary{}, nil, err
+		return database.SimulationSummary{}, nil, 0, err
 	}
 	openPnl, err := s.db.OpenPnlSOL(true)
 	if err != nil {
-		return database.SimulationSummary{}, nil, err
+		return database.SimulationSummary{}, nil, 0, err
 	}
-	balanceNow := run.BalanceStartSOL + simulationGross(allTrades) - allFees + openPnl
-	return database.BuildSimulationSummary(run, trades, fees, balanceNow), trades, nil
+	balanceNow := run.BalanceStartSOL + simulationGross(allTrades) - sessionFees + openPnl
+	closedTradeFees := simulationTradeFees(trades)
+	return database.BuildSimulationSummary(run, trades, closedTradeFees, balanceNow), trades, allFeesPaid, nil
 }
 
 func simulationGross(trades []database.SimulationTrade) float64 {
@@ -129,4 +133,12 @@ func simulationGross(trades []database.SimulationTrade) float64 {
 		gross += trade.GrossPnLSOL
 	}
 	return gross
+}
+
+func simulationTradeFees(trades []database.SimulationTrade) float64 {
+	var fees float64
+	for _, trade := range trades {
+		fees += trade.FeesSOL
+	}
+	return fees
 }

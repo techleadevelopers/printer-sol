@@ -7,13 +7,15 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"solana-sniper-backend/internal/database"
 )
 
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
-	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, AsyncRugCheckAfterEntry, SkipPreflight                                                                                                           bool
-	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct float64
-	SimulationBaseFeeSOL                                                                                                                                                                    float64
+	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, AsyncRugCheckAfterEntry, SkipPreflight                                                                                                          bool
+	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
+	SimulationBaseFeeSOL                                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
 	RPCEndpoints                                                                                                                                                                                            []string
 }
@@ -181,8 +183,27 @@ func Load() (Config, error) {
 	if c.Simulation && c.SimulationBalanceSOL <= 0 {
 		return c, fmt.Errorf("SIMULATION_BALANCE_SOL must be positive when SIMULATION=true")
 	}
+	if !c.Simulation && c.LiveUnlockRequiresPaper {
+		if err := validatePaperLiveUnlock(c.SimulationDatabaseURL); err != nil {
+			return c, fmt.Errorf("live trading blocked by paper evidence: %w", err)
+		}
+	}
 	return c, nil
 }
+
+func validatePaperLiveUnlock(databaseURL string) error {
+	paperDB, err := database.Open(databaseURL)
+	if err != nil {
+		return fmt.Errorf("open SIMULATION_DATABASE_URL: %w", err)
+	}
+	defer paperDB.Close()
+	if err = paperDB.Migrate(); err != nil {
+		return fmt.Errorf("migrate paper evidence database: %w", err)
+	}
+	_, err = paperDB.RequireLiveUnlock()
+	return err
+}
+
 func validateURL(raw string, allowed ...string) error {
 	u, err := url.ParseRequestURI(raw)
 	if err != nil || u.Host == "" {

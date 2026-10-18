@@ -129,6 +129,7 @@ export interface Trade {
   grossPnlSol: number | null;
   /** @nullable */
   netPnlSol: number | null;
+  exitReason?: string | null;
   /** @nullable */
   transactionId: string | null;
   /** @nullable */
@@ -146,6 +147,7 @@ export interface Dashboard {
      * @nullable
      */
   walletBalanceLow: boolean | null;
+  walletBalanceAvailable?: boolean;
   /** @nullable */
   feesReserveSol: number | null;
   /** @nullable */
@@ -154,12 +156,21 @@ export interface Dashboard {
   analyzedTokens: number | null;
   /** @nullable */
   tradesCount: number | null;
+  transactionsCount?: number | null;
+  closedTrades?: number | null;
   /** @nullable */
   openPositions: number | null;
   /** @nullable */
   realizedPnlSol: number | null;
   /** @nullable */
   estimatedOpenPnlSol: number | null;
+  estimatedOpenPnlComplete?: boolean;
+  unmarkedOpenPositions?: number;
+  grossRealizedPnlSol?: number | null;
+  totalEstimatedPnlSol?: number | null;
+  totalEstimatedPnlComplete?: boolean;
+  feesPaidSol?: number | null;
+  virtualEquitySol?: number | null;
   /** @nullable */
   netPnlSol: number | null;
   /** @nullable */
@@ -246,6 +257,8 @@ export interface Position {
   mint: string;
   /** @nullable */
   quantity: number | null;
+  quantityUnit?: string;
+  investedSol?: number | null;
   /** @nullable */
   averageEntryPriceSol: number | null;
   /** @nullable */
@@ -258,6 +271,15 @@ export interface Position {
   estimatedPnlSol: number | null;
   /** @nullable */
   realizedPnlSol: number | null;
+  entryMarketCapSol?: number | null;
+  currentMarketCapSol?: number | null;
+  returnPct?: number | null;
+  markAvailable?: boolean;
+  pnlEstimateAvailable?: boolean;
+  markUpdatedAt?: string | null;
+  markAgeSeconds?: number | null;
+  markSource?: string | null;
+  pnlBasis?: string | null;
   /** @nullable */
   openedAt: string | null;
   status: PositionStatus;

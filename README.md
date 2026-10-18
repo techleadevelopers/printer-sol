@@ -21,9 +21,9 @@ docker build -t solana-sniper-backend .
 docker run --env-file /run/secrets/sniper.env -p 8080:8080 solana-sniper-backend
 ```
 
-Em produção, configure `DATABASE_URL` com a URL PostgreSQL fornecida pelo Railway. `DATABASE_PATH`/SQLite permanece apenas como fallback local; o container não requer volume. Use secret manager para credenciais, reinicialização supervisionada (Compose/Kubernetes/systemd), logs centralizados e monitoramento de `/api/health`. O processo trata `SIGINT` e `SIGTERM` com desligamento gracioso; o monitor e o gerenciador de RPC tentam recuperar conexões.
+Em produção, configure `SIMULATION_DATABASE_URL` e `REAL_DATABASE_URL` como bancos PostgreSQL distintos. `DATABASE_PATH`/SQLite permanece apenas como fallback local de simulação; o container não requer volume. Use secret manager para credenciais, reinicialização supervisionada (Compose/Kubernetes/systemd), logs centralizados e monitoramento de `/api/health`. O processo trata `SIGINT` e `SIGTERM` com desligamento gracioso; o monitor e o gerenciador de RPC tentam recuperar conexões.
 
-Na inicialização, migrações são aplicadas, RPCs são verificados e negociações pendentes são reconciliadas antes de o monitor iniciar. Uma transação sem resultado conhecido bloqueia novas compras até reconciliação. Posições já persistidas contam para os limites antes de qualquer entrada. `MAX_SUBMISSION_ATTEMPTS` controla as retransmissões do mesmo payload assinado no RPC (mesma assinatura); o preflight permanece habilitado. Parar o bot nunca significa vender todas as posições.
+Com `LIVE_UNLOCK_REQUIRES_PAPER=true` (padrão), `config.Load()` aplica as migrations e consulta o ledger de simulação antes de aceitar `SIMULATION=false`; o processo repete a validação no bootstrap e mantém o banco paper conectado para exibir o checklist no console. O gate exige pelo menos 30 operações fechadas e todos os critérios operacionais descritos no relatório. Na inicialização, as migrations do ledger ativo são aplicadas, RPCs são verificados e negociações pendentes são reconciliadas antes de o monitor iniciar. Uma transação sem resultado conhecido bloqueia novas compras até reconciliação. Posições já persistidas contam para os limites antes de qualquer entrada. `MAX_SUBMISSION_ATTEMPTS` controla retransmissões do mesmo payload assinado no RPC (mesma assinatura); `SKIP_PREFLIGHT=true` é o padrão e pode ser desativado explicitamente. Parar o bot nunca significa vender todas as posições.
 
 Ambientes de desenvolvimento não devem ser presumidos como processos 24/7: configure armazenamento, saúde, reinício, limites de recursos e rotação de segredos no ambiente de implantação.
 
@@ -37,8 +37,12 @@ Rotas de leitura:
 
 - `GET /api/health` — separa serviço ativo, monitor conectado e capacidade de negociação.
 - `GET /api/dashboard`, `/api/tokens`, `/api/positions`, `/api/trades`, `/api/rpcs`, `/api/config`, `/api/wallet`.
+- `GET /api/performance/report?from=<iso>&to=<iso>` — relatório autenticado de simulação ou execução real, com métricas, operações fechadas, curva acumulada, resultados por hora e prontidão paper para live.
+- `GET /api/simulation/report?from=<iso>&to=<iso>` — compatibilidade com o relatório paper e mesmo conteúdo de prontidão.
 
 `/api/dashboard` calcula P&L aberto para o modo ativo, separa resultado realizado de estimativa aberta e informa `estimatedOpenPnlComplete`/`unmarkedOpenPositions`. `/api/positions` devolve os market caps de entrada e atuais, idade da marca e P&L estimado; `currentTokenPriceSol` permanece `null` porque o feed registra market cap, não preço unitário do token. Valores abertos usam a variação de market cap como estimativa, não como P&L garantido de uma venda.
+
+O console apresenta esse relatório em **Relatório de desempenho** nos modos paper e real. P&L live fechado usa deltas confirmados da carteira e taxas registradas; P&L de posições abertas continua sendo uma estimativa por market-cap. A prontidão paper para live exige 7 dias e 100 operações fechadas, P&L líquido e expectativa positivos, win rate de pelo menos 45%, profit factor de pelo menos 1,2, drawdown máximo de até metade da banca inicial, pelo menos 10 saídas por cada motivo (take-profit, trailing, stop-loss e max-hold), reconciliação limpa, retenção média de até 180 segundos, taxas de até 15% do P&L bruto e mais de 30% das saídas por trailing stop. O teste com 29 operações permanece bloqueado.
 
 Autenticação: `POST /api/auth/login` recebe `{ "password": "..." }` e retorna uma sessão de administrador. Rotas administrativas usam `Authorization: Bearer <session-token>`:
 
