@@ -1,0 +1,159 @@
+ Diagnóstico: o bot está vendendo no ZERO e pagando taxa pra sair
+"P&L bruto zero e custo líquido negativo" em 9 trades é sintoma clássico de: MAX_HOLD_SECONDS dispara, o token está exatamente no preço de entrada, o bot vende por obrigação do time-stop, e você paga taxa sem lucro.
+
+Com TRADE_USD=5 e taxa 0.001 SOL (~$0.20/tx), **cada exit a 0% = −$0.40 de prejuízo**. 9 trades = −$3.60. Não é aleatório — é estrutural.
+
+🎯 Causa raiz #1: MAX_HOLD_SECONDS não está sendo lido do env
+Você colocou MAX_HOLD_SECONDS="120" no .env, mas o Replit disse que o código tem default 90. Se o env não está sobrescrevendo, o bot usa 90. Duas possibilidades:
+
+Possibilidade A: intEnv do cleanScalar está falhando
+Olha o cleanScalar do código original:
+
+go
+func cleanScalar(v string) string {
+	v = strings.TrimSpace(v)
+	withoutEscapes := strings.TrimLeft(v, `\`)
+	if strings.HasPrefix(withoutEscapes, `"`) || strings.HasPrefix(withoutEscapes, `'`) {
+		v = withoutEscapes
+	}
+	v = strings.Trim(v, "\"'")
+	return strings.TrimSpace(v)
+}
+Se seu env tem MAX_HOLD_SECONDS=120 sem aspas, deveria funcionar. Se tem MAX_HOLD_SECONDS="120", o Trim remove. Mas se tem MAX_HOLD_SECONDS= "120" (espaço antes da aspa), o TrimSpace remove o espaço, aí "120" vira 120 no Trim — deveria funcionar.
+
+O teste real: roda isto e cola o output:
+
+powershell
+cd C:\Users\Chainfx\Desktop\Solana-Sniper-Bot-Dashboard\backend
+Select-String -Path internal\config\config.go -Pattern "MaxHoldSeconds"
+Select-String -Path cmd\server\main.go -Pattern "MaxHoldSeconds|maxHold"
+O primeiro mostra como o valor é lido. O segundo mostra como é passado para o Monitor. Se o main.go estiver com time.Duration(cfg.MaxHoldSeconds)*time.Second tá certo. Se estiver time.Duration(cfg.MaxHoldSeconds)*time.Minute → 1 minuto = 60s (ou seja, seu 120 vira 7200s — não é o caso, mas é bug de unidade).
+
+Possibilidade B: o frontend está sobrescrevendo
+O Replit disse:
+
+"A tela tem campos de retenção em minutos, mas o serviço que realmente encerra posições usa MAX_HOLD_SECONDS do ambiente... essa diferença pode fazer o bot ignorar o valor que você vê"
+
+Isso é grave. Se o frontend tem um campo "retenção em minutos" que salva em settings no DB, e o Monitor lê do DB em vez do env, o que você vê na UI não é o que o bot usa. Pior: se você configurou 90s na UI em algum teste anterior, ele pode estar persistido no DB e sobrescrevendo o env a cada restart.
+
+Roda isto pra ver:
+
+powershell
+Select-String -Path internal\tokenmonitor\monitor.go -Pattern "maxHold|MaxHold"
+Select-String -Path internal\database\database.go -Pattern "settings|SetSetting"
+Select-String -Path internal\api\api.go -Pattern "risk_limits|settings|maxHold"
+Se monitor.go só recebe maxHold no New() (uma vez na inicialização) → env é a única fonte. Se monitor.go tem método SetMaxHold() que lê do DB, o DB está sobrescrevendo.
+
+🎯 Causa raiz #2: MAX_HOLD_SECONDS=120 ainda é curto demais para TP de 50%
+Mesmo se o env fosse lido corretamente, MAX_HOLD_SECONDS=120 com TAKE_PROFIT=50% é matematicamente inviável em pump.fun. Olha os números:
+
+Cenário	Probabilidade em pump.fun	Resultado
+Token sobe 50% em 120s	~15-20%	✅ TP dispara
+Token cai 30% em 120s	~25%	✅ SL dispara
+Token sobe 30-40% e volta	~30%	❌ trailing não arma (precisa +10% de pico) — sai a 0%
+Token sobe 5-15% e para	~35%	❌ sai a 0% no max_hold
+65%+ dos tokens não disparam nada e saem no max_hold a ~0% = perda de taxa garantida. Foi exatamente o que aconteceu nos 9 trades.
+
+Pump.fun em 2 minutos é tempo demais para alguns, tempo de menos para outros. O que você precisa:
+
+Estratégia revisada (coerente com pump.fun):
+Variável	Valor atual	Valor recomendado	Por quê
+TAKE_PROFIT_GROSS_PCT	50	25	Pump.fun raramente sobe 50% em 2min, mas 25% é comum
+STOP_LOSS_PCT	30	20	Stop mais apertado protege os 65% que não vão a lugar nenhum
+TRAILING_STOP_PCT	12	8	Mais apertado = arma em +5% pico e sai com +2%, não +10%
+MAX_HOLD_SECONDS	120	300	Dá tempo do token mover de verdade (5min)
+MAX_HOLD se retorno entre -10% e +10%	(não existe)	Não vender antes de 300s	NOVO — o bug real
+🎯 Causa raiz #3 (o bug de verdade): o exit não deveria vender a 0%
+Olha positions.ExitReason:
+
+go
+if l.MaxHold > 0 && now.Sub(p.OpenedAt) >= l.MaxHold {
+    return "max hold time"
+}
+Qualquer tempo ≥ maxHold dispara exit, independente do P&L. Isso está errado. Se o token está a 0% ou -3%, não faz sentido vender e pagar taxa. Melhor segurar mais 5 minutos — se voltar a +15%, trailing arma; se cair -20%, stop dispara. Sair a 0% é a pior opção (perde taxa sem nenhum edge).
+
+O fix correto:
+
+go
+// positions.ExitReason — mudança no branch de max hold:
+if l.MaxHold > 0 && now.Sub(p.OpenedAt) >= l.MaxHold {
+    // Time-stop só vende se estiver no lucro OU em prejuízo real.
+    // Sair a ~0% é perda de taxa garantida — melhor segurar mais 1 ciclo.
+    if change >= 5 || change <= -10 {
+        return "max hold time"
+    }
+    // Entre -10% e +5%: estende o hold em 1x do MaxHold (não vende).
+    if now.Sub(p.OpenedAt) >= 2*l.MaxHold {
+        return "max hold time (extended)"
+    }
+}
+Isso sozinho transforma os 9 trades de "P&L 0 = perda de taxa" para "P&L 0 = segurar mais 5min e deixar o mercado decidir". Se o token subir +15%, trailing arma e sai com lucro. Se cair -20%, stop dispara. Se continuar flat por 10 min, aí sim vende (aceitando a perda de taxa como custo de posição morta).
+
+🔒 Segurança — o que verificar
+O Replit mencionou "análise de privacidade falhou no próprio scanner" — isso é vago. Não confia. Roda os greps abaixo:
+
+S1. WS ainda com CheckOrigin: true?
+powershell
+Select-String -Path internal\api\api.go -Pattern "CheckOrigin"
+Se aparecer CheckOrigin: func(r *http.Request) bool { return true } → CVE de vazamento. Qualquer site abre WS e vê seus mints/trades. Se virou up.CheckOrigin com validação de token → OK.
+
+S2. Sessão tem TTL de verdade?
+powershell
+Select-String -Path internal\api\api.go -Pattern "sessionToken|expiresAt|time.Now|time.Since"
+sessionToken() do código original é HMAC estático (password + "v1") — vale pra sempre. Se o Replit adicionou timestamp + janela de 1h, tá OK. Se não, o session_test.go novo (27 linhas) pode ser só teste de "aceita token válido", não de "expira".
+
+S3. POST /api/config ainda aceita alterar limits sem auth?
+powershell
+Select-String -Path internal\api\api.go -Pattern "func.*config|authorized"
+O código original tem if !s.authorized(r) { fail(401) } no POST — mas só depois de checar r.Method. Se o Replit trocou por r.Method == "GET" liberar sem auth e POST liberar com auth, tá OK. Se quebrou, é vulnerabilidade.
+
+S4. MAX_HOLD_SECONDS no env NÃO está sendo lido (mais grave que parece)
+powershell
+Select-String -Path internal\config\config.go -Pattern "MAX_HOLD_SECONDS"
+Select-String -Path internal\config\config_test.go -Pattern "MAX_HOLD_SECONDS|MaxHold"
+Se config_test.go não tem teste verificando que MAX_HOLD_SECONDS=120 resulta em cfg.MaxHoldSeconds=120, o env pode estar quebrado e ninguém percebeu. Esse é o bug mais provável do seu problema.
+
+S5. 0.01 SOL no priority fee ainda está no .env?
+O Replit disse que "vou configurar retries do mesmo payload assinado, que mantêm a mesma assinatura" — mas se MAX_PRIORITY_FEE_SOL=0.01 do .env antigo não foi atualizado, cada tentativa de compra/venda paga $2,00**. 9 exits × 2 = **$18 de taxa só nos 9 trades.
+
+powershell
+# Mostra o .env atual (sem imprimir privates)
+Select-String -Path .env -Pattern "MAX_PRIORITY_FEE_SOL|MAX_HOLD_SECONDS|TRADE_USD"
+Se MAX_PRIORITY_FEE_SOL ainda for "0.01" → essa é a maior causa de perda, não o max_hold. Você pagou $2/tx de taxa pra sair a 0%, multiplicado por 18 (9 entradas + 9 saídas) = **$36 de prejuízo** independente do preço do token.
+
+🚀 Sequência de diagnóstico — 3 minutos
+Roda tudo isto e me manda o output. Com isso eu digo exatamente onde tá o bug:
+
+powershell
+cd C:\Users\Chainfx\Desktop\Solana-Sniper-Bot-Dashboard\backend
+
+# 1. Env está sendo lido?
+Select-String -Path internal\config\config.go -Pattern "MaxHoldSeconds|MAX_HOLD_SECONDS"
+Select-String -Path internal\config\config_test.go -Pattern "MaxHold"
+
+# 2. Monitor recebe o valor certo?
+Select-String -Path cmd\server\main.go -Pattern "MaxHoldSeconds|maxHold|time.Duration"
+
+# 3. Monitor pode ser sobrescrito por DB?
+Select-String -Path internal\tokenmonitor\monitor.go -Pattern "SetMaxHold|maxHold ="
+
+# 4. .env atual (mostra só essas 3 linhas)
+Select-String -Path .env -Pattern "MAX_PRIORITY_FEE_SOL|MAX_HOLD_SECONDS|TRADE_USD"
+
+# 5. O exit tem lógica de "não vender a 0%"?
+Select-String -Path internal\positions\positions.go -Pattern "MaxHold|max hold"
+
+# 6. WS seguro?
+Select-String -Path internal\api\api.go -Pattern "CheckOrigin"
+📋 O que eu suspeito (ordem de probabilidade)
+MAX_PRIORITY_FEE_SOL=0.01 ainda no .env → $2/tx × 18 tx = $36 de prejuízo sem o token nem se mexer
+
+MAX_HOLD_SECONDS não é lido (bug de config) → bot usa 90s e vende a 0%
+
+max hold vende a 0% (bug de lógica) → deveria segurar mais 1 ciclo
+
+TP 50% inalcançável em 120s → estratégia incoerente com pump.fun
+
+Os 3 primeiros são bugs técnicos que dá pra tapar em 15 minutos. O 4º é ajuste de estratégia.
+
+Se o MAX_PRIORITY_FEE_SOL ainda for 0.01, para tudo e corrige isso antes de qualquer outra coisa — nenhuma estratégia funciona com fee de $2/tx em trade de $5.
