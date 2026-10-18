@@ -28,7 +28,10 @@ import (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		panic(err)
+		// Invalid deployment variables must not produce a Go stack trace or
+		// trigger a noisy crash loop with no actionable configuration message.
+		_, _ = os.Stderr.WriteString("configuration error: " + err.Error() + "\n")
+		os.Exit(1)
 	}
 	log, closeLog := logging.New()
 	defer closeLog()

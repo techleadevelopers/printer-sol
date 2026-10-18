@@ -161,13 +161,42 @@ func env(k, d string) string {
 	return d
 }
 func boolEnv(k string, d bool) (bool, error) {
-	v := env(k, strconv.FormatBool(d))
-	return strconv.ParseBool(v)
+	v := cleanScalar(env(k, strconv.FormatBool(d)))
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false (got %q): %w", k, v, err)
+	}
+	return parsed, nil
 }
 func floatEnv(k string, d float64) (float64, error) {
-	return strconv.ParseFloat(strings.TrimSpace(env(k, fmt.Sprint(d))), 64)
+	v := cleanScalar(env(k, fmt.Sprint(d)))
+	parsed, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a number (got %q): %w", k, v, err)
+	}
+	return parsed, nil
 }
-func intEnv(k string, d int) (int, error) { return strconv.Atoi(env(k, strconv.Itoa(d))) }
+func intEnv(k string, d int) (int, error) {
+	v := cleanScalar(env(k, strconv.Itoa(d)))
+	parsed, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer (got %q): %w", k, v, err)
+	}
+	return parsed, nil
+}
+
+// cleanScalar accepts values copied from JSON, Docker/Railway forms, and .env
+// files. Those interfaces commonly leave a leading escaped or unclosed quote
+// around otherwise valid scalar values (for example \"1 or "1).
+func cleanScalar(v string) string {
+	v = strings.TrimSpace(v)
+	for strings.HasPrefix(v, `\"`) {
+		v = strings.TrimPrefix(v, `\`)
+	}
+	v = strings.TrimPrefix(v, `\"`)
+	v = strings.Trim(v, "\"'")
+	return strings.TrimSpace(v)
+}
 func splitEndpoints(v string) []string {
 	var out []string
 	for _, endpoint := range strings.Split(v, ",") {
