@@ -179,6 +179,79 @@ func (d *DB) ListTokens() (*sql.Rows, error) {
 func (d *DB) OpenSimulationPosition(mint string, amount float64) error {
 	return d.OpenPosition(mint, amount)
 }
+
+func (d *DB) FinalizeSimulationBuy(id, mint string, amount float64) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC()
+	if _, err = tx.Exec(d.bind(`INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
+		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,updated_at=excluded.updated_at`),
+		mint, fmt.Sprint(amount), amount, "open", now, now); err != nil {
+		return err
+	}
+	if err = setSimulationTradeState(tx, d, id, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *DB) FinalizeSimulationSell(id, mint string, value float64) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var cost float64
+	if err = tx.QueryRow(d.bind(`SELECT COALESCE(cost_sol,0) FROM positions WHERE mint=? AND status='open'`), mint).Scan(&cost); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=? AND status='open'`), now, mint)
+	if err != nil {
+		return err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if affected != 1 {
+		return fmt.Errorf("simulated position %q is no longer open", mint)
+	}
+	result, err = tx.Exec(d.bind(`UPDATE trades SET state='simulated',executed_value_sol=?,realized_pnl_sol=?,confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='sell'`),
+		value, value-cost, now, false, now, id)
+	if err != nil {
+		return err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if affected != 1 {
+		return fmt.Errorf("simulated sell trade %q not found", id)
+	}
+	if _, err = tx.Exec(d.bind(`UPDATE transactions SET state='simulated',updated_at=? WHERE trade_id=?`), now, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func setSimulationTradeState(tx *sql.Tx, d *DB, id string, now time.Time) error {
+	result, err := tx.Exec(d.bind(`UPDATE trades SET state='simulated',confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='buy'`), now, false, now, id)
+	if err != nil {
+		return err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if affected != 1 {
+		return fmt.Errorf("simulated buy trade %q not found", id)
+	}
+	if _, err = tx.Exec(d.bind(`UPDATE transactions SET state='simulated',updated_at=? WHERE trade_id=?`), now, id); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (d *DB) OpenPosition(mint string, amount float64) error {
 	now := time.Now().UTC()
 	query := `INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
@@ -281,6 +354,16 @@ func (d *DB) RealizedPnlSOL() (float64, error) {
 	e := d.QueryRow(`SELECT COALESCE(SUM(realized_pnl_sol),0) FROM trades WHERE realized_pnl_sol IS NOT NULL`).Scan(&pnl)
 	return pnl, e
 }
+
+// SimulationAvailableBalanceSOL returns the uninvested paper capital after
+// realized results and the cost of currently open paper positions.
+func (d *DB) SimulationAvailableBalanceSOL(initialBalance float64) (float64, error) {
+	var balance float64
+	err := d.QueryRow(d.bind(`SELECT ? + COALESCE((SELECT SUM(realized_pnl_sol) FROM trades WHERE realized_pnl_sol IS NOT NULL),0)
+		- COALESCE((SELECT SUM(cost_sol) FROM positions WHERE status='open'),0)`), initialBalance).Scan(&balance)
+	return balance, err
+}
+
 func (d *DB) ListPositions() (*sql.Rows, error) {
 	return d.Query(`SELECT p.mint,p.quantity,COALESCE(p.cost_sol,0),p.status,p.opened_at,p.updated_at,COALESCE(m.entry_market_cap_sol,0),COALESCE(m.current_market_cap_sol,0) FROM positions p LEFT JOIN paper_marks m ON m.mint=p.mint ORDER BY p.updated_at DESC`)
 }

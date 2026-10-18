@@ -1,0 +1,656 @@
+CENTRO DE OPERAÇÕES
+Visão geral
+Estado consolidado reportado pelo serviço de operações.
+
+BOT
+running
+MODO
+simulation
+Pausar novas compras
+Parar novas operações
+Parar interrompe novas operações; não fecha posições existentes.
+
+Tokens detetados
+29 969
+Tokens analisados
+29 969
+Operações
+101
+Posições abertas
+101
+Património virtual
+1SOL
+Reserva de taxas
+0,01SOL
+P&L realizado
+0SOL
+P&L estimado · aberto
+0SOL
+Estimativa, não resultado realizado
+Histórico do saldo
+SOL · API
+Histórico indisponível ou sem pontos válidos.
+
+Resultado acumulado
+Líquido
+0SOL
+Custos
+0SOL
+OPERAÇÕES POR PERÍODO
+2026-10-18
+0/0de 101
+Evolução do resultado líquido
+SOL · API
+18/10/2026
+0
+1
+2
+3
+4
+
+Operações por período
+CONTAGEM · API
+2026-10-18
+0
+30
+60
+90
+120
+
+Distribuição dos resultados
+OPERAÇÕES · API
+Distribuição indisponível ou sem operações classificadas.
+
+Histórico do saldo
+SOL · API
+18/10/2026
+0
+0.25
+0.5
+0.75
+1
+
+Saúde dos serviços
+API
+ok
+Monitor de eventos
+connected
+Verificado
+18/10/2026, 10:57
+Monitor de eventos
+Ligado
+entry_rejected
+Indisponível
+Operações recentes
+[Ver histórico](https://solana-sniper-bot-dashboard.vercel.app/user-portal/trades) 
+Data	Token / Mint	Lado	Quantidade	Valor SOL	Taxas	Slippage	Resultado bruto	Resultado líquido	Estado	Explorer / ID
+17/10/2026, 23:17	
+Token sem nome
+A32ZZ…qpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:17	
+Token sem nome
+6pyz6…Nm45i
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:17	
+Token sem nome
+BtCW9…WUBJw
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:17	
+Token sem nome
+D7e9X…spump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:17	
+Token sem nome
+HTGF4…bBwaa
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:16	
+Token sem nome
+CgzeR…Eton1
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:16	
+Token sem nome
+2F1xu…spump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:16	
+Token sem nome
+38NNH…vpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:16	
+Token sem nome
+vyQLn…8pump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:15	
+Token sem nome
+5ELnV…HGcZr
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:15	
+Token sem nome
+HCGR8…Ypump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:15	
+Token sem nome
+EjDNK…iyF8H
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:14	
+Token sem nome
+GksAy…xuzjj
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:14	
+Token sem nome
+HkyKY…oWbVL
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:14	
+Token sem nome
+CP1Mu…N4DmQ
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:13	
+Token sem nome
+5PF8g…Qpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:13	
+Token sem nome
+FEcTs…S8feR
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:13	
+Token sem nome
+DXGyx…z848A
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:13	
+Token sem nome
+7A3KR…Z5wJa
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:13	
+Token sem nome
+J1wdF…upump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:12	
+Token sem nome
+Hd4xc…Hpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:12	
+Token sem nome
+2o4La…ZRZDB
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:12	
+Token sem nome
+68M1z…kpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:12	
+Token sem nome
+39BKM…dbV1m
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:11	
+Token sem nome
+Prewe…3rpgF
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:11	
+Token sem nome
+9GsG6…Wen9p
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:11	
+Token sem nome
+3HjWp…mvcnt
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:11	
+Token sem nome
+Hg4z5…wpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:10	
+Token sem nome
+2ivam…3E1Sc
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:10	
+Token sem nome
+8fAfs…yiDCE
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:09	
+Token sem nome
+3vJqJ…dpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:09	
+Token sem nome
+9zdAE…xMSKF
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:09	
+Token sem nome
+HEbnX…EdoZL
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:09	
+Token sem nome
+7qRV8…Jpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:08	
+Token sem nome
+6845j…Qpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:08	
+Token sem nome
+HcjWU…qAyto
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:08	
+Token sem nome
+13Jth…apump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:08	
+Token sem nome
+FZigr…Wpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:08	
+Token sem nome
+GFEY8…Xpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:07	
+Token sem nome
+GNAFC…wpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:06	
+Token sem nome
+nRxhQ…cpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:06	
+Token sem nome
+9EuCb…gpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:06	
+Token sem nome
+74ZWd…7XT34
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:06	
+Token sem nome
+85DvN…MoWa4
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:06	
+Token sem nome
+4ivVr…Ypump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:05	
+Token sem nome
+61qik…wpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:05	
+Token sem nome
+5rDFN…Hpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:05	
+Token sem nome
+DqrMM…Wpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:05	
+Token sem nome
+Ay2X1…Vpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:05	
+Token sem nome
+8hkhV…Tpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:03	
+Token sem nome
+9Hzge…kpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:03	
+Token sem nome
+98ZVT…aTMFf
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:03	
+Token sem nome
+3ryfr…CQGAe
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:03	
+Token sem nome
+FKXy3…Zpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:03	
+Token sem nome
+2aEQU…JgYHd
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:02	
+Token sem nome
+D7om9…Dpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:02	
+Token sem nome
+8Mn1B…Mpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:02	
+Token sem nome
+EZEvE…bpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:02	
+Token sem nome
+A3Tpn…v4RMK
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:02	
+Token sem nome
+FtSes…Ypump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:01	
+Token sem nome
+GFthK…3z1Jy
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:00	
+Token sem nome
+2xP5y…mvwnA
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:00	
+Token sem nome
+CLTVg…ZuYU2
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 23:00	
+Token sem nome
+8uW8w…Epump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:59	
+Token sem nome
+EnpVe…j2ubh
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:59	
+Token sem nome
+4EGaB…mFotV
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:59	
+Token sem nome
+DmV4a…dpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:59	
+Token sem nome
+4bhDp…vpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:59	
+Token sem nome
+3hGBf…gpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:57	
+Token sem nome
+2KrTe…39roH
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:57	
+Token sem nome
+464E8…6pump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:57	
+Token sem nome
+CGfn9…VutD5
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:57	
+Token sem nome
+FkvV2…P2qkg
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:56	
+Token sem nome
+CnP8K…5pump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:56	
+Token sem nome
+3mL4n…Npump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:56	
+Token sem nome
+6keyn…Vpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:55	
+Token sem nome
+5uPTd…Vpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:55	
+Token sem nome
+5wG3n…6TJwE
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:55	
+Token sem nome
+97xMH…upump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:55	
+Token sem nome
+GCbW8…xpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 22:54	
+Token sem nome
+2p5pA…GGrcK
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:06	
+Token sem nome
+syFYo…7pump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:06	
+Token sem nome
+AaVyG…eCNNn
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:06	
+Token sem nome
+DZ7kW…rpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:06	
+Token sem nome
+WkbWB…FQ5NC
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:06	
+Token sem nome
+JAd6Y…w8ZRT
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:05	
+Token sem nome
+3TAkd…Bpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:05	
+Token sem nome
+BZ2dq…Epump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:05	
+Token sem nome
+TSx3T…Wpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:04	
+Token sem nome
+2f69j…Jq1Jf
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:04	
+Token sem nome
+AYoUW…6jz5i
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:04	
+Token sem nome
+tREk4…Ypump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:04	
+Token sem nome
+ZNBL3…xpump
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:03	
+Token sem nome
+81o5F…osLUc
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—
+17/10/2026, 03:03	
+Token sem nome
+39uKE…eCKaL
+Compra	0,01	0,01	0	10%	Em aberto	Em aberto	
+confirmed	
+—

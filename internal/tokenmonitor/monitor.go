@@ -124,6 +124,10 @@ func (m *Monitor) connect(ctx context.Context) error {
 				return
 			case mint := <-m.subscriptions:
 				if err := c.WriteJSON(map[string]any{"method": "subscribeTokenTrade", "keys": []string{mint}}); err != nil {
+					if m.simulation {
+						// Reconnect so all open paper positions are subscribed again.
+						_ = c.Close()
+					}
 					return
 				}
 			}

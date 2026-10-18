@@ -91,7 +91,13 @@ func Load() (Config, error) {
 	if c.TakeProfitGrossPct, err = floatEnv("TAKE_PROFIT_GROSS_PCT", 70); err != nil {
 		return c, err
 	}
-	if c.StopLossPct, err = floatEnv("STOP_LOSS_PCT", 0); err != nil {
+	stopLossDefault := 0.0
+	if c.Simulation {
+		// Match the documented paper-trading stop while keeping live mode
+		// fail-closed when its stop-loss is not explicitly configured.
+		stopLossDefault = 30
+	}
+	if c.StopLossPct, err = floatEnv("STOP_LOSS_PCT", stopLossDefault); err != nil {
 		return c, err
 	}
 	if c.MaxHoldSeconds, err = intEnv("MAX_HOLD_SECONDS", 0); err != nil {
@@ -131,8 +137,14 @@ func Load() (Config, error) {
 	if !c.Simulation && (!c.EnableLiveTrading || c.PrivateKey == "" || c.KeyProviderRef == "" || c.WalletPublicAddress == "" || c.PumpPortalKey == "") {
 		return c, fmt.Errorf("live trading requires ENABLE_LIVE_TRADING=true, BOT_PRIVATE_KEY via KEY_PROVIDER_REF, WALLET_PUBLIC_ADDRESS and PUMPPORTAL_API_KEY")
 	}
+	if c.Simulation && strings.TrimSpace(c.PumpPortalKey) == "" {
+		return c, fmt.Errorf("simulation requires PUMPPORTAL_API_KEY to receive token price updates for virtual exits")
+	}
 	if !c.Simulation && (c.StopLossPct <= 0 || c.MaxHoldSeconds <= 0) {
 		return c, fmt.Errorf("live trading requires STOP_LOSS_PCT > 0 and MAX_HOLD_SECONDS > 0")
+	}
+	if c.Simulation && (c.StopLossPct <= 0 || c.TakeProfitGrossPct <= 0) {
+		return c, fmt.Errorf("simulation requires STOP_LOSS_PCT > 0 and TAKE_PROFIT_GROSS_PCT > 0 for virtual exits")
 	}
 	if c.Simulation && c.EnableLiveTrading {
 		return c, fmt.Errorf("SIMULATION=true and ENABLE_LIVE_TRADING=true cannot be enabled together")

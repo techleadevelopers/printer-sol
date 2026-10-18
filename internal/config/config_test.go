@@ -115,6 +115,60 @@ func TestLiveTradingRequiresStopLossAndMaxHold(t *testing.T) {
 	}
 }
 
+func TestSimulationRequiresPriceFeedAndDefaultsBothExitTargets(t *testing.T) {
+	keys := []string{
+		"HTTP_ADDR", "DATABASE_URL", "DATABASE_PATH", "SIMULATION_DATABASE_URL",
+		"REAL_DATABASE_URL", "BOT_PRIVATE_KEY", "KEY_PROVIDER_REF", "WALLET_PUBLIC_ADDRESS",
+		"PUMPPORTAL_API_KEY", "ADMIN_PASSWORD", "PUMPPORTAL_URL", "PUMPPORTAL_WS",
+		"SOL_USD_PRICE_URL", "RPC_ENDPOINTS", "SIMULATION", "ENABLE_LIVE_TRADING",
+		"MAX_TRADE_SOL", "MAX_DAILY_LOSS_SOL", "FEE_RESERVE_SOL", "MAX_EXPOSURE_SOL",
+		"MAX_SLIPPAGE_PCT", "MAX_PRIORITY_FEE_SOL", "TOKEN_QUEUE_SIZE",
+		"MAX_OPEN_POSITIONS", "MAX_CONFIRMATION_WAIT_SECONDS", "MAX_SUBMISSION_ATTEMPTS",
+		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "TRADE_USD", "SIMULATION_BALANCE_SOL",
+		"TOKEN_MAX_AGE_SECONDS", "TAKE_PROFIT_GROSS_PCT", "STOP_LOSS_PCT", "MAX_HOLD_SECONDS",
+	}
+	type previousValue struct {
+		value string
+		set   bool
+	}
+	previous := make(map[string]previousValue, len(keys))
+	for _, key := range keys {
+		value, set := os.LookupEnv(key)
+		previous[key] = previousValue{value: value, set: set}
+		_ = os.Unsetenv(key)
+	}
+	defer func() {
+		for key, prior := range previous {
+			if prior.set {
+				_ = os.Setenv(key, prior.value)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		}
+	}()
+
+	_ = os.Setenv("SIMULATION", "true")
+	_ = os.Setenv("ENABLE_LIVE_TRADING", "false")
+	_ = os.Setenv("ADMIN_PASSWORD", "test-password")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "PUMPPORTAL_API_KEY") {
+		t.Fatalf("simulation without a price feed key should fail clearly, got %v", err)
+	}
+
+	_ = os.Setenv("PUMPPORTAL_API_KEY", "test-pumpportal-key")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StopLossPct != 30 || cfg.TakeProfitGrossPct != 70 {
+		t.Fatalf("unexpected simulation exit defaults: stop=%.1f take=%.1f", cfg.StopLossPct, cfg.TakeProfitGrossPct)
+	}
+
+	_ = os.Setenv("STOP_LOSS_PCT", "0")
+	if _, err = Load(); err == nil || !strings.Contains(err.Error(), "STOP_LOSS_PCT") {
+		t.Fatalf("simulation with disabled stop-loss should fail clearly, got %v", err)
+	}
+}
+
 func TestValidateURLRejectsWrongSchemeAndRelativeURL(t *testing.T) {
 	if err := validateURL("https://rpc.example", "http", "https"); err != nil {
 		t.Fatalf("expected valid HTTPS URL: %v", err)

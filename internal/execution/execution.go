@@ -128,8 +128,19 @@ func (e *Engine) CloseLivePosition(ctx context.Context, mint string, slippage, p
 }
 
 func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error {
-	balance := e.simulationBalance
-	if !e.simulation {
+	var balance uint64
+	if e.simulation {
+		available, err := e.db.SimulationAvailableBalanceSOL(e.SimulationBalanceSOL())
+		if err != nil {
+			return err
+		}
+		if available > 0 {
+			balance, err = wallet.SOLToLamports(available)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
 		var err error
 		balance, err = e.rpcs.Balance(ctx, e.wallet.Address())
 		if err != nil {
@@ -149,15 +160,19 @@ func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error 
 	for _, v := range e.reserved {
 		reserved += v
 	}
-	exposure, err := e.db.OpenExposureSOL()
-	if err != nil {
-		return err
+	required := reserve + reserved + needed
+	if !e.simulation {
+		exposure, err := e.db.OpenExposureSOL()
+		if err != nil {
+			return err
+		}
+		openCost, err := wallet.SOLToLamports(exposure)
+		if err != nil {
+			return err
+		}
+		required += openCost
 	}
-	openCost, err := wallet.SOLToLamports(exposure)
-	if err != nil {
-		return err
-	}
-	if balance < reserve+openCost+reserved+needed {
+	if balance < required {
 		return fmt.Errorf("insufficient free wallet balance after fee reserve and pending entries")
 	}
 	e.reserved[mint] = needed
@@ -293,18 +308,13 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		return "", err
 	}
 	if e.simulation {
-		_ = e.db.UpdateTradeState(id, "simulated", "", true)
 		if r.Side == "buy" {
-			if err := e.db.OpenSimulationPosition(r.Mint, r.Amount); err != nil {
+			if err := e.db.FinalizeSimulationBuy(id, r.Mint, r.Amount); err != nil {
 				return id, fmt.Errorf("record simulated position: %w", err)
 			}
 		} else {
-			cost, err := e.db.CloseSimulationPosition(r.Mint, r.Amount)
-			if err != nil {
+			if err := e.db.FinalizeSimulationSell(id, r.Mint, r.Amount); err != nil {
 				return id, fmt.Errorf("close simulated position: %w", err)
-			}
-			if err = e.db.SetTradePnl(id, r.Amount, r.Amount-cost); err != nil {
-				return id, fmt.Errorf("record simulated profit: %w", err)
 			}
 		}
 		e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "simulation": true})

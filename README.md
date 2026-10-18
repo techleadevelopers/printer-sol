@@ -6,6 +6,8 @@ Backend Go conservador para observação de novos tokens, controles de risco e e
 
 O padrão é `SIMULATION=true`. Neste modo o serviço registra a negociação simulada, mas não assina nem envia bytes de transação.
 
+A simulação calcula saídas virtuais a partir das atualizações de preço por token do PumpPortal. Por isso, `PUMPPORTAL_API_KEY` também é obrigatória em simulação; o PumpPortal exige uma carteira vinculada com pelo menos 0,02 SOL para essa assinatura. O padrão de stop-loss da simulação é 30% e o take-profit é 70%; ambos podem ser ajustados por configuração. A banca exibida como saldo disponível desconta o capital alocado em posições abertas e incorpora resultados realizados após cada saída.
+
 Para ativar execução real é necessário, simultaneamente: `SIMULATION=false`, `ENABLE_LIVE_TRADING=true`, `BOT_PRIVATE_KEY` carregada somente no ambiente de execução, `KEY_PROVIDER_REF`, `WALLET_PUBLIC_ADDRESS`, um RPC saudável e saldo suficiente além da reserva de taxas. `ADMIN_PASSWORD` é obrigatória para acessar o console. A chave privada nunca é salva no banco, devolvida por HTTP/WebSocket ou registrada em logs.
 
 Copie os nomes de variáveis de `.env.example` para o secret manager/deployment. Não versione um `.env` real.

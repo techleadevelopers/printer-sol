@@ -87,9 +87,20 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	realizedPnl, _ := s.db.RealizedPnlSOL()
 	trades := s.tradeItems()
-	balance := s.balanceSOL(openPnl)
+	balance := s.balanceSOL()
+	virtualEquity := balance
+	if s.cfg.Simulation {
+		virtualEquity = s.engine.SimulationBalanceSOL() + realizedPnl + openPnl
+		if virtualEquity < 0 {
+			virtualEquity = 0
+		}
+	}
 	now := time.Now().UTC()
-	write(w, 200, map[string]any{"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance, "walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "detectedTokens": detected, "analyzedTokens": detected, "tradesCount": len(trades), "openPositions": positions, "realizedPnlSol": realizedPnl, "estimatedOpenPnlSol": openPnl, "netPnlSol": realizedPnl, "costsSol": 0.0, "cumulativeResult": []map[string]any{{"timestamp": now, "value": realizedPnl}}, "tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": len(trades), "positive": 0, "negative": 0}}, "balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades})
+	dashboard := map[string]any{"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": balance, "walletBalanceLow": balance < s.engine.Limits().FeeReserveSOL, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "detectedTokens": detected, "analyzedTokens": detected, "tradesCount": len(trades), "openPositions": positions, "realizedPnlSol": realizedPnl, "estimatedOpenPnlSol": openPnl, "netPnlSol": realizedPnl, "costsSol": 0.0, "cumulativeResult": []map[string]any{{"timestamp": now, "value": realizedPnl}}, "tradesByPeriod": []map[string]any{{"period": now.Format("2006-01-02"), "total": len(trades), "positive": 0, "negative": 0}}, "balanceHistory": []map[string]any{{"timestamp": now, "value": balance}}, "recentTrades": trades}
+	if s.cfg.Simulation {
+		dashboard["virtualEquitySol"] = virtualEquity
+	}
+	write(w, 200, dashboard)
 }
 func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
@@ -188,14 +199,12 @@ func (s *Server) mode() string {
 	}
 	return "real"
 }
-func (s *Server) balanceSOL(openPnl float64) float64 {
+func (s *Server) balanceSOL() float64 {
 	if s.cfg.Simulation {
-		realized, _ := s.db.RealizedPnlSOL()
-		// Paper equity carries forward across restarts: initial virtual capital
-		// plus persisted realized P&L and the live mark-to-market of open paper
-		// positions. The starting balance is never reapplied per trade.
-		balance := s.engine.SimulationBalanceSOL() + realized + openPnl
-		if balance < 0 {
+		// The wallet balance is uninvested paper capital. Mark-to-market and
+		// realized results are exposed separately by the dashboard.
+		balance, err := s.db.SimulationAvailableBalanceSOL(s.engine.SimulationBalanceSOL())
+		if err != nil || balance < 0 {
 			return 0
 		}
 		return balance
@@ -249,7 +258,7 @@ func (s *Server) walletInfo(w http.ResponseWriter, r *http.Request) {
 	result := map[string]any{"publicAddress": s.wallet.Address(), "balanceSol": nil, "feesReserveSol": s.engine.Limits().FeeReserveSOL, "tokenHoldings": []any{}, "syncStatus": "synced", "updatedAt": time.Now().UTC()}
 	if s.cfg.Simulation {
 		result["publicAddress"] = nil
-		result["balanceSol"] = s.balanceSOL(0)
+		result["balanceSol"] = s.balanceSOL()
 	}
 	if s.wallet.Address() != "" && s.rpcs.Available() {
 		ctx, c := context.WithTimeout(r.Context(), 5*time.Second)
