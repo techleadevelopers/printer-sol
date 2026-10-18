@@ -27,6 +27,7 @@ type Event struct {
 	Created      time.Time
 	MarketCapSOL float64
 	Raw          string
+	queuedAt     time.Time
 }
 
 // Entrier is implemented by the execution engine. Keeping the dependency as
@@ -48,15 +49,18 @@ type Settings struct {
 	EntryDelay        time.Duration
 	MinTransactions   int
 	PricePollInterval time.Duration
+	SnipeConcurrency  int
+	SnipeTimeout      time.Duration
+	DedupeTTL         time.Duration
 	BondingCurve      BondingCurveMarketCapSource
 }
 
 type candidate struct {
-	event              Event
-	detectedAt         time.Time
-	tradeEvents        int
-	tradeMarketCapSOL  float64
-	checking           bool
+	event             Event
+	detectedAt        time.Time
+	tradeEvents       int
+	tradeMarketCapSOL float64
+	checking          bool
 }
 
 type Monitor struct {
@@ -88,9 +92,14 @@ type Monitor struct {
 	exitIntents                     sync.Map
 	candidateMu                     sync.Mutex
 	candidates                      map[string]*candidate
+	snipeMu                         sync.Mutex
+	snipePending                    map[string]time.Time
 	entryDelay                      time.Duration
 	minTransactions                 int
 	pricePollInterval               time.Duration
+	snipeConcurrency                int
+	snipeTimeout                    time.Duration
+	dedupeTTL                       time.Duration
 	bondingCurve                    BondingCurveMarketCapSource
 	priceSourceStatusMu             sync.Mutex
 	priceSourceFailures             int
@@ -174,6 +183,9 @@ func (m *Monitor) ResetInMemoryState() {
 	m.candidateMu.Lock()
 	m.candidates = make(map[string]*candidate)
 	m.candidateMu.Unlock()
+	m.snipeMu.Lock()
+	m.snipePending = make(map[string]time.Time)
+	m.snipeMu.Unlock()
 	for {
 		select {
 		case <-m.q:
@@ -200,6 +212,9 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		EntryDelay:        5 * time.Second,
 		MinTransactions:   2,
 		PricePollInterval: 20 * time.Second,
+		SnipeConcurrency:  4,
+		SnipeTimeout:      15 * time.Second,
+		DedupeTTL:         60 * time.Second,
 	}
 	if len(options) > 0 {
 		option := options[0]
@@ -212,6 +227,15 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		if option.PricePollInterval > 0 {
 			settings.PricePollInterval = option.PricePollInterval
 		}
+		if option.SnipeConcurrency > 0 {
+			settings.SnipeConcurrency = option.SnipeConcurrency
+		}
+		if option.SnipeTimeout > 0 {
+			settings.SnipeTimeout = option.SnipeTimeout
+		}
+		if option.DedupeTTL > 0 {
+			settings.DedupeTTL = option.DedupeTTL
+		}
 		settings.BondingCurve = option.BondingCurve
 	}
 	return &Monitor{
@@ -220,10 +244,13 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15,
 		maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size),
 		seen: make(map[string]time.Time), candidates: make(map[string]*candidate),
-		entryDelay: settings.EntryDelay, minTransactions: settings.MinTransactions,
+		snipePending: make(map[string]time.Time),
+		entryDelay:   settings.EntryDelay, minTransactions: settings.MinTransactions,
 		pricePollInterval: settings.PricePollInterval,
+		snipeConcurrency:  settings.SnipeConcurrency,
+		snipeTimeout:      settings.SnipeTimeout, dedupeTTL: settings.DedupeTTL,
 		bondingCurve: settings.BondingCurve,
-		bus: b, log: l,
+		bus:          b, log: l,
 	}
 }
 func (m *Monitor) SetTrailingStopPct(pct float64) {
@@ -258,6 +285,7 @@ func (m *Monitor) runSeenJanitor(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			m.pruneSeen(now)
+			m.pruneSnipeDedupe(now)
 		}
 	}
 }
@@ -401,16 +429,16 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 		} else {
 			returnPct, known, err = m.db.LiveReturnPct(mint)
 		}
-	_, exitMarketCap, _, markKnown, markErr := m.db.MarkMarketCaps(mint, m.simulation)
-	if err != nil || markErr != nil || !known || !markKnown || exitMarketCap <= 0 {
-		if err != nil {
-			m.alertMissingMark(mint, err)
-		} else {
-			m.alertMissingMark(mint, markErr)
+		_, exitMarketCap, _, markKnown, markErr := m.db.MarkMarketCaps(mint, m.simulation)
+		if err != nil || markErr != nil || !known || !markKnown || exitMarketCap <= 0 {
+			if err != nil {
+				m.alertMissingMark(mint, err)
+			} else {
+				m.alertMissingMark(mint, markErr)
+			}
+			continue
 		}
-		continue
-		}
-	m.missingMarks.Delete(mint)
+		m.missingMarks.Delete(mint)
 		failedExit, failedExitErr := m.db.HasFailedSellForMint(mint)
 		if failedExitErr != nil {
 			m.log.Warn("check previous exit failures", zap.String("mint", mint), zap.Error(failedExitErr))
@@ -651,14 +679,42 @@ func (m *Monitor) connect(ctx context.Context) error {
 	}
 }
 func (m *Monitor) consume(ctx context.Context) {
+	concurrency := m.snipeConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	var workers sync.WaitGroup
+	workers.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer workers.Done()
+			m.consumeSnipeQueue(ctx)
+		}()
+	}
+	<-ctx.Done()
+	workers.Wait()
+}
+
+func (m *Monitor) consumeSnipeQueue(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case e := <-m.q:
+			if ctx.Err() != nil {
+				return
+			}
+			if !e.queuedAt.IsZero() && time.Since(e.queuedAt) >= m.dedupeTTL {
+				m.rejectCandidate(e, "snipe queue item expired before processing")
+				continue
+			}
+			jobCtx, cancel := context.WithTimeout(ctx, m.snipeTimeout)
 			m.runOperation(func() {
-				m.consumeEvent(ctx, e)
+				if jobCtx.Err() == nil {
+					m.consumeEvent(jobCtx, e)
+				}
 			})
+			cancel()
 		}
 	}
 }
@@ -676,52 +732,56 @@ func (m *Monitor) websocketPayloadPreview(raw []byte) string {
 
 func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 	latency := time.Since(e.Received).Milliseconds()
-			if err := m.db.RecordEvent(e.Mint, e.Creator, e.Raw, e.Received, latency); err != nil {
-				m.log.Warn("record event", zap.Error(err))
-				m.bus.Publish("operational_error", map[string]string{"component": "database", "message": "unable to record token"})
-			}
-			if e.MarketCapSOL <= 0 {
-				reason := "missing creation market cap for take-profit baseline"
-				_ = m.db.RecordAssessment(e.Mint, false, reason)
-				m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
-	return
-			}
-			ok, reason := m.strategy.EvaluateFast(e.Mint, e.Created)
-			m.log.Info("token evaluated", zap.String("mint", e.Mint), zap.Bool("eligible", ok), zap.String("reason", reason), zap.Int64("latency_ms", latency))
-			if !ok || m.entry == nil {
-				_ = m.db.RecordAssessment(e.Mint, false, reason)
-				m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
-	return
-			}
-			id, entryErr := m.entry.BuyNewTokenUSD(ctx, e.Mint, m.tradeUSD, m.slippage, m.priorityFee, "pump", reason)
-			if entryErr != nil {
-				_ = m.db.RecordAssessment(e.Mint, false, entryErr.Error())
-				m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": entryErr.Error()})
-				m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.Error(entryErr))
-	return
-			}
-			if assessmentErr := m.db.RecordAssessment(e.Mint, true, reason); assessmentErr != nil {
-				m.log.Warn("record entered-token assessment", zap.Error(assessmentErr))
-			}
-			if m.simulation {
-				if err := m.db.RecordPaperMark(e.Mint, e.MarketCapSOL); err != nil {
-					m.log.Warn("record paper mark", zap.Error(err))
-				}
-			} else if err := m.db.RecordLiveMark(e.Mint, e.MarketCapSOL); err != nil {
-				m.log.Warn("record live mark", zap.Error(err))
-			}
-			m.tracked.Store(e.Mint, struct{}{})
-			select {
-			case m.subscriptions <- e.Mint:
-			default:
-				m.tracked.Delete(e.Mint)
-				m.log.Warn("token trade subscription queue full", zap.String("mint", e.Mint))
-			}
-			m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
-			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": m.simulation})
-			if m.strategy.HasScreen() {
-				m.screenAfterEntry(ctx, e.Mint)
-			}
+	if err := m.db.RecordEvent(e.Mint, e.Creator, e.Raw, e.Received, latency); err != nil {
+		m.log.Warn("record event", zap.Error(err))
+		m.bus.Publish("operational_error", map[string]string{"component": "database", "message": "unable to record token"})
+	}
+	if reason := m.creatorBlacklistReason(e.Creator); reason != "" {
+		m.rejectCandidate(e, reason)
+		return
+	}
+	if e.MarketCapSOL <= 0 {
+		reason := "missing creation market cap for take-profit baseline"
+		_ = m.db.RecordAssessment(e.Mint, false, reason)
+		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
+		return
+	}
+	ok, reason := m.strategy.EvaluateFast(e.Mint, e.Created)
+	m.log.Info("token evaluated", zap.String("mint", e.Mint), zap.Bool("eligible", ok), zap.String("reason", reason), zap.Int64("latency_ms", latency))
+	if !ok || m.entry == nil {
+		_ = m.db.RecordAssessment(e.Mint, false, reason)
+		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
+		return
+	}
+	id, entryErr := m.entry.BuyNewTokenUSD(ctx, e.Mint, m.tradeUSD, m.slippage, m.priorityFee, "pump", reason)
+	if entryErr != nil {
+		_ = m.db.RecordAssessment(e.Mint, false, entryErr.Error())
+		m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": entryErr.Error()})
+		m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.Error(entryErr))
+		return
+	}
+	if assessmentErr := m.db.RecordAssessment(e.Mint, true, reason); assessmentErr != nil {
+		m.log.Warn("record entered-token assessment", zap.Error(assessmentErr))
+	}
+	if m.simulation {
+		if err := m.db.RecordPaperMark(e.Mint, e.MarketCapSOL); err != nil {
+			m.log.Warn("record paper mark", zap.Error(err))
+		}
+	} else if err := m.db.RecordLiveMark(e.Mint, e.MarketCapSOL); err != nil {
+		m.log.Warn("record live mark", zap.Error(err))
+	}
+	m.tracked.Store(e.Mint, struct{}{})
+	select {
+	case m.subscriptions <- e.Mint:
+	default:
+		m.tracked.Delete(e.Mint)
+		m.log.Warn("token trade subscription queue full", zap.String("mint", e.Mint))
+	}
+	m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
+	m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": m.simulation})
+	if m.strategy.HasScreen() {
+		m.screenAfterEntry(ctx, e.Mint)
+	}
 }
 
 func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {

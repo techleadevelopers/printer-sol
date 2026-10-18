@@ -174,7 +174,8 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 		"MAX_SLIPPAGE_PCT", "MAX_PRIORITY_FEE_SOL", "TOKEN_QUEUE_SIZE",
 		"MAX_OPEN_POSITIONS", "MAX_CONFIRMATION_WAIT_SECONDS", "MAX_SUBMISSION_ATTEMPTS",
 		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "ENTRY_DELAY_SECONDS", "MIN_TXNS_BEFORE_BUY",
-		"PRICE_POLL_SECONDS", "TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
+		"PRICE_POLL_SECONDS", "SNIPE_CONCURRENCY", "SNIPE_TIMEOUT_MS", "DEDUPE_TTL_MS",
+		"TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
 		"LIVE_UNLOCK_REQUIRES_PAPER", "SKIP_PREFLIGHT",
 		"TOKEN_MAX_AGE_SECONDS", "TAKE_PROFIT_GROSS_PCT", "STOP_LOSS_PCT", "TRAILING_STOP_PCT", "MAX_HOLD_SECONDS",
 	}
@@ -210,8 +211,8 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinTxnsBeforeBuy != 2 || cfg.PricePollSeconds != 20 || cfg.TokenMaxAgeSeconds != 30 {
-		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f priorityFee=%.9f liveGate=%v skipPreflight=%v entryDelay=%d minTxns=%d pricePoll=%d tokenMaxAge=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.MaxPriorityFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.SkipPreflight, cfg.EntryDelaySeconds, cfg.MinTxnsBeforeBuy, cfg.PricePollSeconds, cfg.TokenMaxAgeSeconds)
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinTxnsBeforeBuy != 2 || cfg.PricePollSeconds != 20 || cfg.SnipeConcurrency != 4 || cfg.SnipeTimeoutMS != 15000 || cfg.DedupeTTLMS != 60000 || cfg.TokenMaxAgeSeconds != 30 {
+		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f priorityFee=%.9f liveGate=%v skipPreflight=%v entryDelay=%d minTxns=%d pricePoll=%d snipeConcurrency=%d snipeTimeoutMs=%d dedupeTtlMs=%d tokenMaxAge=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.MaxPriorityFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.SkipPreflight, cfg.EntryDelaySeconds, cfg.MinTxnsBeforeBuy, cfg.PricePollSeconds, cfg.SnipeConcurrency, cfg.SnipeTimeoutMS, cfg.DedupeTTLMS, cfg.TokenMaxAgeSeconds)
 	}
 
 	_ = os.Setenv("MAX_HOLD_SECONDS", `"120"`)
@@ -226,6 +227,38 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	_ = os.Setenv("STOP_LOSS_PCT", "0")
 	if _, err = Load(); err == nil || !strings.Contains(err.Error(), "STOP_LOSS_PCT") {
 		t.Fatalf("simulation with disabled stop-loss should fail clearly, got %v", err)
+	}
+}
+
+func TestSnipeQueueConfigurationOverridesAndBounds(t *testing.T) {
+	keys := []string{"SIMULATION", "ADMIN_PASSWORD", "PUMPPORTAL_API_KEY", "SNIPE_CONCURRENCY", "SNIPE_TIMEOUT_MS", "DEDUPE_TTL_MS"}
+	old := make(map[string]string, len(keys))
+	for _, key := range keys {
+		old[key] = os.Getenv(key)
+	}
+	defer func() {
+		for _, key := range keys {
+			_ = os.Setenv(key, old[key])
+		}
+	}()
+	_ = os.Setenv("SIMULATION", "true")
+	_ = os.Setenv("ADMIN_PASSWORD", "test-password")
+	_ = os.Setenv("PUMPPORTAL_API_KEY", "test-key")
+	_ = os.Setenv("SNIPE_CONCURRENCY", "8")
+	_ = os.Setenv("SNIPE_TIMEOUT_MS", "9000")
+	_ = os.Setenv("DEDUPE_TTL_MS", "60000")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SnipeConcurrency != 8 || cfg.SnipeTimeoutMS != 9000 || cfg.DedupeTTLMS != 60000 {
+		t.Fatalf("snipe settings = (%d, %d, %d)", cfg.SnipeConcurrency, cfg.SnipeTimeoutMS, cfg.DedupeTTLMS)
+	}
+
+	_ = os.Setenv("SNIPE_CONCURRENCY", "0")
+	if _, err = Load(); err == nil || !strings.Contains(err.Error(), "SNIPE_CONCURRENCY") {
+		t.Fatalf("invalid concurrency was not rejected: %v", err)
 	}
 }
 

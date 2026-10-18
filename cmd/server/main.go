@@ -98,6 +98,9 @@ func main() {
 			EntryDelay:        time.Duration(cfg.EntryDelaySeconds) * time.Second,
 			MinTransactions:   cfg.MinTxnsBeforeBuy,
 			PricePollInterval: time.Duration(cfg.PricePollSeconds) * time.Second,
+			SnipeConcurrency:  cfg.SnipeConcurrency,
+			SnipeTimeout:      time.Duration(cfg.SnipeTimeoutMS) * time.Millisecond,
+			DedupeTTL:         time.Duration(cfg.DedupeTTLMS) * time.Millisecond,
 			BondingCurve:      rpcs,
 		},
 	)

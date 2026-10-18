@@ -2,12 +2,17 @@ package rpcmanager
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gagliardetto/solana-go"
 )
 
 func TestRPCRejectsRateLimitAndForbidden(t *testing.T) {
@@ -89,5 +94,66 @@ func TestCheckMarksRPCUnavailableWhenEveryEndpointFails(t *testing.T) {
 	m.Check(context.Background())
 	if m.Available() {
 		t.Fatal("an endpoint that failed its latest health check must not remain available")
+	}
+}
+
+func TestGetBondingCurveStateReadsAndDecodesRPCAccount(t *testing.T) {
+	discriminator := sha256.Sum256([]byte("account:BondingCurve"))
+	data := make([]byte, 49)
+	copy(data[:8], discriminator[:8])
+	binary.LittleEndian.PutUint64(data[8:16], 2_000_000)
+	binary.LittleEndian.PutUint64(data[16:24], 1_000_000_000)
+	binary.LittleEndian.PutUint64(data[24:32], 1_500_000)
+	binary.LittleEndian.PutUint64(data[32:40], 750_000_000)
+	binary.LittleEndian.PutUint64(data[40:48], 2_000_000)
+	data[48] = 1
+
+	var requestedMethod, requestedCurve string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode RPC request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		requestedMethod = request.Method
+		if len(request.Params) != 2 {
+			t.Errorf("getAccountInfo params = %d; want 2", len(request.Params))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if err := json.Unmarshal(request.Params[0], &requestedCurve); err != nil {
+			t.Errorf("decode bonding-curve address: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"value":{"owner":"` + pumpFunProgramID + `","data":["` + base64.StdEncoding.EncodeToString(data) + `","base64"]}}}`))
+	}))
+	defer server.Close()
+
+	manager := &Manager{
+		endpoints: []Endpoint{{URL: server.URL}},
+		current:   0,
+		client:    server.Client(),
+	}
+	mint := solana.MustPublicKeyFromBase58("So11111111111111111111111111111111111111112").String()
+	state, err := manager.GetBondingCurveState(context.Background(), mint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requestedMethod != "getAccountInfo" {
+		t.Fatalf("RPC method = %q, want getAccountInfo", requestedMethod)
+	}
+	if requestedCurve == "" {
+		t.Fatal("RPC did not receive the derived bonding-curve PDA")
+	}
+	if state.VirtualTokenReserves != 2_000_000 || state.VirtualSOLReserves != 1_000_000_000 ||
+		state.RealTokenReserves != 1_500_000 || state.RealSOLReserves != 750_000_000 ||
+		state.TokenSupply != 2_000_000 || !state.Complete || state.MarketCapSOL != 1 {
+		t.Fatalf("decoded bonding curve state = %+v", state)
 	}
 }

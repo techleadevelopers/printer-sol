@@ -22,7 +22,7 @@ type DB struct {
 	*sql.DB
 	postgres bool
 	// markMu serializes WebSocket and public-API updates to mark rows.
-	markMu   sync.Mutex
+	markMu sync.Mutex
 }
 
 func Open(target string) (*DB, error) {
@@ -78,11 +78,11 @@ func (d *DB) Migrate() error {
 			if d.postgres {
 				appliedAt = time.Now().UTC()
 			}
-		recordMigration := "INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)"
-		if d.postgres {
-			recordMigration += " ON CONFLICT(version) DO NOTHING"
-		}
-		_, e = tx.Exec(d.bind(recordMigration), n, appliedAt)
+			recordMigration := "INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)"
+			if d.postgres {
+				recordMigration += " ON CONFLICT(version) DO NOTHING"
+			}
+			_, e = tx.Exec(d.bind(recordMigration), n, appliedAt)
 		}
 		if e != nil {
 			_ = tx.Rollback()
@@ -260,6 +260,10 @@ func (d *DB) FinalizeSimulationSell(id, mint string, value float64, feesOpt ...f
 	if err = tx.QueryRow(d.bind(`SELECT COALESCE(cost_sol,0) FROM positions WHERE mint=? AND status='open'`), mint).Scan(&cost); err != nil {
 		return err
 	}
+	var exitReason string
+	if err = tx.QueryRow(d.bind(`SELECT COALESCE(exit_reason,'') FROM trades WHERE id=? AND side='sell'`), id).Scan(&exitReason); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	fees := 0.0
 	if len(feesOpt) > 0 {
@@ -285,6 +289,9 @@ func (d *DB) FinalizeSimulationSell(id, mint string, value float64, feesOpt ...f
 		return fmt.Errorf("simulated sell trade %q not found", id)
 	}
 	if _, err = tx.Exec(d.bind(`UPDATE transactions SET state='simulated',updated_at=? WHERE trade_id=?`), now, id); err != nil {
+		return err
+	}
+	if err = blacklistCreatorAfterStopLoss(tx, d, mint, exitReason, now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -329,6 +336,10 @@ func (d *DB) FinalizeLiveSell(id, mint, state, signature string, value, fees flo
 	if cost <= 0 {
 		return fmt.Errorf("invalid confirmed live position cost")
 	}
+	var exitReason string
+	if err = tx.QueryRow(d.bind(`SELECT COALESCE(exit_reason,'') FROM trades WHERE id=? AND side='sell'`), id).Scan(&exitReason); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=? AND status='open'`), now, mint)
 	if err != nil {
@@ -342,7 +353,54 @@ func (d *DB) FinalizeLiveSell(id, mint, state, signature string, value, fees flo
 	if err = updateExecutedTrade(tx, d, id, state, signature, value, fees, value-cost, now); err != nil {
 		return err
 	}
+	if err = blacklistCreatorAfterStopLoss(tx, d, mint, exitReason, now); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func blacklistCreatorAfterStopLoss(tx *sql.Tx, d *DB, mint, reason string, now time.Time) error {
+	normalizedReason := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(reason)), "-", " ")
+	if !strings.Contains(normalizedReason, "stop loss") {
+		return nil
+	}
+	var creator sql.NullString
+	err := tx.QueryRow(d.bind(`SELECT creator FROM token_events WHERE mint=? AND TRIM(COALESCE(creator,''))<>'' ORDER BY received_at DESC LIMIT 1`), mint).Scan(&creator)
+	if err == sql.ErrNoRows || (err == nil && (!creator.Valid || strings.TrimSpace(creator.String) == "")) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	blockedUntil := any(now.Add(24 * time.Hour))
+	updatedAt := any(now)
+	if !d.postgres {
+		blockedUntil = now.Add(24 * time.Hour).UTC().Format(time.RFC3339Nano)
+		updatedAt = now.UTC().Format(time.RFC3339Nano)
+	}
+	_, err = tx.Exec(d.bind(`INSERT INTO creator_blacklist(creator,blocked_until,source_mint,reason,updated_at)
+		VALUES(?,?,?,?,?)
+		ON CONFLICT(creator) DO UPDATE SET blocked_until=excluded.blocked_until,
+		source_mint=excluded.source_mint,reason=excluded.reason,updated_at=excluded.updated_at`),
+		strings.TrimSpace(creator.String), blockedUntil, mint, reason, updatedAt)
+	return err
+}
+
+// IsCreatorBlacklisted reports whether this creator has an active 24-hour
+// block from a closed stop-loss. Expired rows remain as an audit trail.
+func (d *DB) IsCreatorBlacklisted(creator string) (bool, error) {
+	creator = strings.TrimSpace(creator)
+	if creator == "" {
+		return false, nil
+	}
+	now := any(time.Now().UTC())
+	if !d.postgres {
+		now = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	var count int
+	err := d.QueryRow(d.bind(`SELECT COUNT(*) FROM creator_blacklist WHERE creator=? AND blocked_until>?`), creator, now).Scan(&count)
+	return count > 0, err
 }
 
 func updateExecutedTrade(tx *sql.Tx, d *DB, id, state, signature string, executed, fees float64, realized any, now time.Time) error {
@@ -560,8 +618,9 @@ func (d *DB) TradeCount() (int, error) {
 	err := d.QueryRow(`SELECT COUNT(*) FROM trades`).Scan(&count)
 	return count, err
 }
+
 type PerformanceStats struct {
-	ClosedTrades, Winners, Losers int
+	ClosedTrades, Winners, Losers                                                                      int
 	WinRatePct, AvgWinSOL, AvgLossSOL, AvgHoldSeconds, FeesSOL, GrossRealizedPnlSOL, NetRealizedPnlSOL float64
 }
 

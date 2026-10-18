@@ -13,11 +13,12 @@ import (
 
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
-	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, SkipPreflight                                                                                                                                    bool
+	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, SkipPreflight                                                                                                                                   bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
-	EntryDelaySeconds, MinTxnsBeforeBuy, PricePollSeconds                                                                                                                                                 int
+	SnipeConcurrency, SnipeTimeoutMS, DedupeTTLMS                                                                                                                                                           int
+	EntryDelaySeconds, MinTxnsBeforeBuy, PricePollSeconds                                                                                                                                                   int
 	RPCEndpoints                                                                                                                                                                                            []string
 }
 
@@ -98,6 +99,15 @@ func Load() (Config, error) {
 	if c.PricePollSeconds, err = intEnv("PRICE_POLL_SECONDS", 20); err != nil {
 		return c, err
 	}
+	if c.SnipeConcurrency, err = intEnv("SNIPE_CONCURRENCY", 4); err != nil {
+		return c, err
+	}
+	if c.SnipeTimeoutMS, err = intEnv("SNIPE_TIMEOUT_MS", 15000); err != nil {
+		return c, err
+	}
+	if c.DedupeTTLMS, err = intEnv("DEDUPE_TTL_MS", 60000); err != nil {
+		return c, err
+	}
 	tradeUSDDefault := 3.0
 	if !c.Simulation {
 		// Live notional must be an explicit operator decision. Do not silently
@@ -157,6 +167,9 @@ func Load() (Config, error) {
 	}
 	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.MinTxnsBeforeBuy < 1 || c.PricePollSeconds < 1 {
 		return c, fmt.Errorf("queue, position, timing, and entry thresholds must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
+	}
+	if c.SnipeConcurrency < 1 || c.SnipeConcurrency > 64 || c.SnipeTimeoutMS < 1 || c.SnipeTimeoutMS > 120000 || c.DedupeTTLMS < 1 || c.DedupeTTLMS > 3600000 {
+		return c, fmt.Errorf("SNIPE_CONCURRENCY must be 1-64, SNIPE_TIMEOUT_MS must be 1-120000, and DEDUPE_TTL_MS must be 1-3600000")
 	}
 	if c.TokenMaxAgeSeconds > 0 && c.TokenMaxAgeSeconds <= c.EntryDelaySeconds {
 		return c, fmt.Errorf("TOKEN_MAX_AGE_SECONDS must be greater than ENTRY_DELAY_SECONDS")

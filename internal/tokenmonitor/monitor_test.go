@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,9 +16,37 @@ import (
 )
 
 type recordingEntrier struct {
-	liveExitCalls int
+	liveExitCalls    int
 	liveExitFailures int
-	buyCalls      int
+	buyCalls         int
+}
+
+type concurrentEntrier struct {
+	active  atomic.Int32
+	maximum atomic.Int32
+	started chan struct{}
+	release chan struct{}
+}
+
+func (e *concurrentEntrier) BuyNewTokenUSD(ctx context.Context, _ string, _, _, _ float64, _, _ string) (string, error) {
+	active := e.active.Add(1)
+	for previous := e.maximum.Load(); active > previous && !e.maximum.CompareAndSwap(previous, active); previous = e.maximum.Load() {
+	}
+	e.started <- struct{}{}
+	defer e.active.Add(-1)
+	select {
+	case <-e.release:
+		return "trade", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (e *concurrentEntrier) ClosePaperPosition(context.Context, string, float64, string) (string, error) {
+	return "", nil
+}
+func (e *concurrentEntrier) CloseLivePosition(context.Context, string, float64, float64, string) (string, error) {
+	return "", nil
 }
 
 func TestSeenMintIsDeduplicatedOnlyWithinRetentionWindow(t *testing.T) {
@@ -140,6 +169,103 @@ func TestConsumeSubmitsEntryBeforeRunningRiskScreen(t *testing.T) {
 	case <-screenDone:
 	case <-time.After(time.Second):
 		t.Fatal("post-entry risk screen did not finish")
+	}
+}
+
+func TestSnipeQueueProcessesNoMoreThanConfiguredConcurrency(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "snipe-concurrency.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	entry := &concurrentEntrier{started: make(chan struct{}, 4), release: make(chan struct{}, 4)}
+	monitor := New("", "", 8, db, strategy.New(db, time.Minute), entry,
+		1, 0, 0, 50, 25, time.Minute, true, events.New(), zap.NewNop(),
+		Settings{SnipeConcurrency: 2, SnipeTimeout: 2 * time.Second, DedupeTTL: time.Minute})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		monitor.consume(ctx)
+		close(done)
+	}()
+	for _, mint := range []string{"parallel-mint-one", "parallel-mint-two"} {
+		queued, reason := monitor.enqueueSnipe(Event{
+			Mint: mint, Received: time.Now().UTC(), Created: time.Now().UTC(),
+			MarketCapSOL: 100, Raw: `{"mint":"` + mint + `"}`,
+		})
+		if !queued {
+			cancel()
+			t.Fatalf("enqueue %s: %s", mint, reason)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entry.started:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("both configured snipe workers did not start")
+		}
+	}
+	if maximum := entry.maximum.Load(); maximum != 2 {
+		cancel()
+		t.Fatalf("maximum concurrent entries = %d; want 2", maximum)
+	}
+	entry.release <- struct{}{}
+	entry.release <- struct{}{}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("snipe workers did not stop after cancellation")
+	}
+}
+
+func TestSnipeQueueExpiresStaleEventsBeforeEntry(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "snipe-ttl.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	bus := events.New()
+	eventStream, unsubscribe := bus.Subscribe()
+	defer unsubscribe()
+	entry := &recordingEntrier{}
+	monitor := New("", "", 8, db, strategy.New(db, time.Minute), entry,
+		1, 0, 0, 50, 25, time.Minute, true, bus, zap.NewNop(),
+		Settings{SnipeConcurrency: 1, SnipeTimeout: time.Second, DedupeTTL: 40 * time.Millisecond})
+	queued, reason := monitor.enqueueSnipe(Event{
+		Mint: "expired-snipe", Received: time.Now().UTC(), Created: time.Now().UTC(),
+		MarketCapSOL: 100, Raw: `{"mint":"expired-snipe"}`,
+	})
+	if !queued {
+		t.Fatalf("enqueue stale-event test: %s", reason)
+	}
+	time.Sleep(60 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		monitor.consume(ctx)
+		close(done)
+	}()
+	select {
+	case event := <-eventStream:
+		if event.Type != "token_rejected" {
+			t.Fatalf("stale queue event type = %q, want token_rejected", event.Type)
+		}
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("expired queue item was not rejected")
+	}
+	cancel()
+	<-done
+	if entry.buyCalls != 0 {
+		t.Fatalf("expired queue item attempted %d entries", entry.buyCalls)
 	}
 }
 

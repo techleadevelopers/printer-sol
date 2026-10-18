@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	candidateCheckWorkers      = 8
-	pricePollWorkers           = 5
+	candidateCheckWorkers = 8
+	pricePollWorkers      = 5
 )
 
 type candidateState struct {
@@ -106,6 +106,64 @@ func (m *Monitor) uncheckCandidate(mint string) {
 	m.candidateMu.Unlock()
 }
 
+func (m *Monitor) enqueueSnipe(event Event) (bool, string) {
+	now := time.Now().UTC()
+	ttl := m.dedupeTTL
+	if ttl <= 0 {
+		ttl = 60 * time.Second
+	}
+	m.snipeMu.Lock()
+	m.pruneSnipeDedupeLocked(now, ttl)
+	if _, duplicate := m.snipePending[event.Mint]; duplicate {
+		m.snipeMu.Unlock()
+		return false, "duplicate snipe suppressed within dedupe TTL"
+	}
+	event.queuedAt = now
+	m.snipePending[event.Mint] = now
+	select {
+	case m.q <- event:
+		m.snipeMu.Unlock()
+		return true, ""
+	default:
+		delete(m.snipePending, event.Mint)
+		m.snipeMu.Unlock()
+		return false, "token queue full after activity validation"
+	}
+}
+
+func (m *Monitor) pruneSnipeDedupe(now time.Time) {
+	ttl := m.dedupeTTL
+	if ttl <= 0 {
+		ttl = 60 * time.Second
+	}
+	m.snipeMu.Lock()
+	m.pruneSnipeDedupeLocked(now, ttl)
+	m.snipeMu.Unlock()
+}
+
+func (m *Monitor) pruneSnipeDedupeLocked(now time.Time, ttl time.Duration) {
+	for mint, queuedAt := range m.snipePending {
+		if now.Sub(queuedAt) >= ttl {
+			delete(m.snipePending, mint)
+		}
+	}
+}
+
+func (m *Monitor) creatorBlacklistReason(creator string) string {
+	if strings.TrimSpace(creator) == "" {
+		return ""
+	}
+	blocked, err := m.db.IsCreatorBlacklisted(creator)
+	if err != nil {
+		m.log.Warn("check creator stop-loss blacklist", zap.String("creator", creator), zap.Error(err))
+		return "creator blacklist unavailable; entry blocked"
+	}
+	if blocked {
+		return "creator blocked for 24 hours after a stop-loss"
+	}
+	return ""
+}
+
 func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 	generation := m.resetGeneration.Load()
 	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
@@ -152,7 +210,7 @@ func (m *Monitor) finishCandidate(mint string, rpcMarketCapSOL float64) {
 		return
 	}
 	state := candidateState{
-		event: item.event,
+		event:       item.event,
 		tradeEvents: item.tradeEvents, tradeMarketCapSOL: item.tradeMarketCapSOL,
 	}
 	delete(m.candidates, mint)
@@ -171,16 +229,19 @@ func (m *Monitor) finishCandidate(mint string, rpcMarketCapSOL float64) {
 		m.rejectCandidate(state.event, reason)
 		return
 	}
+	if reason := m.creatorBlacklistReason(state.event.Creator); reason != "" {
+		m.rejectCandidate(state.event, reason)
+		return
+	}
 	if marketCapSOL <= 0 {
 		m.rejectCandidate(state.event, "candidate has no positive market cap")
 		return
 	}
 	state.event.MarketCapSOL = marketCapSOL
-	select {
-	case m.q <- state.event:
-	default:
-		m.rejectCandidate(state.event, "token queue full after activity validation")
-		m.log.Warn("validated token queue full", zap.String("mint", mint))
+	queued, enqueueReason := m.enqueueSnipe(state.event)
+	if !queued {
+		m.rejectCandidate(state.event, enqueueReason)
+		m.log.Warn("validated token not queued", zap.String("mint", mint), zap.String("reason", enqueueReason))
 	}
 }
 

@@ -138,6 +138,26 @@ func TestCandidateGateUsesRPCAfterTwoWebSocketTradesWithoutMark(t *testing.T) {
 	}
 }
 
+func TestSnipeQueueDeduplicationExpiresAfterConfiguredTTL(t *testing.T) {
+	monitor, closeDB := newMarketDataTestMonitor(t)
+	defer closeDB()
+	monitor.dedupeTTL = 20 * time.Millisecond
+	event := testCandidate("deduplicated-snipe")
+
+	if queued, reason := monitor.enqueueSnipe(event); !queued {
+		t.Fatalf("first enqueue rejected: %s", reason)
+	}
+	if queued, reason := monitor.enqueueSnipe(event); queued || reason != "duplicate snipe suppressed within dedupe TTL" {
+		t.Fatalf("duplicate enqueue = (%v, %q); want a TTL duplicate rejection", queued, reason)
+	}
+	<-monitor.q
+
+	monitor.pruneSnipeDedupe(time.Now().UTC().Add(21 * time.Millisecond))
+	if queued, reason := monitor.enqueueSnipe(event); !queued {
+		t.Fatalf("enqueue after dedupe TTL rejected: %s", reason)
+	}
+}
+
 func TestCandidateGateRejectsWebSocketFallbackWithoutTwoTrades(t *testing.T) {
 	monitor, closeDB := newMarketDataTestMonitor(t)
 	defer closeDB()
