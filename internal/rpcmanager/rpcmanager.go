@@ -304,6 +304,12 @@ func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint stri
 		TokenSupply:          binary.LittleEndian.Uint64(data[40:48]),
 		Complete:             data[48] != 0,
 	}
+	if state.RealSOLReserves == 0 && m.log != nil {
+		m.log.Debug("bonding-curve real_sol_reserves decoded as zero",
+			zap.String("mint", mint),
+			zap.Int("data_len", len(data)),
+			zap.String("first_48_bytes_hex", fmt.Sprintf("%x", data[:48])))
+	}
 	if state.VirtualTokenReserves == 0 || state.VirtualSOLReserves == 0 || state.TokenSupply == 0 {
 		return BondingCurveState{}, fmt.Errorf("Pump.fun bonding-curve reserves or supply are zero")
 	}
