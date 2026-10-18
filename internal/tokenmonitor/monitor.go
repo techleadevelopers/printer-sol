@@ -17,14 +17,15 @@ import (
 )
 
 type Event struct {
-	Mint     string `json:"mint"`
-	Creator  string `json:"creator"`
-	User     string `json:"user"`
-	Received time.Time
-	Created  time.Time
+	Mint         string `json:"mint"`
+	Creator      string `json:"creator"`
+	User         string `json:"user"`
+	Received     time.Time
+	Created      time.Time
 	MarketCapSOL float64
-	Raw      string
+	Raw          string
 }
+
 // Entrier is implemented by the execution engine. Keeping the dependency as
 // an interface lets discovery remain independent from transaction signing.
 type Entrier interface {
@@ -32,25 +33,38 @@ type Entrier interface {
 	ClosePaperPosition(context.Context, string, float64, string) (string, error)
 }
 type Monitor struct {
-	ws, key   string
-	q         chan Event
-	db        *database.DB
-	strategy  *strategy.Strategy
-	bus       *events.Bus
-	log       *zap.Logger
-	entry     Entrier
+	ws, key                         string
+	q                               chan Event
+	db                              *database.DB
+	strategy                        *strategy.Strategy
+	bus                             *events.Bus
+	log                             *zap.Logger
+	entry                           Entrier
 	tradeUSD, slippage, priorityFee float64
-	takeProfit float64
-	subscriptions chan string
-	tracked sync.Map
-	seen      sync.Map
-	connected atomic.Bool
+	takeProfit                      float64
+	subscriptions                   chan string
+	tracked                         sync.Map
+	seen                            sync.Map
+	connected                       atomic.Bool
 }
 
 func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit float64, b *events.Bus, l *zap.Logger) *Monitor {
 	return &Monitor{ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry, tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee, takeProfit: takeProfit, subscriptions: make(chan string, size), bus: b, log: l}
 }
 func (m *Monitor) Run(ctx context.Context) {
+	// Tracked mints are in-memory subscriptions. Restore them after a restart
+	// so persisted simulation positions keep receiving live price marks and can
+	// be closed when their take-profit is reached.
+	if mints, err := m.db.OpenPositionMints(); err != nil {
+		m.log.Warn("restore simulated positions", zap.Error(err))
+	} else {
+		for _, mint := range mints {
+			m.tracked.Store(mint, struct{}{})
+		}
+		if len(mints) > 0 {
+			m.log.Info("restored simulated positions", zap.Int("count", len(mints)))
+		}
+	}
 	go m.consume(ctx)
 	backoff := time.Second
 	for ctx.Err() == nil {
@@ -92,22 +106,31 @@ func (m *Monitor) connect(ctx context.Context) error {
 	go func() {
 		for {
 			select {
-			case <-writerDone: return
+			case <-writerDone:
+				return
 			case mint := <-m.subscriptions:
-				if err := c.WriteJSON(map[string]any{"method": "subscribeTokenTrade", "keys": []string{mint}}); err != nil { return }
+				if err := c.WriteJSON(map[string]any{"method": "subscribeTokenTrade", "keys": []string{mint}}); err != nil {
+					return
+				}
 			}
 		}
 	}()
-	m.tracked.Range(func(key, _ any) bool { select { case m.subscriptions <- key.(string): default: }; return true })
+	m.tracked.Range(func(key, _ any) bool {
+		select {
+		case m.subscriptions <- key.(string):
+		default:
+		}
+		return true
+	})
 	for {
 		_, b, err := c.ReadMessage()
 		if err != nil {
 			return err
 		}
 		var d struct {
-			Mint, Creator, User string
+			Mint, Creator, User                    string
 			CreatedTimestamp, Timestamp, BlockTime json.RawMessage
-			MarketCapSol float64 `json:"marketCapSol"`
+			MarketCapSol                           float64 `json:"marketCapSol"`
 		}
 		if err = json.Unmarshal(b, &d); err != nil || d.Mint == "" {
 			m.log.Warn("invalid token event", zap.Error(err))
@@ -123,7 +146,9 @@ func (m *Monitor) connect(ctx context.Context) error {
 		}
 		received := time.Now().UTC()
 		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
-		if created.IsZero() { created = received }
+		if created.IsZero() {
+			created = received
+		}
 		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
 		if _, loaded := m.seen.LoadOrStore(e.Mint, true); loaded {
 			continue
@@ -166,9 +191,15 @@ func (m *Monitor) consume(ctx context.Context) {
 			if assessmentErr := m.db.RecordAssessment(e.Mint, true, reason); assessmentErr != nil {
 				m.log.Warn("record entered-token assessment", zap.Error(assessmentErr))
 			}
-			if err := m.db.RecordPaperMark(e.Mint, e.MarketCapSOL); err != nil { m.log.Warn("record paper mark", zap.Error(err)) }
+			if err := m.db.RecordPaperMark(e.Mint, e.MarketCapSOL); err != nil {
+				m.log.Warn("record paper mark", zap.Error(err))
+			}
 			m.tracked.Store(e.Mint, struct{}{})
-			select { case m.subscriptions <- e.Mint: default: m.log.Warn("token trade subscription queue full", zap.String("mint", e.Mint)) }
+			select {
+			case m.subscriptions <- e.Mint:
+			default:
+				m.log.Warn("token trade subscription queue full", zap.String("mint", e.Mint))
+			}
 			m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 			m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": true})
 		}
@@ -178,14 +209,27 @@ func (m *Monitor) consume(ctx context.Context) {
 func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float64) {
 	// Some creation events omit marketCapSol. In that case the first live trade
 	// establishes the paper entry mark rather than fabricating a price.
-	if err := m.db.RecordPaperMark(mint, marketCapSOL); err != nil { m.log.Warn("record missing paper mark", zap.Error(err)); return }
-	if err := m.db.UpdatePaperMark(mint, marketCapSOL); err != nil { m.log.Warn("update paper mark", zap.Error(err)); return }
+	if err := m.db.RecordPaperMark(mint, marketCapSOL); err != nil {
+		m.log.Warn("record missing paper mark", zap.Error(err))
+		return
+	}
+	if err := m.db.UpdatePaperMark(mint, marketCapSOL); err != nil {
+		m.log.Warn("update paper mark", zap.Error(err))
+		return
+	}
 	returnPct, known, err := m.db.PaperReturnPct(mint)
-	if err != nil || !known { return }
+	if err != nil || !known {
+		return
+	}
 	m.bus.Publish("paper_mark_updated", map[string]any{"mint": mint, "marketCapSol": marketCapSOL, "returnPct": returnPct, "takeProfitPct": m.takeProfit})
-	if returnPct < m.takeProfit { return }
+	if returnPct < m.takeProfit {
+		return
+	}
 	id, err := m.entry.ClosePaperPosition(ctx, mint, returnPct, "take profit reached in simulation")
-	if err != nil { m.log.Warn("paper take-profit exit", zap.String("mint", mint), zap.Error(err)); return }
+	if err != nil {
+		m.log.Warn("paper take-profit exit", zap.String("mint", mint), zap.Error(err))
+		return
+	}
 	m.tracked.Delete(mint)
 	m.bus.Publish("paper_take_profit", map[string]any{"mint": mint, "tradeId": id, "returnPct": returnPct})
 }
@@ -195,19 +239,29 @@ func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float
 // stream; its receipt time then becomes the creation-time upper bound.
 func timestampFromEvent(values ...json.RawMessage) time.Time {
 	for _, raw := range values {
-		if len(raw) == 0 || string(raw) == "null" { continue }
+		if len(raw) == 0 || string(raw) == "null" {
+			continue
+		}
 		var numeric float64
 		if json.Unmarshal(raw, &numeric) == nil && numeric > 0 {
-			if numeric > 1e12 { numeric /= 1000 }
+			if numeric > 1e12 {
+				numeric /= 1000
+			}
 			return time.Unix(int64(numeric), 0).UTC()
 		}
 		var text string
-		if json.Unmarshal(raw, &text) != nil { continue }
+		if json.Unmarshal(raw, &text) != nil {
+			continue
+		}
 		if numeric, err := strconv.ParseFloat(strings.TrimSpace(text), 64); err == nil && numeric > 0 {
-			if numeric > 1e12 { numeric /= 1000 }
+			if numeric > 1e12 {
+				numeric /= 1000
+			}
 			return time.Unix(int64(numeric), 0).UTC()
 		}
-		if parsed, err := time.Parse(time.RFC3339, text); err == nil { return parsed.UTC() }
+		if parsed, err := time.Parse(time.RFC3339, text); err == nil {
+			return parsed.UTC()
+		}
 	}
 	return time.Time{}
 }

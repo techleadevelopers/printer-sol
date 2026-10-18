@@ -4,8 +4,8 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
-	"io/fs"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"io/fs"
 	_ "modernc.org/sqlite"
 	"os"
 	"path/filepath"
@@ -17,27 +17,36 @@ import (
 //go:embed migrations/*.sql migrations/postgres/*.sql
 var migrations embed.FS
 
-type DB struct { *sql.DB; postgres bool }
+type DB struct {
+	*sql.DB
+	postgres bool
+}
 
 func Open(target string) (*DB, error) {
 	postgres := strings.HasPrefix(target, "postgres://") || strings.HasPrefix(target, "postgresql://")
 	if !postgres {
-	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil && filepath.Dir(target) != "." {
-		return nil, err
-	}
+		if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil && filepath.Dir(target) != "." {
+			return nil, err
+		}
 	}
 	driver := "sqlite"
-	if postgres { driver = "pgx" }
+	if postgres {
+		driver = "pgx"
+	}
 	d, e := sql.Open(driver, target)
 	if e != nil {
 		return nil, e
 	}
-	if !postgres { d.SetMaxOpenConns(1) }
+	if !postgres {
+		d.SetMaxOpenConns(1)
+	}
 	return &DB{d, postgres}, d.Ping()
 }
 func (d *DB) Migrate() error {
 	pattern := "migrations/*.sql"
-	if d.postgres { pattern = "migrations/postgres/*.sql" }
+	if d.postgres {
+		pattern = "migrations/postgres/*.sql"
+	}
 	files, e := fs.Glob(migrations, pattern)
 	if e != nil {
 		return e
@@ -63,7 +72,9 @@ func (d *DB) Migrate() error {
 		}
 		if _, e = tx.Exec(string(b)); e == nil {
 			appliedAt := any(time.Now().UTC().Format(time.RFC3339Nano))
-			if d.postgres { appliedAt = time.Now().UTC() }
+			if d.postgres {
+				appliedAt = time.Now().UTC()
+			}
 			_, e = tx.Exec(d.bind("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)"), n, appliedAt)
 		}
 		if e != nil {
@@ -130,9 +141,13 @@ func (d *DB) HasPurchaseForMint(mint string) (bool, error) {
 }
 func (d *DB) RecordEvent(mint, creator, raw string, at time.Time, latency int64) error {
 	query := `INSERT OR IGNORE INTO token_events(mint,creator,received_at,raw_json,latency_ms) VALUES(?,?,?,?,?)`
-	if d.postgres { query = `INSERT INTO token_events(mint,creator,received_at,raw_json,latency_ms) VALUES(?,?,?,?,?) ON CONFLICT (mint, received_at) DO NOTHING` }
+	if d.postgres {
+		query = `INSERT INTO token_events(mint,creator,received_at,raw_json,latency_ms) VALUES(?,?,?,?,?) ON CONFLICT (mint, received_at) DO NOTHING`
+	}
 	receivedAt := any(at.UTC().Format(time.RFC3339Nano))
-	if d.postgres { receivedAt = at.UTC() }
+	if d.postgres {
+		receivedAt = at.UTC()
+	}
 	_, e := d.Exec(d.bind(query), mint, creator, receivedAt, raw, latency)
 	return e
 }
@@ -169,23 +184,33 @@ func (d *DB) OpenSimulationPosition(mint string, amount float64) error {
 	return e
 }
 func (d *DB) RecordPaperMark(mint string, marketCapSOL float64) error {
-	if marketCapSOL <= 0 { return nil }
+	if marketCapSOL <= 0 {
+		return nil
+	}
 	now := time.Now().UTC()
 	_, e := d.Exec(d.bind(`INSERT INTO paper_marks(mint,entry_market_cap_sol,current_market_cap_sol,updated_at) VALUES(?,?,?,?) ON CONFLICT(mint) DO NOTHING`), mint, marketCapSOL, marketCapSOL, now)
 	return e
 }
 func (d *DB) UpdatePaperMark(mint string, marketCapSOL float64) error {
-	if marketCapSOL <= 0 { return nil }
+	if marketCapSOL <= 0 {
+		return nil
+	}
 	_, e := d.Exec(d.bind(`UPDATE paper_marks SET current_market_cap_sol=?,updated_at=? WHERE mint=?`), marketCapSOL, time.Now().UTC(), mint)
 	return e
 }
 func (d *DB) PaperReturnPct(mint string) (float64, bool, error) {
 	var entry, current float64
 	e := d.QueryRow(d.bind(`SELECT entry_market_cap_sol,current_market_cap_sol FROM paper_marks WHERE mint=?`), mint).Scan(&entry, &current)
-	if e == sql.ErrNoRows { return 0, false, nil }
-	if e != nil { return 0, false, e }
-	if entry <= 0 { return 0, false, nil }
-	return (current-entry)/entry*100, true, nil
+	if e == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if e != nil {
+		return 0, false, e
+	}
+	if entry <= 0 {
+		return 0, false, nil
+	}
+	return (current - entry) / entry * 100, true, nil
 }
 func (d *DB) PositionCost(mint string) (float64, error) {
 	var cost float64
@@ -194,13 +219,21 @@ func (d *DB) PositionCost(mint string) (float64, error) {
 }
 func (d *DB) CloseSimulationPosition(mint string, value float64) (float64, error) {
 	tx, e := d.Begin()
-	if e != nil { return 0, e }
+	if e != nil {
+		return 0, e
+	}
 	var cost float64
 	if e = tx.QueryRow(d.bind(`SELECT COALESCE(cost_sol,0) FROM positions WHERE mint=? AND status='open'`), mint).Scan(&cost); e != nil {
-		_ = tx.Rollback(); return 0, e
+		_ = tx.Rollback()
+		return 0, e
 	}
-	if _, e = tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=?`), time.Now().UTC(), mint); e != nil { _ = tx.Rollback(); return 0, e }
-	if e = tx.Commit(); e != nil { return 0, e }
+	if _, e = tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=?`), time.Now().UTC(), mint); e != nil {
+		_ = tx.Rollback()
+		return 0, e
+	}
+	if e = tx.Commit(); e != nil {
+		return 0, e
+	}
 	return cost, nil
 }
 func (d *DB) SetTradePnl(id string, executed, pnl float64) error {
@@ -220,6 +253,22 @@ func (d *DB) RealizedPnlSOL() (float64, error) {
 func (d *DB) ListPositions() (*sql.Rows, error) {
 	return d.Query(`SELECT p.mint,p.quantity,COALESCE(p.cost_sol,0),p.status,p.opened_at,p.updated_at,COALESCE(m.entry_market_cap_sol,0),COALESCE(m.current_market_cap_sol,0) FROM positions p LEFT JOIN paper_marks m ON m.mint=p.mint ORDER BY p.updated_at DESC`)
 }
+func (d *DB) OpenPositionMints() ([]string, error) {
+	rows, err := d.Query(`SELECT mint FROM positions WHERE status='open'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	mints := make([]string, 0)
+	for rows.Next() {
+		var mint string
+		if err := rows.Scan(&mint); err != nil {
+			return nil, err
+		}
+		mints = append(mints, mint)
+	}
+	return mints, rows.Err()
+}
 func (d *DB) OpenPositionCount() (int, error) {
 	var n int
 	e := d.QueryRow(`SELECT COUNT(*) FROM positions WHERE status='open'`).Scan(&n)
@@ -228,7 +277,9 @@ func (d *DB) OpenPositionCount() (int, error) {
 func (d *DB) UnknownTradeCount() (int, error) {
 	var n int
 	query := `SELECT COUNT(*) FROM trades WHERE state='unknown' OR reconciliation_needed=1`
-	if d.postgres { query = `SELECT COUNT(*) FROM trades WHERE state='unknown' OR reconciliation_needed=TRUE` }
+	if d.postgres {
+		query = `SELECT COUNT(*) FROM trades WHERE state='unknown' OR reconciliation_needed=TRUE`
+	}
 	e := d.QueryRow(query).Scan(&n)
 	return n, e
 }
@@ -245,7 +296,9 @@ func (d *DB) DailyRealizedLossSOL() (float64, error) {
 func (d *DB) ReconciliationRequired() (bool, error) { n, e := d.UnknownTradeCount(); return n > 0, e }
 func (d *DB) UnreconciledTrades() (*sql.Rows, error) {
 	query := `SELECT id,COALESCE(signature,''),state FROM trades WHERE reconciliation_needed=1 ORDER BY created_at ASC`
-	if d.postgres { query = `SELECT id,COALESCE(signature,''),state FROM trades WHERE reconciliation_needed=TRUE ORDER BY created_at ASC` }
+	if d.postgres {
+		query = `SELECT id,COALESCE(signature,''),state FROM trades WHERE reconciliation_needed=TRUE ORDER BY created_at ASC`
+	}
 	return d.Query(query)
 }
 func (d *DB) LogOperational(level, eventType, message string, payload string) error {
@@ -261,11 +314,18 @@ func (d *DB) Settings() (*sql.Rows, error) {
 }
 
 func (d *DB) bind(query string) string {
-	if !d.postgres { return query }
+	if !d.postgres {
+		return query
+	}
 	var out strings.Builder
 	index := 1
 	for _, char := range query {
-		if char == '?' { out.WriteByte('$'); out.WriteString(strconv.Itoa(index)); index++; continue }
+		if char == '?' {
+			out.WriteByte('$')
+			out.WriteString(strconv.Itoa(index))
+			index++
+			continue
+		}
 		out.WriteRune(char)
 	}
 	return out.String()
