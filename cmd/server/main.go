@@ -96,7 +96,6 @@ func main() {
 		time.Duration(cfg.MaxHoldSeconds)*time.Second, cfg.Simulation, bus, log,
 		tokenmonitor.Settings{
 			EntryDelay:            time.Duration(cfg.EntryDelaySeconds) * time.Second,
-			MinTransactions:       cfg.MinTxnsBeforeBuy,
 			MinVolumeBeforeBuySOL: cfg.MinVolumeBeforeBuySOL,
 			MinMarketCapSOL:       cfg.MinMarketCapSOL,
 			PricePollInterval:     time.Duration(cfg.PricePollSeconds) * time.Second,

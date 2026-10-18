@@ -173,7 +173,8 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 		"MAX_TRADE_SOL", "MAX_DAILY_LOSS_SOL", "FEE_RESERVE_SOL", "MAX_EXPOSURE_SOL",
 		"MAX_SLIPPAGE_PCT", "MAX_PRIORITY_FEE_SOL", "TOKEN_QUEUE_SIZE",
 		"MAX_OPEN_POSITIONS", "MAX_CONFIRMATION_WAIT_SECONDS", "MAX_SUBMISSION_ATTEMPTS",
-		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "ENTRY_DELAY_SECONDS", "MIN_TXNS_BEFORE_BUY",
+		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "ENTRY_DELAY_SECONDS", "MIN_VOLUME_BEFORE_BUY",
+		"MIN_MARKET_CAP_SOL",
 		"PRICE_POLL_SECONDS", "SNIPE_CONCURRENCY", "SNIPE_TIMEOUT_MS", "DEDUPE_TTL_MS",
 		"TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
 		"LIVE_UNLOCK_REQUIRES_PAPER", "SKIP_PREFLIGHT",
@@ -211,8 +212,8 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinTxnsBeforeBuy != 2 || cfg.PricePollSeconds != 20 || cfg.SnipeConcurrency != 4 || cfg.SnipeTimeoutMS != 15000 || cfg.DedupeTTLMS != 60000 || cfg.TokenMaxAgeSeconds != 30 {
-		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f priorityFee=%.9f liveGate=%v skipPreflight=%v entryDelay=%d minTxns=%d pricePoll=%d snipeConcurrency=%d snipeTimeoutMs=%d dedupeTtlMs=%d tokenMaxAge=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.MaxPriorityFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.SkipPreflight, cfg.EntryDelaySeconds, cfg.MinTxnsBeforeBuy, cfg.PricePollSeconds, cfg.SnipeConcurrency, cfg.SnipeTimeoutMS, cfg.DedupeTTLMS, cfg.TokenMaxAgeSeconds)
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinVolumeBeforeBuySOL != .02 || cfg.MinMarketCapSOL != 20 || cfg.PricePollSeconds != 20 || cfg.SnipeConcurrency != 4 || cfg.SnipeTimeoutMS != 15000 || cfg.DedupeTTLMS != 60000 || cfg.TokenMaxAgeSeconds != 30 {
+		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f priorityFee=%.9f liveGate=%v skipPreflight=%v entryDelay=%d minVolumeSOL=%.3f minMarketCapSOL=%.1f pricePoll=%d snipeConcurrency=%d snipeTimeoutMs=%d dedupeTtlMs=%d tokenMaxAge=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.MaxPriorityFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.SkipPreflight, cfg.EntryDelaySeconds, cfg.MinVolumeBeforeBuySOL, cfg.MinMarketCapSOL, cfg.PricePollSeconds, cfg.SnipeConcurrency, cfg.SnipeTimeoutMS, cfg.DedupeTTLMS, cfg.TokenMaxAgeSeconds)
 	}
 
 	_ = os.Setenv("MAX_HOLD_SECONDS", `"120"`)

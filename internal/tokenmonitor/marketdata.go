@@ -16,11 +16,7 @@ const (
 )
 
 type candidateState struct {
-	event             Event
-	tradeEvents       int
-	buyVolumeSOL      float64
-	creatorSold       bool
-	tradeMarketCapSOL float64
+	event Event
 }
 
 func (m *Monitor) addCandidate(event Event) bool {
@@ -40,43 +36,6 @@ func (m *Monitor) addCandidate(event Event) bool {
 		detectedAt = time.Now().UTC()
 	}
 	m.candidates[event.Mint] = &candidate{event: event, detectedAt: detectedAt}
-	return true
-}
-
-// recordCandidateTrade consumes the candidate's own PumpPortal subscription.
-// It counts only actual buy/sell trade frames, never the creation announcement.
-func (m *Monitor) recordCandidateTrade(mint, txType string, marketCapSOL float64) bool {
-	return m.recordCandidateTradeDetails(mint, txType, marketCapSOL, 0, "")
-}
-
-func (m *Monitor) recordCandidateTradeDetails(mint, txType string, marketCapSOL, solAmount float64, trader string) bool {
-	m.candidateMu.Lock()
-	defer m.candidateMu.Unlock()
-	item, exists := m.candidates[mint]
-	if !exists {
-		return false
-	}
-	isTrade := true
-	switch strings.ToLower(strings.TrimSpace(txType)) {
-	case "buy":
-		item.tradeEvents++
-		if solAmount > 0 && !math.IsNaN(solAmount) && !math.IsInf(solAmount, 0) {
-			item.buyVolumeSOL += solAmount
-		}
-	case "sell":
-		item.tradeEvents++
-		creator := strings.TrimSpace(item.event.Creator)
-		if creator != "" && strings.TrimSpace(trader) == creator {
-			item.creatorSold = true
-		}
-	case "trade":
-		item.tradeEvents++
-	default:
-		isTrade = false
-	}
-	if isTrade && marketCapSOL > 0 && !math.IsNaN(marketCapSOL) && !math.IsInf(marketCapSOL, 0) {
-		item.tradeMarketCapSOL = marketCapSOL
-	}
 	return true
 }
 
@@ -191,114 +150,89 @@ func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	state, exists := m.candidateSnapshot(mint)
+	event, exists := m.candidateSnapshot(mint)
 	if !exists {
 		return
 	}
-	marketCapSOL := state.tradeMarketCapSOL
-	if marketCapSOL <= 0 {
-		marketCapSOL = state.event.MarketCapSOL
-	}
-	if state.tradeEvents >= m.minTransactions && marketCapSOL <= 0 {
-		var err error
-		marketCapSOL, err = m.readBondingCurveMarketCap(ctx, mint)
-		if err != nil {
-			m.log.Debug("candidate bonding-curve market-cap lookup failed",
-				zap.String("mint", mint), zap.Error(err))
-		}
-	}
+	marketCapSOL, realSOLReservesSOL, err := m.readBondingCurveEntryMetrics(ctx, mint)
 	if parent.Err() != nil {
 		return
 	}
 	m.runOperationAt(generation, func() {
-		m.finishCandidate(mint, marketCapSOL)
+		m.finishCandidate(mint, event, marketCapSOL, realSOLReservesSOL, err)
 	})
 }
 
-func (m *Monitor) candidateSnapshot(mint string) (candidateState, bool) {
+func (m *Monitor) candidateSnapshot(mint string) (Event, bool) {
 	m.candidateMu.Lock()
 	defer m.candidateMu.Unlock()
 	item := m.candidates[mint]
 	if item == nil {
-		return candidateState{}, false
+		return Event{}, false
 	}
-	return candidateState{
-		event: item.event, tradeEvents: item.tradeEvents,
-		buyVolumeSOL: item.buyVolumeSOL, creatorSold: item.creatorSold,
-		tradeMarketCapSOL: item.tradeMarketCapSOL,
-	}, true
+	return item.event, true
 }
 
-func (m *Monitor) finishCandidate(mint string, rpcMarketCapSOL float64) {
+func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, realSOLReservesSOL float64, rpcErr error) {
 	m.candidateMu.Lock()
 	item := m.candidates[mint]
 	if item == nil {
 		m.candidateMu.Unlock()
 		return
 	}
-	state := candidateState{
-		event:       item.event,
-		tradeEvents: item.tradeEvents, buyVolumeSOL: item.buyVolumeSOL,
-		creatorSold: item.creatorSold, tradeMarketCapSOL: item.tradeMarketCapSOL,
-	}
 	delete(m.candidates, mint)
 	m.candidateMu.Unlock()
 
-	accepted, reason := m.websocketCandidateFallback(state)
-	marketCapSOL := state.tradeMarketCapSOL
-	if marketCapSOL <= 0 {
-		marketCapSOL = rpcMarketCapSOL
-	}
-	if accepted && marketCapSOL <= 0 {
-		accepted = false
-		reason = "candidate has no positive WebSocket or bonding-curve market cap"
-	}
-	if !accepted {
-		m.rejectCandidate(state.event, reason)
+	if rpcErr != nil {
+		m.rejectCandidate(event, "bonding-curve RPC entry check failed: "+rpcErr.Error())
 		return
 	}
-	if strings.TrimSpace(state.event.Creator) == "" {
-		m.rejectCandidate(state.event, "creator wallet unavailable; developer sells cannot be monitored")
+	if rpcMarketCapSOL <= 0 || math.IsNaN(rpcMarketCapSOL) || math.IsInf(rpcMarketCapSOL, 0) {
+		m.rejectCandidate(event, "RPC returned an invalid bonding-curve market cap")
 		return
 	}
-	if state.creatorSold {
-		m.rejectCandidate(state.event, "creator sold during the entry activity window")
+	if realSOLReservesSOL < m.minVolumeBeforeBuySOL {
+		m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL (volume proxy) are below the %.6f SOL minimum", realSOLReservesSOL, m.minVolumeBeforeBuySOL))
 		return
 	}
-	if state.buyVolumeSOL < m.minVolumeBeforeBuySOL {
-		m.rejectCandidate(state.event, fmt.Sprintf("buy volume %.6f SOL is below the %.6f SOL minimum", state.buyVolumeSOL, m.minVolumeBeforeBuySOL))
+	if rpcMarketCapSOL < m.minMarketCapSOL {
+		m.rejectCandidate(event, fmt.Sprintf("bonding-curve market cap %.6f SOL is below the %.6f SOL minimum", rpcMarketCapSOL, m.minMarketCapSOL))
 		return
 	}
-	if reason := m.creatorBlacklistReason(state.event.Creator); reason != "" {
-		m.rejectCandidate(state.event, reason)
+	if reason := m.creatorBlacklistReason(event.Creator); reason != "" {
+		m.rejectCandidate(event, reason)
 		return
 	}
-	if marketCapSOL <= 0 {
-		m.rejectCandidate(state.event, "candidate has no positive market cap")
-		return
-	}
-	if marketCapSOL < m.minMarketCapSOL {
-		m.rejectCandidate(state.event, fmt.Sprintf("market cap %.6f SOL is below the %.6f SOL minimum", marketCapSOL, m.minMarketCapSOL))
-		return
-	}
-	state.event.MarketCapSOL = marketCapSOL
+	event.MarketCapSOL = rpcMarketCapSOL
 	m.log.Info("candidate passed entry activity gate",
 		zap.String("mint", mint),
-		zap.Int("trade_events", state.tradeEvents),
-		zap.Float64("buy_volume_sol", state.buyVolumeSOL),
-		zap.Float64("market_cap_sol", marketCapSOL))
-	queued, enqueueReason := m.enqueueSnipe(state.event)
+		zap.Float64("real_sol_reserves_sol_proxy", realSOLReservesSOL),
+		zap.Float64("market_cap_sol", rpcMarketCapSOL))
+	queued, enqueueReason := m.enqueueSnipe(event)
 	if !queued {
-		m.rejectCandidate(state.event, enqueueReason)
+		m.rejectCandidate(event, enqueueReason)
 		m.log.Warn("validated token not queued", zap.String("mint", mint), zap.String("reason", enqueueReason))
 	}
 }
 
-func (m *Monitor) websocketCandidateFallback(state candidateState) (bool, string) {
-	if state.tradeEvents < m.minTransactions {
-		return false, fmt.Sprintf("fewer than %d WebSocket trades in the entry window", m.minTransactions)
+func (m *Monitor) readBondingCurveEntryMetrics(ctx context.Context, mint string) (float64, float64, error) {
+	if m.bondingCurve == nil {
+		err := fmt.Errorf("bonding-curve RPC source is not configured")
+		m.recordPriceSourceResult(err)
+		return 0, 0, err
 	}
-	return true, "WebSocket activity fallback accepted"
+	marketCapSOL, realSOLReservesSOL, err := m.bondingCurve.BondingCurveEntryMetrics(ctx, mint)
+	if err == nil && (marketCapSOL <= 0 || math.IsNaN(marketCapSOL) || math.IsInf(marketCapSOL, 0)) {
+		err = fmt.Errorf("bonding-curve RPC market cap is not positive and finite")
+	}
+	if err == nil && (realSOLReservesSOL < 0 || math.IsNaN(realSOLReservesSOL) || math.IsInf(realSOLReservesSOL, 0)) {
+		err = fmt.Errorf("bonding-curve real SOL reserves are invalid")
+	}
+	m.recordPriceSourceResult(err)
+	if err != nil {
+		return 0, 0, err
+	}
+	return marketCapSOL, realSOLReservesSOL, nil
 }
 
 func (m *Monitor) bondingCurveMarketCapSOL(ctx context.Context, mint string) (float64, error) {

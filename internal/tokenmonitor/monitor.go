@@ -43,11 +43,11 @@ type unknownTradeReconciler interface {
 
 type BondingCurveMarketCapSource interface {
 	BondingCurveMarketCapSOL(context.Context, string) (float64, error)
+	BondingCurveEntryMetrics(context.Context, string) (float64, float64, error)
 }
 
 type Settings struct {
 	EntryDelay            time.Duration
-	MinTransactions       int
 	MinVolumeBeforeBuySOL float64
 	MinMarketCapSOL       float64
 	PricePollInterval     time.Duration
@@ -58,13 +58,9 @@ type Settings struct {
 }
 
 type candidate struct {
-	event             Event
-	detectedAt        time.Time
-	tradeEvents       int
-	buyVolumeSOL      float64
-	creatorSold       bool
-	tradeMarketCapSOL float64
-	checking          bool
+	event      Event
+	detectedAt time.Time
+	checking   bool
 }
 
 type Monitor struct {
@@ -100,7 +96,6 @@ type Monitor struct {
 	snipePending                    map[string]time.Time
 	validationSlots                 chan struct{}
 	entryDelay                      time.Duration
-	minTransactions                 int
 	minVolumeBeforeBuySOL           float64
 	minMarketCapSOL                 float64
 	pricePollInterval               time.Duration
@@ -220,7 +215,8 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 	}
 	settings := Settings{
 		EntryDelay:        5 * time.Second,
-		MinTransactions:   2,
+		MinVolumeBeforeBuySOL: .02,
+		MinMarketCapSOL:       20,
 		PricePollInterval: 20 * time.Second,
 		SnipeConcurrency:  4,
 		SnipeTimeout:      15 * time.Second,
@@ -231,8 +227,11 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		if option.EntryDelay > 0 {
 			settings.EntryDelay = option.EntryDelay
 		}
-		if option.MinTransactions > 0 {
-			settings.MinTransactions = option.MinTransactions
+		if option.MinVolumeBeforeBuySOL > 0 {
+			settings.MinVolumeBeforeBuySOL = option.MinVolumeBeforeBuySOL
+		}
+		if option.MinMarketCapSOL > 0 {
+			settings.MinMarketCapSOL = option.MinMarketCapSOL
 		}
 		if option.PricePollInterval > 0 {
 			settings.PricePollInterval = option.PricePollInterval
@@ -259,7 +258,7 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		candidates:   make(map[string]*candidate),
 		snipePending: make(map[string]time.Time),
 		validationSlots: make(chan struct{}, settings.SnipeConcurrency),
-	entryDelay: settings.EntryDelay, minTransactions: settings.MinTransactions,
+	entryDelay: settings.EntryDelay,
 	minVolumeBeforeBuySOL: settings.MinVolumeBeforeBuySOL,
 	minMarketCapSOL:       settings.MinMarketCapSOL,
 		pricePollInterval: settings.PricePollInterval,
@@ -632,7 +631,6 @@ func (m *Monitor) connect(ctx context.Context) error {
 				Timestamp        json.RawMessage `json:"timestamp"`
 				BlockTime        json.RawMessage `json:"blockTime"`
 				MarketCapSol     float64         `json:"marketCapSol"`
-				SolAmount        float64         `json:"solAmount"`
 		}
 		if err = json.Unmarshal(b, &d); err != nil {
 			m.log.Warn("invalid PumpPortal websocket JSON",
@@ -692,13 +690,6 @@ func (m *Monitor) connect(ctx context.Context) error {
 			}
 			continue
 		}
-			trader := d.TraderPublicKey
-			if trader == "" {
-				trader = d.User
-			}
-			if m.recordCandidateTradeDetails(d.Mint, d.TxType, d.MarketCapSol, d.SolAmount, trader) {
-			continue
-		}
 		creator := d.Creator
 		if creator == "" {
 				creator = d.TraderPublicKey
@@ -720,12 +711,6 @@ func (m *Monitor) connect(ctx context.Context) error {
 			if !m.addCandidate(e) {
 				m.rejectCandidate(e, "candidate queue full")
 				return
-			}
-			select {
-			case m.subscriptions <- e.Mint:
-				m.log.Debug("subscribed to candidate trades", zap.String("mint", e.Mint))
-			default:
-				m.log.Warn("candidate subscription queue full; public activity check will continue", zap.String("mint", e.Mint))
 			}
 		})
 	}

@@ -18,7 +18,7 @@ type Config struct {
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
 	SnipeConcurrency, SnipeTimeoutMS, DedupeTTLMS                                                                                                                                                           int
-	EntryDelaySeconds, MinTxnsBeforeBuy, PricePollSeconds                                                                                                                                                   int
+EntryDelaySeconds, PricePollSeconds                                                                                                                                                                      int
 	MinVolumeBeforeBuySOL, MinMarketCapSOL                                                                                                                                                                   float64
 	RPCEndpoints                                                                                                                                                                                            []string
 }
@@ -92,9 +92,6 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.EntryDelaySeconds, err = intEnv("ENTRY_DELAY_SECONDS", 5); err != nil {
-		return c, err
-	}
-	if c.MinTxnsBeforeBuy, err = intEnv("MIN_TXNS_BEFORE_BUY", 2); err != nil {
 		return c, err
 	}
 	if c.MinVolumeBeforeBuySOL, err = floatEnv("MIN_VOLUME_BEFORE_BUY", .02); err != nil {
@@ -172,9 +169,12 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("RPC_ENDPOINTS: %w", err)
 		}
 	}
-	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.MinTxnsBeforeBuy < 1 || c.PricePollSeconds < 1 {
-		return c, fmt.Errorf("queue, position, timing, and entry thresholds must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
+if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.PricePollSeconds < 1 {
+return c, fmt.Errorf("queue, position, and timing values must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
 	}
+if c.MinVolumeBeforeBuySOL <= 0 || c.MinMarketCapSOL <= 0 {
+return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY and MIN_MARKET_CAP_SOL must be greater than zero")
+}
 	if c.SnipeConcurrency < 1 || c.SnipeConcurrency > 10 || c.SnipeTimeoutMS < 1 || c.SnipeTimeoutMS > 120000 || c.DedupeTTLMS < 1 || c.DedupeTTLMS > 3600000 {
 		return c, fmt.Errorf("SNIPE_CONCURRENCY must be 1-10, SNIPE_TIMEOUT_MS must be 1-120000, and DEDUPE_TTL_MS must be 1-3600000")
 	}

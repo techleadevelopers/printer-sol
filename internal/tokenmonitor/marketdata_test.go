@@ -9,15 +9,22 @@ import (
 
 	"go.uber.org/zap"
 	"solana-sniper-backend/internal/database"
-	"solana-sniper-backend/internal/dexscreener"
 	"solana-sniper-backend/internal/events"
 	"solana-sniper-backend/internal/strategy"
 )
 
-type fixedBondingCurveMarketCap float64
+type fixedBondingCurveMarketCap struct {
+	marketCapSOL float64
+	reservesSOL  float64
+	err          error
+}
 
-func (mcap fixedBondingCurveMarketCap) BondingCurveMarketCapSOL(context.Context, string) (float64, error) {
-	return float64(mcap), nil
+func (source fixedBondingCurveMarketCap) BondingCurveMarketCapSOL(context.Context, string) (float64, error) {
+	return source.marketCapSOL, source.err
+}
+
+func (source fixedBondingCurveMarketCap) BondingCurveEntryMetrics(context.Context, string) (float64, float64, error) {
+	return source.marketCapSOL, source.reservesSOL, source.err
 }
 
 func newMarketDataTestMonitor(t *testing.T) (*Monitor, func()) {
@@ -31,7 +38,12 @@ func newMarketDataTestMonitor(t *testing.T) (*Monitor, func()) {
 		t.Fatal(err)
 	}
 	monitor := New("", "", 8, db, strategy.New(db, time.Minute), &recordingEntrier{},
-		1, 0, 0, 50, 25, time.Minute, true, events.New(), zap.NewNop())
+		1, 0, 0, 50, 25, time.Minute, true, events.New(), zap.NewNop(),
+		Settings{
+			MinVolumeBeforeBuySOL: .02,
+			MinMarketCapSOL:       20,
+			BondingCurve:          fixedBondingCurveMarketCap{marketCapSOL: 30, reservesSOL: .05},
+		})
 	return monitor, func() { _ = db.Close() }
 }
 
@@ -43,98 +55,63 @@ Mint: mint, Creator: "test-creator", Received: now, Created: now,
 	}
 }
 
-func TestCandidateGateRejectsTwoTradesWithoutPositiveMarketCap(t *testing.T) {
+func TestCandidateGateUsesRPCWithoutWebSocketTrades(t *testing.T) {
 	monitor, closeDB := newMarketDataTestMonitor(t)
 	defer closeDB()
-	event := testCandidate("zero-market-cap")
+	event := testCandidate("rpc-only-entry")
 	if !monitor.addCandidate(event) {
 		t.Fatal("candidate was not queued")
 	}
-
-	monitor.recordCandidateTrade(event.Mint, "buy", 0)
-	monitor.recordCandidateTrade(event.Mint, "sell", 0)
-	monitor.finishCandidate(event.Mint, 0)
-	if len(monitor.q) != 0 {
-		t.Fatal("candidate without a positive WebSocket or RPC mark was queued for entry")
-	}
-}
-
-func TestCandidateGateRequiresTwoWebSocketTrades(t *testing.T) {
-	monitor, closeDB := newMarketDataTestMonitor(t)
-	defer closeDB()
-	event := testCandidate("low-activity")
-	if !monitor.addCandidate(event) {
-		t.Fatal("candidate was not queued")
-	}
-
-	monitor.recordCandidateTrade(event.Mint, "buy", 120)
-	monitor.finishCandidate(event.Mint, 0)
-	if len(monitor.q) != 0 {
-		t.Fatal("candidate with only one WebSocket trade was queued for entry")
-	}
-}
-
-func TestCandidateGateQueuesActiveTokenWithPositiveMarketCap(t *testing.T) {
-	monitor, closeDB := newMarketDataTestMonitor(t)
-	defer closeDB()
-	event := testCandidate("active-token")
-	if !monitor.addCandidate(event) {
-		t.Fatal("candidate was not queued")
-	}
-
-	monitor.recordCandidateTrade(event.Mint, "buy", 110)
-	monitor.recordCandidateTrade(event.Mint, "sell", 120)
-	monitor.finishCandidate(event.Mint, 0)
-	select {
-	case queued := <-monitor.q:
-		if queued.MarketCapSOL != 120 {
-			t.Fatalf("entry baseline market cap = %f, want 120", queued.MarketCapSOL)
-		}
-	default:
-		t.Fatal("active candidate was not queued after its delay gate")
-	}
-}
-
-func TestCandidateGateUsesTwoPositivePriceWebSocketTradesWithoutRPC(t *testing.T) {
-	monitor, closeDB := newMarketDataTestMonitor(t)
-	defer closeDB()
-	event := testCandidate("websocket-fallback")
-	if !monitor.addCandidate(event) {
-		t.Fatal("candidate was not queued")
-	}
-	monitor.recordCandidateTrade(event.Mint, "buy", 130)
-	monitor.recordCandidateTrade(event.Mint, "sell", 140)
-
-	monitor.finishCandidate(event.Mint, 0)
-	select {
-	case queued := <-monitor.q:
-		if queued.MarketCapSOL != 140 {
-			t.Fatalf("fallback market cap = %f, want latest positive trade mark 140", queued.MarketCapSOL)
-		}
-	default:
-		t.Fatal("eligible WebSocket fallback was not queued")
-	}
-}
-
-func TestCandidateGateUsesRPCAfterTwoWebSocketTradesWithoutMark(t *testing.T) {
-	monitor, closeDB := newMarketDataTestMonitor(t)
-	defer closeDB()
-	event := testCandidate("rpc-mark-fallback")
-	if !monitor.addCandidate(event) {
-		t.Fatal("candidate was not queued")
-	}
-	monitor.recordCandidateTrade(event.Mint, "buy", 0)
-	monitor.recordCandidateTrade(event.Mint, "sell", 0)
-	monitor.bondingCurve = fixedBondingCurveMarketCap(150)
-
 	monitor.checkCandidate(context.Background(), event.Mint)
 	select {
 	case queued := <-monitor.q:
-		if queued.MarketCapSOL != 150 {
-			t.Fatalf("RPC entry baseline market cap = %f, want 150", queued.MarketCapSOL)
+		if queued.MarketCapSOL != 30 {
+			t.Fatalf("entry baseline market cap = %f, want RPC value 30", queued.MarketCapSOL)
 		}
 	default:
-		t.Fatal("candidate with two WS trades and positive RPC mark was not queued")
+		t.Fatal("candidate with RPC-confirmed reserve and market cap was not queued")
+	}
+}
+
+func TestCandidateGateRejectsBelowRPCReserveOrMarketCapFloor(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		marketCap   float64
+		reservesSOL float64
+	}{
+		{name: "reserve proxy", marketCap: 30, reservesSOL: .01},
+		{name: "market cap", marketCap: 19.99, reservesSOL: .05},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			monitor, closeDB := newMarketDataTestMonitor(t)
+			defer closeDB()
+			monitor.bondingCurve = fixedBondingCurveMarketCap{
+				marketCapSOL: test.marketCap,
+				reservesSOL:  test.reservesSOL,
+			}
+			event := testCandidate(test.name)
+			if !monitor.addCandidate(event) {
+				t.Fatal("candidate was not queued")
+			}
+			monitor.checkCandidate(context.Background(), event.Mint)
+			if len(monitor.q) != 0 {
+				t.Fatal("candidate below an RPC threshold was queued")
+			}
+		})
+	}
+}
+
+func TestCandidateGateRejectsRPCFailure(t *testing.T) {
+	monitor, closeDB := newMarketDataTestMonitor(t)
+	defer closeDB()
+	monitor.bondingCurve = fixedBondingCurveMarketCap{err: errors.New("RPC unavailable")}
+	event := testCandidate("rpc-failure")
+	if !monitor.addCandidate(event) {
+		t.Fatal("candidate was not queued")
+	}
+	monitor.checkCandidate(context.Background(), event.Mint)
+	if len(monitor.q) != 0 {
+		t.Fatal("candidate without RPC confirmation was queued")
 	}
 }
 
@@ -155,21 +132,6 @@ func TestSnipeQueueDeduplicationExpiresAfterConfiguredTTL(t *testing.T) {
 	monitor.pruneSnipeDedupe(time.Now().UTC().Add(21 * time.Millisecond))
 	if queued, reason := monitor.enqueueSnipe(event); !queued {
 		t.Fatalf("enqueue after dedupe TTL rejected: %s", reason)
-	}
-}
-
-func TestCandidateGateRejectsWebSocketFallbackWithoutTwoTrades(t *testing.T) {
-	monitor, closeDB := newMarketDataTestMonitor(t)
-	defer closeDB()
-	event := testCandidate("idle-token")
-	if !monitor.addCandidate(event) {
-		t.Fatal("candidate was not queued")
-	}
-	monitor.recordCandidateTrade(event.Mint, "buy", 140)
-
-	monitor.finishCandidate(event.Mint, 0)
-	if len(monitor.q) != 0 {
-		t.Fatal("candidate with only one WebSocket trade was queued for entry")
 	}
 }
 

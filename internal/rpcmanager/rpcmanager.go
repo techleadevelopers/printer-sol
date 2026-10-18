@@ -325,6 +325,16 @@ func (m *Manager) BondingCurveMarketCapSOL(ctx context.Context, mint string) (fl
 	return state.MarketCapSOL, nil
 }
 
+// BondingCurveEntryMetrics returns the RPC-derived market cap and current
+// real SOL reserves. The reserves are a liquidity proxy, not traded volume.
+func (m *Manager) BondingCurveEntryMetrics(ctx context.Context, mint string) (float64, float64, error) {
+	state, err := m.GetBondingCurveStateWithContext(ctx, mint)
+	if err != nil {
+		return 0, 0, err
+	}
+	return state.MarketCapSOL, float64(state.RealSOLReserves) / 1e9, nil
+}
+
 // Execution reads the confirmed transaction receipt and returns the SOL delta
 // for the operational wallet plus the network fee. Live P&L must use this
 // ledger data rather than a market-cap estimate.
