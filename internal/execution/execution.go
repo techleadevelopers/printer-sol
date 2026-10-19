@@ -525,7 +525,8 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 // state. Two terminal outcomes exist:
 //
 //  1. Complete: trade/transaction/position all persisted as simulated/closed.
-//  2. Definitive failure: trade/transaction failed AND position still open.
+//  2. Definitive failure: trade/transaction failed AND position closed by the
+//     dedicated MarkSimulationSellFailed helper, which also releases the slot.
 //
 // Anything else is marked unknown so ActiveForMint blocks a second sell, and
 // ReconcileStaleSimulationSells later converts it to failed. Only when the
@@ -552,7 +553,9 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 		snapshot.PositionState == "open"
 	var stateErr error
 	if definitiveFailure {
-		stateErr = e.db.MarkTradeFailed(id)
+		// In simulation, a failed sell is terminal: close the paper position
+		// in the same boundary so MaxOpenPositions is released immediately.
+		stateErr = e.db.MarkSimulationSellFailed(id, request.Mint)
 	} else {
 		stateErr = e.db.MarkSimulationSellUnknown(id)
 	}
@@ -575,7 +578,7 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 		if verifyErr == nil &&
 			after.TradeState == "failed" &&
 			after.TransactionState == "failed" &&
-			after.PositionState == "open" {
+			after.PositionState == "closed" {
 			// The failure-state transaction committed despite returning an error.
 			definitiveFailure = true
 		} else {
@@ -609,7 +612,7 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 	}
 
 	if e.log != nil {
-		e.log.Error("simulated sell finalization failed; position remains open",
+		e.log.Error("simulated sell finalization failed",
 			zap.String("trade_id", id),
 			zap.String("mint", request.Mint),
 			zap.String("exit_reason", request.Reason),
@@ -628,7 +631,7 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 	// The failure/unknown state is persisted and ActiveForMint will block a
 	// duplicate sell. Returning nil here is what stops the monitor from
 	// re-evaluating this mint in a tight loop. ReconcileStaleSimulationSells
-	// will convert a stale unknown into failed once the cooldown elapses.
+	// will close the paper position on the next monitor pass.
 	return nil
 }
 

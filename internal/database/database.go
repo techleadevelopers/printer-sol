@@ -211,11 +211,18 @@ func (d *DB) HasFailedSellForMint(mint string) (bool, error) {
 
 // FailedSellRetryState makes the retry count and cooldown survive process
 // restarts by deriving them from persisted, definitively failed sell attempts.
+//
+// It now only counts failures for mints whose position is still open: once a
+// position is closed (e.g. by MarkSimulationSellFailed or a successful sell),
+// the historical failure is irrelevant to retry scheduling and must not pin
+// the monitor in a retry loop for a mint that has no remaining exposure.
 func (d *DB) FailedSellRetryState(mint string) (int, time.Time, error) {
 	var attempts int
 	var lastFailure sql.NullTime
-	err := d.QueryRow(d.bind(`SELECT COUNT(*),MAX(updated_at) FROM trades
-		WHERE mint=? AND side='sell' AND state='failed'`), mint).Scan(&attempts, &lastFailure)
+	err := d.QueryRow(d.bind(`SELECT COUNT(*),MAX(t.updated_at)
+		FROM trades t
+		WHERE t.mint=? AND t.side='sell' AND t.state='failed'
+		AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='open')`), mint).Scan(&attempts, &lastFailure)
 	if err != nil {
 		return 0, time.Time{}, fmt.Errorf("read failed sell retry state for mint %q: %w", mint, err)
 	}
@@ -223,6 +230,27 @@ func (d *DB) FailedSellRetryState(mint string) (int, time.Time, error) {
 		return attempts, time.Time{}, nil
 	}
 	return attempts, lastFailure.Time.UTC(), nil
+}
+
+// LastSellState reports the state of the most recent sell trade for a mint.
+// Callers use it to distinguish "there is no active sell, but the last one
+// failed/unknown and the position is still open" from "the mint is genuinely
+// free for a new exit attempt".
+func (d *DB) LastSellState(mint string) (state string, updatedAt time.Time, err error) {
+	var s string
+	var at sql.NullTime
+	err = d.QueryRow(d.bind(`SELECT state,updated_at FROM trades
+		WHERE mint=? AND side='sell' ORDER BY created_at DESC,id DESC LIMIT 1`), mint).Scan(&s, &at)
+	if err == sql.ErrNoRows {
+		return "", time.Time{}, nil
+	}
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("read last sell state for mint %q: %w", mint, err)
+	}
+	if at.Valid {
+		updatedAt = at.Time.UTC()
+	}
+	return s, updatedAt, nil
 }
 
 type SimulationSellSnapshot struct {
@@ -286,9 +314,60 @@ func (d *DB) MarkSimulationSellUnknown(id string) error {
 	return nil
 }
 
+// MarkSimulationSellFailed definitively closes a paper position after a sell
+// that can no longer execute. Unlike MarkSimulationSellUnknown, this is
+// terminal: the position is closed so MaxOpenPositions is released, the trade
+// and transaction are marked failed, and the monitor stops retrying.
+func (d *DB) MarkSimulationSellFailed(id, mint string) error {
+	now := time.Now().UTC()
+	tx, err := d.Begin()
+	if err != nil {
+		return fmt.Errorf("begin failed simulated sell update for %q: %w", id, err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=?
+		WHERE mint=? AND status='open'`), now, mint)
+	if err != nil {
+		return fmt.Errorf("close paper position for failed sell %q: %w", id, err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return fmt.Errorf("check paper position close for %q: %w", id, rowsErr)
+	} else if affected != 1 {
+		return fmt.Errorf("paper position for mint %q is no longer open", mint)
+	}
+	result, err = tx.Exec(d.bind(`UPDATE trades SET state='failed',reconciliation_needed=?,updated_at=?
+		WHERE id=? AND side='sell' AND state IN ('prepared','unknown')`), false, now, id)
+	if err != nil {
+		return fmt.Errorf("mark simulated sell %q failed: %w", id, err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return fmt.Errorf("check failed state for simulated sell %q: %w", id, rowsErr)
+	} else if affected != 1 {
+		return fmt.Errorf("simulated sell %q is not in a markable state", id)
+	}
+	result, err = tx.Exec(d.bind(`UPDATE transactions SET state='failed',updated_at=?
+		WHERE trade_id=? AND state IN ('prepared','unknown')`), now, id)
+	if err != nil {
+		return fmt.Errorf("mark transaction for simulated sell %q failed: %w", id, err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return fmt.Errorf("check failed transaction state for simulated sell %q: %w", id, rowsErr)
+	} else if affected != 1 {
+		return fmt.Errorf("transaction for simulated sell %q is not in a markable state", id)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit failed simulated sell %q: %w", id, err)
+	}
+	return nil
+}
+
 // ReconcileStaleSimulationSells releases old active paper sells only when the
 // position is still open and the transaction never reached a finalized state.
 // Paper exits have no external submission side effect, so this is definitive.
+//
+// The position is closed in the same transaction so the slot is released;
+// otherwise MaxOpenPositions pins the monitor with orphaned open positions.
 func (d *DB) ReconcileStaleSimulationSells(mint string, olderThan time.Time) (int, error) {
 	tx, err := d.Begin()
 	if err != nil {
@@ -362,6 +441,12 @@ func (d *DB) ReconcileStaleSimulationSells(mint string, olderThan time.Time) (in
 			} else if affected != 1 {
 				return 0, fmt.Errorf("transaction for stale simulated sell id=%q mint=%q changed during reconciliation", candidate.id, mint)
 			}
+		}
+		// Close the paper position in the same transaction so the slot is
+		// released and MaxOpenPositions stops pinning the monitor.
+		if _, closeErr := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=?
+			WHERE mint=? AND status='open'`), now, mint); closeErr != nil {
+			return 0, fmt.Errorf("close stale paper position for mint %q: %w", mint, closeErr)
 		}
 		reconciled++
 	}

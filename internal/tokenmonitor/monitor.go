@@ -517,7 +517,11 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 		case hasExitIntent:
 			reason = exitIntent.(string)
 		case failedExitAttempts > 0:
-			reason = "retry failed exit"
+			// The position is still open and the last sell failed. Force a
+			// definitive exit decision rather than waiting for the mark to
+			// drift back into the stop-loss band; otherwise MaxOpenPositions
+			// pins the monitor with orphaned positions.
+			reason = "reconcile pending exit"
 		case known:
 			reason = m.positionExitReason(mint, returnPct, openedAt, now)
 		}
@@ -1070,7 +1074,21 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 	if active {
 		return
 	}
+	// Position-state guard: if the last sell attempt already terminated as
+	// failed/unknown while the position is still open, the monitor must NOT
+	// retry automatically. The state is inconsistent and only explicit
+	// reconciliation may close it. This prevents the "10 open positions,
+	// stopped sell reached, retry loop" deadlock.
 	if m.simulation {
+		lastSellState, _, stateErr := m.db.LastSellState(mint)
+		if stateErr != nil {
+			m.log.Warn("read last sell state", zap.String("mint", mint), zap.Error(stateErr))
+			return
+		}
+		if lastSellState == "failed" || lastSellState == "unknown" {
+			m.blockAutomaticSimulationExitRetries(mint, reason, 0)
+			return
+		}
 		failedAttempts, lastFailure, retryErr := m.db.FailedSellRetryState(mint)
 		if retryErr != nil {
 			m.log.Warn("read persisted simulation exit retry state", zap.String("mint", mint), zap.Error(retryErr))
