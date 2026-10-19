@@ -32,6 +32,9 @@ export interface Dashboard {
   analyzedTokens: number | null;
   /** @nullable */
   tradesCount: number | null;
+  closedTrades: number;
+  sellAttempts: number;
+  failedSellAttempts: number;
   /** @nullable */
   openPositions: number | null;
   /** @nullable */

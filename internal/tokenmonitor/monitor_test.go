@@ -585,6 +585,22 @@ func TestLiveFailedSellRetriesEvenAfterPriceFallsBelowTakeProfit(t *testing.T) {
 	}
 }
 
+func TestSimulationExitRetryDelayBacksOff(t *testing.T) {
+	tests := []struct {
+		failedAttempts int
+		want           time.Duration
+	}{
+		{failedAttempts: 1, want: 5 * time.Second},
+		{failedAttempts: 2, want: 10 * time.Second},
+		{failedAttempts: 3, want: 20 * time.Second},
+	}
+	for _, test := range tests {
+		if got := simulationExitRetryDelay(test.failedAttempts); got != test.want {
+			t.Errorf("retry delay after %d failed attempts = %s; want %s", test.failedAttempts, got, test.want)
+		}
+	}
+}
+
 func TestSimulationMaxHoldReleasesFlatPosition(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "paper-max-hold.db"))
 	if err != nil {

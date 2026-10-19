@@ -211,6 +211,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		winRate = performance.WinRatePct
 	}
 	performancePayload := map[string]any{
+		"sellAttempts": performance.SellAttempts, "failedSellAttempts": performance.FailedSellAttempts,
 		"closedTrades": performance.ClosedTrades, "winners": performance.Winners,
 		"losers": performance.Losers, "winRatePct": winRate,
 		"avgWinSol": performance.AvgWinSOL, "avgLossSol": performance.AvgLossSOL,
@@ -222,6 +223,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if simSummary != nil {
 		winRate = simSummary.WinRate
 		performancePayload = map[string]any{
+			"sellAttempts": performance.SellAttempts, "failedSellAttempts": performance.FailedSellAttempts,
 			"closedTrades": simSummary.TotalTrades, "winners": simSummary.Wins,
 			"losers": simSummary.Losses, "winRatePct": winRate,
 			"avgWinSol": simSummary.AvgWinSOL, "avgLossSol": simSummary.AvgLossSOL,
@@ -241,6 +243,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		"walletBalanceLow": balanceAvailable && balance < s.engine.Limits().FeeReserveSOL,
 		"feesReserveSol": s.engine.Limits().FeeReserveSOL,
 		"detectedTokens": detected, "analyzedTokens": analyzed, "tradesCount": tradeCount, "openPositions": positions,
+		"sellAttempts": performance.SellAttempts, "failedSellAttempts": performance.FailedSellAttempts,
 		"realizedPnlSol": netRealizedPnl, "grossRealizedPnlSol": grossRealizedPnl,
 		"estimatedOpenPnlSol": estimatedOpenPnl, "totalEstimatedPnlSol": totalEstimatedPnl,
 		"totalEstimatedPnlComplete": unmarkedPositions == 0,
@@ -456,19 +459,24 @@ func (s *Server) tradeItems(simulation bool) ([]map[string]any, error) {
 			"slippage": slippage, "grossPnlSol": nil, "netPnlSol": nil, "realizedPnlSol": nil,
 			"exitReason": exitReason, "transactionId": nil, "signature": nil, "status": status,
 		}
-		if executed > 0 {
+		if !isCompletedTradeState(state) {
+			item["feesSol"] = 0.0
+		}
+		if executed > 0 && isCompletedTradeState(state) {
 			item["executedValueSol"] = executed
 		}
 		value := requested
-		if executed > 0 {
+		if executed > 0 && isCompletedTradeState(state) {
 			value = executed
 		}
-		if side == "buy" {
-			item["buyValueSol"] = value
-		} else {
-			item["sellValueSol"] = value
+		if isCompletedTradeState(state) {
+			if side == "buy" {
+				item["buyValueSol"] = value
+			} else {
+				item["sellValueSol"] = value
+			}
 		}
-		if realized.Valid {
+		if realized.Valid && isCompletedTradeState(state) {
 			item["grossPnlSol"] = realized.Float64 + fees
 			item["netPnlSol"] = realized.Float64
 			item["realizedPnlSol"] = realized.Float64
@@ -493,6 +501,11 @@ func (s *Server) tradeItems(simulation bool) ([]map[string]any, error) {
 	}
 	return items, nil
 }
+
+func isCompletedTradeState(state string) bool {
+	return state == "simulated" || state == "confirmed" || state == "finalized"
+}
+
 func (s *Server) cumulativeResult(simulation bool) ([]map[string]any, error) {
 	if simulation {
 		run, err := s.db.SimulationRun()

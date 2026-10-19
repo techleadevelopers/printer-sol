@@ -157,7 +157,9 @@ export interface Dashboard {
   /** @nullable */
   tradesCount: number | null;
   transactionsCount?: number | null;
-  closedTrades?: number | null;
+  closedTrades: number;
+  sellAttempts: number;
+  failedSellAttempts: number;
   /** @nullable */
   openPositions: number | null;
   /** @nullable */

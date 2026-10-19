@@ -233,7 +233,7 @@ function DashboardPage() {
       <div className="mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Metric label="Tokens detetados" value={fmt(d.detectedTokens, 0)} />
         <Metric label="Tokens analisados" value={fmt(d.analyzedTokens, 0)} />
-        <Metric label="Operações" value={fmt(d.tradesCount, 0)} />
+        <Metric label="Vendas concluídas" value={fmt(d.closedTrades, 0)} note={`${fmt(d.sellAttempts, 0)} tentativas · ${fmt(d.failedSellAttempts, 0)} falhas`} />
         <Metric label="Posições abertas" value={fmt(d.openPositions, 0)} />
         <Metric label="Saldo da carteira" value={fmt(d.walletBalanceSol)} suffix="SOL" />
         <Metric label="Reserva de taxas" value={fmt(d.feesReserveSol)} suffix="SOL" />

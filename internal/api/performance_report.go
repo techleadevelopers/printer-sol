@@ -118,11 +118,19 @@ func (s *Server) performanceReport(w http.ResponseWriter, r *http.Request) {
 	if openPositions > 0 && unmarkedPositions >= openPositions {
 		openPnlReported = nil
 	}
+	sellAttempts, failedSellAttempts, err := s.db.SellActivityStats(from, to)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not count sell attempts")
+		return
+	}
 	write(w, http.StatusOK, map[string]any{
 		"mode":            s.mode(),
 		"period":          map[string]time.Time{"from": from, "to": to},
 		"summary":         reportSummaryPayload(summary, reportStarted, balanceStart, balanceNow, allFeesPaid),
 		"trades":          trades,
+		"sellAttempts":    sellAttempts,
+		"failedSellAttempts": failedSellAttempts,
+		"completedSells":  len(trades),
 		"cumulativeCurve": curve,
 		"byHour":          byHour,
 		"allFeesPaidSol":  allFeesPaid,

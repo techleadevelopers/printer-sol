@@ -164,6 +164,14 @@ func TestFailedSellRemainsVisibleForAutomaticRetry(t *testing.T) {
 	if err != nil || !failed {
 		t.Fatalf("failed sell was not recorded for retry: failed=%v err=%v", failed, err)
 	}
+	failedAttempts, lastFailure, err := db.FailedSellRetryState("mint-to-close")
+	if err != nil || failedAttempts != 1 || lastFailure.IsZero() {
+		t.Fatalf("failed sell retry state = %d at %v, err=%v", failedAttempts, lastFailure, err)
+	}
+	attemptsInPeriod, failuresInPeriod, err := db.SellActivityStats(time.Now().UTC().Add(-time.Hour), time.Now().UTC().Add(time.Hour))
+	if err != nil || attemptsInPeriod != 1 || failuresInPeriod != 1 {
+		t.Fatalf("sell activity period = attempts:%d failures:%d err:%v", attemptsInPeriod, failuresInPeriod, err)
+	}
 	active, err := db.ActiveForMint("mint-to-close")
 	if err != nil || active {
 		t.Fatalf("confirmed failed sell should not remain active: active=%v err=%v", active, err)
@@ -171,6 +179,55 @@ func TestFailedSellRemainsVisibleForAutomaticRetry(t *testing.T) {
 	reconciliationNeeded, err := db.ReconciliationRequired()
 	if err != nil || reconciliationNeeded {
 		t.Fatalf("definitively failed sell should not require reconciliation: needed=%v err=%v", reconciliationNeeded, err)
+	}
+}
+
+func TestStaleSimulationSellCanBeReconciledWithoutClosingPosition(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "stale-simulation-sell.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenSimulationPosition("stale-paper-mint", 0.05); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.InsertTrade(Trade{
+		ID: "stale-paper-sell", Mint: "stale-paper-mint", Side: "sell",
+		Quantity: "0.04", Requested: 0.04, State: "prepared",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	recentCutoff := time.Now().UTC().Add(-time.Minute)
+	recovered, err := db.ReconcileStaleSimulationSells("stale-paper-mint", recentCutoff)
+	if err != nil || recovered != 0 {
+		t.Fatalf("recent paper sell should not be reconciled: recovered=%d err=%v", recovered, err)
+	}
+
+	oldTime := time.Now().UTC().Add(-2 * time.Minute)
+	if _, err = db.Exec(`UPDATE trades SET updated_at=? WHERE id='stale-paper-sell'`, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`UPDATE transactions SET updated_at=? WHERE trade_id='stale-paper-sell'`, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err = db.ReconcileStaleSimulationSells("stale-paper-mint", recentCutoff)
+	if err != nil || recovered != 1 {
+		t.Fatalf("stale paper sell was not reconciled: recovered=%d err=%v", recovered, err)
+	}
+	active, err := db.ActiveForMint("stale-paper-mint")
+	if err != nil || active {
+		t.Fatalf("reconciled paper sell should not remain active: active=%v err=%v", active, err)
+	}
+	if _, open, openErr := db.PositionOpenedAt("stale-paper-mint"); openErr != nil || !open {
+		t.Fatalf("reconciliation must leave the position open: open=%v err=%v", open, openErr)
+	}
+	failedAttempts, _, err := db.FailedSellRetryState("stale-paper-mint")
+	if err != nil || failedAttempts != 1 {
+		t.Fatalf("reconciled failure retry count = %d, err=%v", failedAttempts, err)
 	}
 }
 
@@ -296,12 +353,23 @@ func TestPerformanceUsesClosedPositionResults(t *testing.T) {
 	if err = db.FinalizeSimulationSell("sell", "performance-mint", 0.15); err != nil {
 		t.Fatal(err)
 	}
+	if err = db.InsertTrade(Trade{
+		ID: "failed-sell-attempt", Mint: "performance-mint", Side: "sell",
+		Quantity: "0.12", Requested: 0.12, Fees: 0.01, State: "prepared",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.MarkTradeFailed("failed-sell-attempt"); err != nil {
+		t.Fatal(err)
+	}
 
 	stats, err := db.Performance()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.ClosedTrades != 1 || stats.Winners != 1 || stats.Losers != 0 || stats.WinRatePct != 100 || stats.NetRealizedPnlSOL < 0.049999999 || stats.NetRealizedPnlSOL > 0.050000001 {
+	if stats.SellAttempts != 2 || stats.FailedSellAttempts != 1 || stats.ClosedTrades != 1 ||
+		stats.Winners != 1 || stats.Losers != 0 || stats.WinRatePct != 100 ||
+		stats.NetRealizedPnlSOL < 0.049999999 || stats.NetRealizedPnlSOL > 0.050000001 {
 		t.Fatalf("unexpected performance stats: %+v", stats)
 	}
 }

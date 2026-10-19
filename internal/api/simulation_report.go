@@ -55,6 +55,11 @@ func (s *Server) simulationReport(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not build simulation report")
 		return
 	}
+	sellAttempts, failedSellAttempts, err := s.db.SellActivityStats(from, to)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "database_unavailable", "could not count simulated sell attempts")
+		return
+	}
 	curve := make([]map[string]any, 0, len(trades)+1)
 	curve = append(curve, map[string]any{"timestamp": from, "cumulativePnlSol": 0.0})
 	cumulative := 0.0
@@ -92,6 +97,9 @@ func (s *Server) simulationReport(w http.ResponseWriter, r *http.Request) {
 		"summary":         summary,
 		"allFeesPaidSol":  allFeesPaid,
 		"trades":          trades,
+		"sellAttempts":    sellAttempts,
+		"failedSellAttempts": failedSellAttempts,
+		"completedSells":  len(trades),
 		"cumulativeCurve": curve,
 		"byHour":          byHour,
 		"paperReadiness":  s.paperReadiness(),

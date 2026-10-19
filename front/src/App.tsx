@@ -292,7 +292,7 @@ function DashboardPage() {
       <div className="mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Metric label="Tokens detetados" value={fmt(d.detectedTokens, 0)} />
         <Metric label="Tokens analisados" value={fmt(d.analyzedTokens, 0)} />
-        <Metric label="Operações encerradas" value={fmt(d.closedTrades ?? d.tradesCount, 0)} note="Ciclos de compra e venda concluídos" />
+        <Metric label="Operações encerradas" value={fmt(d.closedTrades, 0)} note={`${fmt(d.sellAttempts, 0)} tentativas de venda · ${fmt(d.failedSellAttempts, 0)} falhas`} />
         <Metric label="Posições abertas" value={fmt(d.openPositions, 0)} />
         <Metric label={d.mode === 'simulation' ? 'Saldo disponível paper' : 'Saldo da carteira'} value={fmtSol(d.walletBalanceSol)} suffix="SOL" note={d.walletBalanceAvailable === false ? 'Leitura indisponível; zero não será presumido.' : undefined} />
         {d.mode === 'simulation' && <Metric label="Patrimônio virtual paper" value={fmtSol(d.virtualEquitySol)} suffix="SOL" note={d.estimatedOpenPnlComplete === false ? 'Estimativa parcial: falta marca em uma ou mais posições.' : 'Inclui posições abertas pela última marca disponível.'} />}

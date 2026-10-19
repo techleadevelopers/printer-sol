@@ -90,6 +90,7 @@ type Monitor struct {
 	exitMu                          sync.Mutex
 	exitRetryAfter                  sync.Map
 	exitIntents                     sync.Map
+	exitRetryExhausted              sync.Map
 	candidateMu                     sync.Mutex
 	candidates                      map[string]*candidate
 	snipeMu                         sync.Mutex
@@ -109,6 +110,8 @@ type Monitor struct {
 }
 
 const exitRetryDelay = 5 * time.Second
+const maxAutomaticSimulationExitAttempts = 3
+const staleSimulationSellRecoveryAge = time.Minute
 
 func (m *Monitor) runOperation(fn func()) bool {
 	return m.runOperationAt(m.resetGeneration.Load(), fn)
@@ -179,6 +182,10 @@ func (m *Monitor) ResetInMemoryState() {
 	})
 	m.exitIntents.Range(func(key, _ any) bool {
 		m.exitIntents.Delete(key)
+		return true
+	})
+	m.exitRetryExhausted.Range(func(key, _ any) bool {
+		m.exitRetryExhausted.Delete(key)
 		return true
 	})
 	m.missingMarks.Range(func(key, _ any) bool {
@@ -440,6 +447,16 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 			if _, stillOpen := openMints[mint]; !stillOpen {
 				m.exitRetryAfter.Delete(mint)
 				m.exitIntents.Delete(mint)
+				m.exitRetryExhausted.Delete(mint)
+			}
+		}
+		return true
+	})
+	m.exitRetryExhausted.Range(func(key, _ any) bool {
+		mint, ok := key.(string)
+		if ok {
+			if _, stillOpen := openMints[mint]; !stillOpen {
+				m.exitRetryExhausted.Delete(mint)
 			}
 		}
 		return true
@@ -447,6 +464,20 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 	for _, mint := range mints {
 		if ctx.Err() != nil {
 			return
+		}
+		if m.simulation {
+			reconciled, reconcileErr := m.db.ReconcileStaleSimulationSells(mint, now.Add(-staleSimulationSellRecoveryAge))
+			if reconcileErr != nil {
+				m.log.Warn("reconcile stale simulated sell",
+					zap.String("mint", mint),
+					zap.Error(reconcileErr))
+				continue
+			}
+			if reconciled > 0 {
+				m.log.Warn("recovered stale simulated sell state",
+					zap.String("mint", mint),
+					zap.Int("attempts", reconciled))
+			}
 		}
 		openedAt, open, err := m.db.PositionOpenedAt(mint)
 		if err != nil {
@@ -475,16 +506,17 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 			continue
 		}
 		m.missingMarks.Delete(mint)
-		failedExit, failedExitErr := m.db.HasFailedSellForMint(mint)
+		failedExitAttempts, _, failedExitErr := m.db.FailedSellRetryState(mint)
 		if failedExitErr != nil {
 			m.log.Warn("check previous exit failures", zap.String("mint", mint), zap.Error(failedExitErr))
+			continue
 		}
 		reason := ""
 		exitIntent, hasExitIntent := m.exitIntents.Load(mint)
 		switch {
 		case hasExitIntent:
 			reason = exitIntent.(string)
-		case failedExitErr == nil && failedExit:
+		case failedExitAttempts > 0:
 			reason = "retry failed exit"
 		case known:
 			reason = m.positionExitReason(mint, returnPct, openedAt, now)
@@ -1021,6 +1053,10 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 		m.tracked.Delete(mint)
 		m.exitRetryAfter.Delete(mint)
 		m.exitIntents.Delete(mint)
+		m.exitRetryExhausted.Delete(mint)
+		return
+	}
+	if _, exhausted := m.exitRetryExhausted.Load(mint); exhausted {
 		return
 	}
 	if retryAt, ok := m.exitRetryAfter.Load(mint); ok && time.Now().Before(retryAt.(time.Time)) {
@@ -1033,6 +1069,27 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 	}
 	if active {
 		return
+	}
+	if m.simulation {
+		failedAttempts, lastFailure, retryErr := m.db.FailedSellRetryState(mint)
+		if retryErr != nil {
+			m.log.Warn("read persisted simulation exit retry state", zap.String("mint", mint), zap.Error(retryErr))
+			return
+		}
+		if failedAttempts >= maxAutomaticSimulationExitAttempts {
+			m.blockAutomaticSimulationExitRetries(mint, reason, failedAttempts)
+			return
+		}
+		if failedAttempts > 0 {
+			retryAt := lastFailure.Add(simulationExitRetryDelay(failedAttempts))
+			if memoryRetryAt, ok := m.exitRetryAfter.Load(mint); ok && memoryRetryAt.(time.Time).After(retryAt) {
+				retryAt = memoryRetryAt.(time.Time)
+			}
+			if time.Now().Before(retryAt) {
+				m.exitRetryAfter.Store(mint, retryAt)
+				return
+			}
+		}
 	}
 	if m.entry == nil {
 		m.log.Warn("cannot close position: entry engine unavailable", zap.String("mint", mint))
@@ -1087,10 +1144,46 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 	if err != nil {
 		writeExitAudit("position_exit_failed", id, err)
 		m.log.Warn("position exit", zap.String("mint", mint), zap.Error(err))
-		m.bus.Publish("exit_retry_scheduled", map[string]any{
-			"mint": mint, "reason": reason, "retryInSeconds": int(exitRetryDelay.Seconds()),
-			"simulation": m.simulation,
-		})
+		if m.simulation {
+			active, activeErr := m.db.ActiveForMint(mint)
+			if activeErr != nil {
+				m.log.Warn("check simulated exit after failure", zap.String("mint", mint), zap.Error(activeErr))
+			} else if active {
+				m.bus.Publish("risk_alert", map[string]any{
+					"mint": mint, "tradeId": id, "simulation": true,
+					"reason": "simulated exit is unresolved and remains active; automatic retry is blocked",
+				})
+			} else if id == "" {
+				m.blockAutomaticSimulationExitRetries(mint, reason, 0)
+			} else {
+				failedAttempts, lastFailure, retryErr := m.db.FailedSellRetryState(mint)
+				if retryErr != nil {
+					m.log.Warn("read simulated exit retry state after failure", zap.String("mint", mint), zap.Error(retryErr))
+					m.blockAutomaticSimulationExitRetries(mint, reason, failedAttempts)
+				} else if failedAttempts == 0 {
+					m.blockAutomaticSimulationExitRetries(mint, reason, failedAttempts)
+				} else if failedAttempts >= maxAutomaticSimulationExitAttempts {
+					m.blockAutomaticSimulationExitRetries(mint, reason, failedAttempts)
+				} else {
+					retryAt := lastFailure.Add(simulationExitRetryDelay(failedAttempts))
+					m.exitRetryAfter.Store(mint, retryAt)
+					retryIn := time.Until(retryAt)
+					if retryIn < 0 {
+						retryIn = 0
+					}
+					m.bus.Publish("exit_retry_scheduled", map[string]any{
+						"mint": mint, "tradeId": id, "reason": reason,
+						"retryInSeconds": int(retryIn.Seconds()), "simulation": true,
+						"attempt": failedAttempts + 1, "maxAttempts": maxAutomaticSimulationExitAttempts,
+					})
+				}
+			}
+		} else {
+			m.bus.Publish("exit_retry_scheduled", map[string]any{
+				"mint": mint, "reason": reason, "retryInSeconds": int(exitRetryDelay.Seconds()),
+				"simulation": false,
+			})
+		}
 		return
 	}
 	writeExitAudit("position_exit_submitted", id, nil)
@@ -1098,8 +1191,36 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 		m.tracked.Delete(mint)
 		m.exitRetryAfter.Delete(mint)
 		m.exitIntents.Delete(mint)
+		m.exitRetryExhausted.Delete(mint)
 	}
 	m.bus.Publish("exit_triggered", map[string]any{"mint": mint, "tradeId": id, "reason": reason, "returnPct": returnPct, "simulation": m.simulation})
+}
+
+func simulationExitRetryDelay(failedAttempts int) time.Duration {
+	delay := exitRetryDelay
+	for i := 1; i < failedAttempts && delay < 30*time.Second; i++ {
+		delay *= 2
+	}
+	if delay > 30*time.Second {
+		return 30 * time.Second
+	}
+	return delay
+}
+
+func (m *Monitor) blockAutomaticSimulationExitRetries(mint, reason string, failedAttempts int) {
+	if _, alreadyReported := m.exitRetryExhausted.LoadOrStore(mint, struct{}{}); alreadyReported {
+		return
+	}
+	m.log.Error("automatic simulated exit retries stopped; manual reconciliation is required",
+		zap.String("mint", mint),
+		zap.String("reason", reason),
+		zap.Int("failed_attempts", failedAttempts),
+		zap.Int("max_attempts", maxAutomaticSimulationExitAttempts))
+	m.bus.Publish("risk_alert", map[string]any{
+		"mint": mint, "simulation": true,
+		"reason": "automatic simulated exit retries stopped; inspect the failed sell and database error before retrying",
+		"failedAttempts": failedAttempts, "maxAttempts": maxAutomaticSimulationExitAttempts,
+	})
 }
 
 // timestampFromEvent accepts timestamp variants emitted by PumpPortal. Live

@@ -1,4 +1,5 @@
 - [Go toolchain verification](go-toolchain.md) — this workspace's Go 1.21 toolchain cannot satisfy the project's Go 1.24 requirement with checksum downloads disabled.
 - [Unknown live exits](unknown-live-exits.md) — reconcile a persisted signature before retrying; only a definitive failure permits a replacement sell.
+- [Simulation sell finalization](simulation-sell-finalization.md) — zero-valued failure rows are schema-compatible, but only successful sells on closed positions count as realized.
 - [Code-only Go changes](code-only-go.md) — in this project, integrate Go changes in source without executing Go or starting the bot.
 - [First-pump strategy](first-pump.md) — enter quickly; keep TP/SL, trailing/max-hold, financial limits, reconciliation, and post-entry-only RugCheck.

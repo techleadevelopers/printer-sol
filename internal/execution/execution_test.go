@@ -84,3 +84,70 @@ func TestSimulationChargesPriorityAndBaseFeePerTransaction(t *testing.T) {
 		t.Fatalf("round-trip simulated fees = %.9f SOL, want 0.00201 SOL", fees)
 	}
 }
+
+func TestFailedSimulationSellDoesNotCloseOrChargePosition(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "failed-simulation-sell.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenSimulationPosition("failed-paper-mint", 0.05); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`CREATE TRIGGER reject_simulated_sell
+		BEFORE UPDATE OF state ON trades
+		WHEN NEW.side='sell' AND NEW.state='simulated'
+		BEGIN SELECT RAISE(FAIL, 'forced simulated sell failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := New(db, nil, nil, nil, nil, zap.NewNop(), true, 1, nil, nil, Limits{
+		SimulationBaseFeeSOL: 0.001,
+	})
+	id, err := engine.Execute(context.Background(), Request{
+		Mint: "failed-paper-mint", Side: "sell", Amount: 0.04, DenominatedInSOL: true,
+		Reason: "stop loss reached in simulation",
+	})
+	if err == nil || !strings.Contains(err.Error(), "forced simulated sell failure") {
+		t.Fatalf("expected the injected finalization error, got trade=%q err=%v", id, err)
+	}
+	if id == "" {
+		t.Fatal("failed finalization did not retain its trade id")
+	}
+	if _, open, openErr := db.PositionOpenedAt("failed-paper-mint"); openErr != nil || !open {
+		t.Fatalf("failed simulated sell should keep position open: open=%v err=%v", open, openErr)
+	}
+
+	var state string
+	if err = db.QueryRow(`SELECT state FROM trades WHERE id=?`, id).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "failed" {
+		t.Fatalf("failed simulated sell state = %q; want failed", state)
+	}
+	var transactionState string
+	if err = db.QueryRow(`SELECT state FROM transactions WHERE trade_id=?`, id).Scan(&transactionState); err != nil {
+		t.Fatal(err)
+	}
+	if transactionState != "failed" {
+		t.Fatalf("failed simulated sell transaction state = %q; want failed", transactionState)
+	}
+	stats, err := db.Performance(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.SellAttempts != 1 || stats.FailedSellAttempts != 1 || stats.ClosedTrades != 0 ||
+		stats.FeesSOL != 0 || stats.GrossRealizedPnlSOL != 0 || stats.NetRealizedPnlSOL != 0 {
+		t.Fatalf("failed sell contaminated performance: %+v", stats)
+	}
+	balance, err := db.SimulationAvailableBalanceSOL(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if balance < 0.949999999 || balance > 0.950000001 {
+		t.Fatalf("failed sell changed virtual balance to %.9f SOL; want 0.95 SOL", balance)
+	}
+}

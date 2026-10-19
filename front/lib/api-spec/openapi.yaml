@@ -474,7 +474,7 @@ components:
         message: { type: ["string", "null"] }
     Dashboard:
       type: object
-      required: [botStatus, mode, walletBalanceSol, walletBalanceLow, feesReserveSol, detectedTokens, analyzedTokens, tradesCount, openPositions, realizedPnlSol, estimatedOpenPnlSol, netPnlSol, costsSol, cumulativeResult, tradesByPeriod, balanceHistory, recentTrades]
+      required: [botStatus, mode, walletBalanceSol, walletBalanceLow, feesReserveSol, detectedTokens, analyzedTokens, tradesCount, openPositions, realizedPnlSol, estimatedOpenPnlSol, netPnlSol, costsSol, cumulativeResult, tradesByPeriod, balanceHistory, recentTrades, closedTrades, sellAttempts, failedSellAttempts]
       properties:
         botStatus: { $ref: "#/components/schemas/BotStatus" }
         mode: { $ref: "#/components/schemas/BotMode" }
@@ -484,6 +484,9 @@ components:
         detectedTokens: { type: ["integer", "null"] }
         analyzedTokens: { type: ["integer", "null"] }
         tradesCount: { type: ["integer", "null"] }
+        closedTrades: { type: integer, description: Completed buy-and-sell cycles only. }
+        sellAttempts: { type: integer, description: Total sell attempts, including failed attempts. }
+        failedSellAttempts: { type: integer, description: Sell attempts persisted with failed state. }
         openPositions: { type: ["integer", "null"] }
         realizedPnlSol: { type: ["number", "null"] }
         estimatedOpenPnlSol: { type: ["number", "null"] }

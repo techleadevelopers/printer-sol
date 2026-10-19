@@ -73,6 +73,9 @@ type PerformanceReport = {
   period: { from: string; to: string };
   summary: ReportSummary;
   trades: ReportTrade[];
+  sellAttempts: number;
+  failedSellAttempts: number;
+  completedSells: number;
   cumulativeCurve: { timestamp: string; cumulativePnlSol: number }[];
   byHour: { hour: string; trades: number; netPnlSol: number }[];
   allFeesPaidSol: number;
@@ -106,8 +109,8 @@ function dateBoundary(value: string, endExclusive: boolean) {
   return boundary.toISOString();
 }
 
-function Metric({ label, value, suffix = 'SOL', tone }: { label: string; value: string; suffix?: string; tone?: string }) {
-  return <div className="panel metric p-4"><div className="eyebrow">{label}</div><div className={`metric-value mt-3 ${tone || ''}`}>{value}<span className="ml-1 text-xs font-normal muted">{suffix}</span></div></div>;
+function Metric({ label, value, suffix = 'SOL', tone, note }: { label: string; value: string; suffix?: string; tone?: string; note?: string }) {
+  return <div className="panel metric p-4"><div className="eyebrow">{label}</div><div className={`metric-value mt-3 ${tone || ''}`}>{value}<span className="ml-1 text-xs font-normal muted">{suffix}</span></div>{note && <div className="mt-2 text-xs muted">{note}</div>}</div>;
 }
 
 export default function PerformanceReportPage() {
@@ -178,7 +181,9 @@ export default function PerformanceReportPage() {
         <Metric label="P&L bruto fechado" value={numberSol(summary.grossPnlSol)} />
         <Metric label="Taxas das operações fechadas" value={numberSol(closedFees)} tone="warning" />
         <Metric label="Taxas totais no período" value={numberSol(data.allFeesPaidSol)} tone="warning" />
-        <Metric label="Operações encerradas" value={number(summary.totalTrades, 0)} suffix="trades" />
+        <Metric label="Vendas concluídas" value={number(data.completedSells, 0)} suffix="trades" />
+        <Metric label="Tentativas de venda" value={number(data.sellAttempts, 0)} suffix="tentativas" />
+        <Metric label="Vendas falhas" value={number(data.failedSellAttempts, 0)} suffix="tentativas" tone="warning" />
         <Metric label="Taxa de acerto" value={number(summary.winRate, 2)} suffix="%" tone={summary.winRate >= 45 ? 'positive' : 'warning'} />
         <Metric label="Expectativa por operação" value={numberSol(summary.evPerTradeSol)} tone={summary.evPerTradeSol > 0 ? 'positive' : 'negative'} />
         <Metric label="Drawdown máximo" value={numberSol(summary.maxDrawdownSol)} tone="warning" />
