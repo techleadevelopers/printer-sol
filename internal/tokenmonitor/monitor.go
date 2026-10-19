@@ -112,6 +112,7 @@ type Monitor struct {
 const exitRetryDelay = 5 * time.Second
 const maxAutomaticSimulationExitAttempts = 3
 const staleSimulationSellRecoveryAge = time.Minute
+const stuckExitQuarantineAge = 2 * time.Minute
 
 func (m *Monitor) runOperation(fn func()) bool {
 	return m.runOperationAt(m.resetGeneration.Load(), fn)
