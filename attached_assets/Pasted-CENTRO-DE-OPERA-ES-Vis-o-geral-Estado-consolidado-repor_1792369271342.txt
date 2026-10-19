@@ -1,0 +1,295 @@
+CENTRO DE OPERAÇÕES
+Visão geral
+Estado consolidado reportado pelo serviço de operações.
+
+BOT
+running
+MODO
+simulation
+Pausar novas compras
+Parar novas operações
+Limpar operações paper
+Atualizado às 21:20:55 · consulta de segurança a cada 5 s; fluxo de eventos reconectando
+
+Parar interrompe novas operações; não fecha posições existentes.
+
+Tokens detetados
+4.948
+Tokens analisados
+4.968
+Operações encerradas
+10
+Ciclos de compra e venda concluídos
+Posições abertas
+10
+Saldo disponível paper
+0,548966078SOL
+Patrimônio virtual paper
+1,011096571SOL
+Inclui posições abertas pela última marca disponível.
+Reserva de taxas
+0,01SOL
+P&L realizado · paper
+0,046459605SOL
+P&L aberto estimado
+-0,025313034SOL
+Estimativa paper por market cap; ainda não é resultado fechado.
+Evolução do patrimônio paper
+SOL · API
+18 de out. de 2026, 17:25
+18 de out. de 2026, 21:20
+Resultado total estimado
+Realizado + aberto estimado
+0,011096571SOL
+A parcela aberta é estimada, não uma venda confirmada.
+Custos
+0,03015SOL
+OPERAÇÕES POR PERÍODO
+2026-10-19
+1/3de 4
+P&L realizado acumulado
+SOL · OPERAÇÕES FECHADAS
+18/10/2026
+18/10/2026
+18/10/2026
+18/10/2026
+18/10/2026
+0
+0.02
+0.04
+0.06
+0.08
+
+Operações por período
+CONTAGEM · API
+2026-10-19
+0
+1
+2
+3
+4
+
+Distribuição dos resultados
+OPERAÇÕES · API
+● Positivas
+1
+● Negativas
+3
+Histórico do saldo
+SOL · API
+18/10/2026
+18/10/2026
+18/10/2026
+18/10/2026
+18/10/2026
+18/10/2026
+0
+0.3
+0.6
+0.9
+1.2
+
+Saúde dos serviços
+API
+ok
+Monitor de eventos
+connected
+Verificado
+18 de out. de 2026, 21:20
+Monitor de eventos
+A ligar
+Aguardando conexão com o back-end
+
+Operações recentes
+[Ver histórico](https://solana-sniper-bot-dashboard.vercel.app/user-portal/trades) 
+Data	Token / Mint	Lado	Quantidade	Valor SOL	Taxas	Slippage	P&L bruto do ciclo	P&L líquido do ciclo	Motivo	Estado	Explorer / ID
+18 de out. de 2026, 21:20	
+Token sem nome
+3rgrg…upump
+Venda	0,041	0,040924222	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:20	
+Token sem nome
+3rgrg…upump
+Venda	0,041	0,040924222	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:20	
+Token sem nome
+3rgrg…upump
+Venda	0,041	0,040924222	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:20	
+Token sem nome
+3rgrg…upump
+Venda	0,041	0,040924222	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:20	
+Token sem nome
+3rgrg…upump
+Venda	0,041	0,040924222	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:20	
+Token sem nome
+3rgrg…upump
+Venda	0,041	0,040924222	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:20	
+Token sem nome
+3rgrg…upump
+Venda	0,041	0,040924222	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:20	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039904623	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:20	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039904623	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039904623	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039904623	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,03956675	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,03956675	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,03956675	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:19	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:18	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss reached in simulation	
+failed	
+—
+18 de out. de 2026, 21:17	
+Token sem nome
+3rgrg…upump
+Venda	0,04	0,039600775	0,001005	0%	0,001005	0	stop loss
