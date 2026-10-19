@@ -520,6 +520,16 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	return id, nil
 }
 
+// resolveSimulationSellFinalizationError classifies the outcome of a failed
+// paper-sell finalization. It MUST leave the system in a terminal, retry-safe
+// state. Two terminal outcomes exist:
+//
+//  1. Complete: trade/transaction/position all persisted as simulated/closed.
+//  2. Definitive failure: trade/transaction failed AND position still open.
+//
+// Anything else is marked unknown so ActiveForMint blocks a second sell, and
+// ReconcileStaleSimulationSells later converts it to failed. Only when the
+// unknown state cannot be persisted at all is an error returned to the caller.
 func (e *Engine) resolveSimulationSellFinalizationError(id string, request Request, fees float64, finalizeErr error) error {
 	snapshot, snapshotErr := e.db.SimulationSellSnapshot(id, request.Mint)
 	if snapshotErr == nil &&
@@ -615,7 +625,11 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 			"error":  finalizeErr.Error(),
 		})
 	}
-	return fmt.Errorf("close simulated position: %w", finalizeErr)
+	// The failure/unknown state is persisted and ActiveForMint will block a
+	// duplicate sell. Returning nil here is what stops the monitor from
+	// re-evaluating this mint in a tight loop. ReconcileStaleSimulationSells
+	// will convert a stale unknown into failed once the cooldown elapses.
+	return nil
 }
 
 func (e *Engine) confirm(id, sig string, r Request) {

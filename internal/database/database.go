@@ -249,6 +249,9 @@ func (d *DB) SimulationSellSnapshot(id, mint string) (SimulationSellSnapshot, er
 
 // MarkSimulationSellUnknown keeps an unresolved local exit active so the
 // monitor cannot retry it until persisted state has been reconciled.
+// It is intentionally idempotent: a trade/transaction already in 'unknown'
+// does not fail the update, which keeps the terminal safety barrier intact
+// even if a previous attempt partially committed.
 func (d *DB) MarkSimulationSellUnknown(id string) error {
 	now := time.Now().UTC()
 	tx, err := d.Begin()
