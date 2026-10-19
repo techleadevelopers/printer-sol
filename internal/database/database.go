@@ -131,45 +131,63 @@ func (d *DB) UpdateTradeState(id, state, sig string, confirmed bool) error {
 	now := time.Now().UTC()
 	tx, e := d.Begin()
 	if e != nil {
-		return e
+		return fmt.Errorf("begin trade state update for %q: %w", id, e)
 	}
-	if _, e = tx.Exec(d.bind(`UPDATE trades SET state=?, signature=COALESCE(NULLIF(?,''),signature), submitted_at=CASE WHEN ? IN ('submitted','pending') THEN ? ELSE submitted_at END, confirmed_at=CASE WHEN ? THEN ? ELSE confirmed_at END, reconciliation_needed=?, updated_at=? WHERE id=?`), state, sig, state, now, confirmed, now, !confirmed, now, id); e == nil {
-		_, e = tx.Exec(d.bind(`UPDATE transactions SET state=?,signature=COALESCE(NULLIF(?,''),signature),updated_at=? WHERE trade_id=?`), state, sig, now, id)
-	}
+	defer tx.Rollback()
+	result, e := tx.Exec(d.bind(`UPDATE trades SET state=?, signature=COALESCE(NULLIF(?,''),signature), submitted_at=CASE WHEN ? IN ('submitted','pending') THEN ? ELSE submitted_at END, confirmed_at=CASE WHEN ? THEN ? ELSE confirmed_at END, reconciliation_needed=?, updated_at=? WHERE id=?`), state, sig, state, now, confirmed, now, !confirmed, now, id)
 	if e != nil {
-		_ = tx.Rollback()
-		return e
+		return fmt.Errorf("update trade %q to %q: %w", id, state, e)
 	}
-	return tx.Commit()
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return fmt.Errorf("check trade %q state update: %w", id, rowsErr)
+	} else if affected != 1 {
+		return fmt.Errorf("trade %q not found while setting state %q", id, state)
+	}
+	result, e = tx.Exec(d.bind(`UPDATE transactions SET state=?,signature=COALESCE(NULLIF(?,''),signature),updated_at=? WHERE trade_id=?`), state, sig, now, id)
+	if e != nil {
+		return fmt.Errorf("update transaction for trade %q to %q: %w", id, state, e)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return fmt.Errorf("check transaction state update for trade %q: %w", id, rowsErr)
+	} else if affected != 1 {
+		return fmt.Errorf("transaction for trade %q not found while setting state %q", id, state)
+	}
+	if e = tx.Commit(); e != nil {
+		return fmt.Errorf("commit trade state %q for %q: %w", state, id, e)
+	}
+	return nil
 }
 
 func (d *DB) MarkTradeFailed(id string) error {
 	now := time.Now().UTC()
 	tx, err := d.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("begin failed-trade update for %q: %w", id, err)
 	}
 	defer tx.Rollback()
 
-	result, err := tx.Exec(d.bind(`UPDATE trades SET state='failed',reconciliation_needed=?,updated_at=? WHERE id=?`), false, now, id)
+	result, err := tx.Exec(d.bind(`UPDATE trades SET state='failed',reconciliation_needed=?,updated_at=? WHERE id=? AND state IN ('prepared','unknown')`), false, now, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("mark trade %q failed: %w", id, err)
 	}
 	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-		return rowsErr
+		return fmt.Errorf("check failed state for trade %q: %w", id, rowsErr)
 	} else if affected != 1 {
-		return fmt.Errorf("failed trade %q not found", id)
+		return fmt.Errorf("trade %q is not in a markable state", id)
 	}
-	result, err = tx.Exec(d.bind(`UPDATE transactions SET state='failed',updated_at=? WHERE trade_id=?`), now, id)
+	result, err = tx.Exec(d.bind(`UPDATE transactions SET state='failed',updated_at=? WHERE trade_id=? AND state IN ('prepared','unknown')`), now, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("mark transaction for trade %q failed: %w", id, err)
 	}
 	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-		return rowsErr
+		return fmt.Errorf("check failed transaction state for trade %q: %w", id, rowsErr)
 	} else if affected != 1 {
-		return fmt.Errorf("transaction for failed trade %q not found", id)
+		return fmt.Errorf("transaction for trade %q is not in a markable state", id)
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit failed state for trade %q: %w", id, err)
+	}
+	return nil
 }
 
 func (d *DB) ActiveForMint(mint string) (bool, error) {
@@ -189,6 +207,160 @@ func (d *DB) HasFailedSellForMint(mint string) (bool, error) {
 	var n int
 	e := d.QueryRow(d.bind(`SELECT COUNT(*) FROM trades WHERE mint=? AND side='sell' AND state='failed'`), mint).Scan(&n)
 	return n > 0, e
+}
+
+// FailedSellRetryState makes the retry count and cooldown survive process
+// restarts by deriving them from persisted, definitively failed sell attempts.
+func (d *DB) FailedSellRetryState(mint string) (int, time.Time, error) {
+	var attempts int
+	var lastFailure sql.NullTime
+	err := d.QueryRow(d.bind(`SELECT COUNT(*),MAX(updated_at) FROM trades
+		WHERE mint=? AND side='sell' AND state='failed'`), mint).Scan(&attempts, &lastFailure)
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("read failed sell retry state for mint %q: %w", mint, err)
+	}
+	if !lastFailure.Valid {
+		return attempts, time.Time{}, nil
+	}
+	return attempts, lastFailure.Time.UTC(), nil
+}
+
+type SimulationSellSnapshot struct {
+	TradeState       string
+	TransactionState string
+	PositionState    string
+}
+
+// SimulationSellSnapshot reads the records that must change together when a
+// paper sell is finalized.
+func (d *DB) SimulationSellSnapshot(id, mint string) (SimulationSellSnapshot, error) {
+	var snapshot SimulationSellSnapshot
+	err := d.QueryRow(d.bind(`SELECT t.state,COALESCE(x.state,''),COALESCE(p.status,'')
+		FROM trades t
+		LEFT JOIN transactions x ON x.trade_id=t.id
+		LEFT JOIN positions p ON p.mint=t.mint
+		WHERE t.id=? AND t.mint=? AND t.side='sell'`), id, mint).Scan(
+		&snapshot.TradeState, &snapshot.TransactionState, &snapshot.PositionState)
+	if err != nil {
+		return snapshot, fmt.Errorf("read simulated sell snapshot id=%q mint=%q: %w", id, mint, err)
+	}
+	return snapshot, nil
+}
+
+// MarkSimulationSellUnknown keeps an unresolved local exit active so the
+// monitor cannot retry it until persisted state has been reconciled.
+func (d *DB) MarkSimulationSellUnknown(id string) error {
+	now := time.Now().UTC()
+	tx, err := d.Begin()
+	if err != nil {
+		return fmt.Errorf("begin unknown simulated sell update for %q: %w", id, err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(d.bind(`UPDATE trades SET state='unknown',reconciliation_needed=?,updated_at=?
+		WHERE id=? AND side='sell' AND state IN ('prepared','unknown')`), true, now, id)
+	if err != nil {
+		return fmt.Errorf("mark simulated sell %q unknown: %w", id, err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return fmt.Errorf("check unknown state for simulated sell %q: %w", id, rowsErr)
+	} else if affected != 1 {
+		return fmt.Errorf("simulated sell %q is not in a markable state", id)
+	}
+	result, err = tx.Exec(d.bind(`UPDATE transactions SET state='unknown',updated_at=?
+		WHERE trade_id=? AND state IN ('prepared','unknown')`), now, id)
+	if err != nil {
+		return fmt.Errorf("mark transaction for simulated sell %q unknown: %w", id, err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return fmt.Errorf("check unknown transaction state for simulated sell %q: %w", id, rowsErr)
+	} else if affected != 1 {
+		return fmt.Errorf("transaction for simulated sell %q is not in a markable state", id)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit unknown state for simulated sell %q: %w", id, err)
+	}
+	return nil
+}
+
+// ReconcileStaleSimulationSells releases old active paper sells only when the
+// position is still open and the transaction never reached a finalized state.
+// Paper exits have no external submission side effect, so this is definitive.
+func (d *DB) ReconcileStaleSimulationSells(mint string, olderThan time.Time) (int, error) {
+	tx, err := d.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin stale simulated sell reconciliation for mint %q: %w", mint, err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(d.bind(`SELECT t.id,t.state,COALESCE(x.state,''),COALESCE(p.status,''),t.updated_at
+		FROM trades t
+		LEFT JOIN transactions x ON x.trade_id=t.id
+		LEFT JOIN positions p ON p.mint=t.mint
+		WHERE t.mint=? AND t.side='sell' AND t.state IN ('prepared','unknown')
+		ORDER BY t.created_at`), mint)
+	if err != nil {
+		return 0, fmt.Errorf("find stale simulated sells for mint %q: %w", mint, err)
+	}
+	type staleSell struct {
+		id, tradeState, transactionState, positionState string
+		updatedAt                                       time.Time
+	}
+	var candidates []staleSell
+	for rows.Next() {
+		var candidate staleSell
+		if err = rows.Scan(&candidate.id, &candidate.tradeState, &candidate.transactionState, &candidate.positionState, &candidate.updatedAt); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("read stale simulated sell for mint %q: %w", mint, err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("iterate stale simulated sells for mint %q: %w", mint, err)
+	}
+	if err = rows.Close(); err != nil {
+		return 0, fmt.Errorf("close stale simulated sell scan for mint %q: %w", mint, err)
+	}
+
+	reconciled := 0
+	now := time.Now().UTC()
+	for _, candidate := range candidates {
+		if candidate.updatedAt.After(olderThan) {
+			continue
+		}
+		if candidate.positionState != "open" ||
+			(candidate.tradeState != "prepared" && candidate.tradeState != "unknown") ||
+			candidate.transactionState != candidate.tradeState {
+			return 0, fmt.Errorf("stale simulated sell id=%q mint=%q has inconsistent persisted states trade=%q transaction=%q position=%q",
+				candidate.id, mint, candidate.tradeState, candidate.transactionState, candidate.positionState)
+		}
+		result, updateErr := tx.Exec(d.bind(`UPDATE trades SET state='failed',reconciliation_needed=?,updated_at=?
+			WHERE id=? AND side='sell' AND state=?`), false, now, candidate.id, candidate.tradeState)
+		if updateErr != nil {
+			return 0, fmt.Errorf("recover stale simulated sell id=%q mint=%q: %w", candidate.id, mint, updateErr)
+		}
+		if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+			return 0, fmt.Errorf("check stale simulated sell id=%q mint=%q: %w", candidate.id, mint, rowsErr)
+		} else if affected != 1 {
+			return 0, fmt.Errorf("stale simulated sell id=%q mint=%q changed during reconciliation", candidate.id, mint)
+		}
+		result, updateErr = tx.Exec(d.bind(`UPDATE transactions SET state='failed',updated_at=?
+			WHERE trade_id=? AND state=?`), now, candidate.id, candidate.transactionState)
+		if updateErr != nil {
+			return 0, fmt.Errorf("recover transaction for stale simulated sell id=%q mint=%q: %w", candidate.id, mint, updateErr)
+		}
+		if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+			return 0, fmt.Errorf("check transaction recovery for simulated sell id=%q mint=%q: %w", candidate.id, mint, rowsErr)
+		} else if affected != 1 {
+			return 0, fmt.Errorf("transaction for stale simulated sell id=%q mint=%q changed during reconciliation", candidate.id, mint)
+		}
+		reconciled++
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit stale simulated sell reconciliation for mint %q: %w", mint, err)
+	}
+	return reconciled, nil
 }
 func (d *DB) RecordEvent(mint, creator, raw string, at time.Time, latency int64) error {
 	query := `INSERT OR IGNORE INTO token_events(mint,creator,received_at,raw_json,latency_ms) VALUES(?,?,?,?,?)`
@@ -261,17 +433,17 @@ func (d *DB) FinalizeSimulationBuy(id, mint string, amount float64, feesOpt ...f
 func (d *DB) FinalizeSimulationSell(id, mint string, value float64, feesOpt ...float64) error {
 	tx, err := d.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("begin finalization for simulated sell id=%q mint=%q: %w", id, mint, err)
 	}
 	defer tx.Rollback()
 
 	var cost float64
 	if err = tx.QueryRow(d.bind(`SELECT COALESCE(cost_sol,0) FROM positions WHERE mint=? AND status='open'`), mint).Scan(&cost); err != nil {
-		return err
+		return fmt.Errorf("read open position cost for simulated sell id=%q mint=%q: %w", id, mint, err)
 	}
 	var exitReason string
 	if err = tx.QueryRow(d.bind(`SELECT COALESCE(exit_reason,'') FROM trades WHERE id=? AND side='sell'`), id).Scan(&exitReason); err != nil {
-		return err
+		return fmt.Errorf("read exit reason for simulated sell id=%q mint=%q: %w", id, mint, err)
 	}
 	exitReason = strings.TrimSpace(exitReason)
 	if exitReason == "" {
@@ -285,30 +457,39 @@ func (d *DB) FinalizeSimulationSell(id, mint string, value float64, feesOpt ...f
 	realizedPnl := value - cost
 	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=? AND status='open'`), now, mint)
 	if err != nil {
-		return err
+		return fmt.Errorf("mark position closed for simulated sell id=%q mint=%q: %w", id, mint, err)
 	}
 	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-		return rowsErr
+		return fmt.Errorf("check position close for simulated sell id=%q mint=%q: %w", id, mint, rowsErr)
 	} else if affected != 1 {
 		return fmt.Errorf("simulated position %q is no longer open", mint)
 	}
 	result, err = tx.Exec(d.bind(`UPDATE trades SET state='simulated',executed_value_sol=COALESCE(?,0.0),fees_sol=COALESCE(?,0.0),realized_pnl_sol=COALESCE(?,0.0),exit_reason=COALESCE(NULLIF(TRIM(exit_reason),''),?),confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=? AND side='sell'`),
 		value, fees, realizedPnl, exitReason, now, false, now, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("finalize trade row for simulated sell id=%q mint=%q: %w", id, mint, err)
 	}
 	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-		return rowsErr
+		return fmt.Errorf("check trade finalization for simulated sell id=%q mint=%q: %w", id, mint, rowsErr)
 	} else if affected != 1 {
 		return fmt.Errorf("simulated sell trade %q not found", id)
 	}
-	if _, err = tx.Exec(d.bind(`UPDATE transactions SET state='simulated',updated_at=? WHERE trade_id=?`), now, id); err != nil {
-		return err
+	result, err = tx.Exec(d.bind(`UPDATE transactions SET state='simulated',updated_at=? WHERE trade_id=?`), now, id)
+	if err != nil {
+		return fmt.Errorf("finalize transaction row for simulated sell id=%q mint=%q: %w", id, mint, err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return fmt.Errorf("check transaction finalization for simulated sell id=%q mint=%q: %w", id, mint, rowsErr)
+	} else if affected != 1 {
+		return fmt.Errorf("transaction for simulated sell %q not found", id)
 	}
 	if err = blacklistCreatorAfterStopLoss(tx, d, mint, exitReason, now); err != nil {
-		return err
+		return fmt.Errorf("apply stop-loss creator blacklist for simulated sell id=%q mint=%q: %w", id, mint, err)
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit finalization for simulated sell id=%q mint=%q: %w", id, mint, err)
+	}
+	return nil
 }
 
 func (d *DB) FinalizeLiveBuy(id, mint, state, signature string, cost, fees float64) error {
