@@ -478,6 +478,51 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 					zap.String("mint", mint),
 					zap.Int("attempts", reconciled))
 			}
+
+			// Break-glass: if the position is still open and the last sell
+			// attempt is terminally failed/unknown beyond the quarantine
+			// window, close the paper position and mark the stuck sell as
+			// failed with reconciliation_needed=false. This releases
+			// MaxOpenPositions even if the monitor never observes a fresh
+			// stop-loss signal on this mint again.
+			stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-stuckExitQuarantineAge))
+			if stuckErr != nil {
+				m.log.Warn("check stuck exit mint", zap.String("mint", mint), zap.Error(stuckErr))
+				continue
+			}
+			if stuck {
+				cleaned, quarantineErr := m.db.QuarantineStuckSimulationMint(mint, now.Add(-stuckExitQuarantineAge))
+				if quarantineErr != nil {
+					m.log.Warn("quarantine stuck simulated mint",
+						zap.String("mint", mint),
+						zap.Error(quarantineErr))
+					continue
+				}
+				if cleaned > 0 {
+					m.log.Error("quarantined stuck simulated mint",
+						zap.String("mint", mint),
+						zap.Int("cleaned_sells", cleaned))
+					payload, _ := json.Marshal(map[string]any{
+						"mint": mint, "simulation": true, "cleanedSells": cleaned,
+					})
+					if logErr := m.db.LogOperational("error", "stuck_mint_quarantined",
+						"stuck simulated exit quarantined; position closed and slot released",
+						string(payload)); logErr != nil {
+						m.log.Warn("record quarantine audit", zap.String("mint", mint), zap.Error(logErr))
+					}
+					m.bus.Publish("risk_alert", map[string]any{
+						"mint": mint, "simulation": true,
+						"reason":          "stuck simulated exit quarantined; position closed and slot released",
+						"cleanedSells":    cleaned,
+						"positionRemainsOpen": false,
+					})
+					m.tracked.Delete(mint)
+					m.exitRetryAfter.Delete(mint)
+					m.exitIntents.Delete(mint)
+					m.exitRetryExhausted.Delete(mint)
+				}
+				continue
+			}
 		}
 		openedAt, open, err := m.db.PositionOpenedAt(mint)
 		if err != nil {

@@ -212,10 +212,10 @@ func (d *DB) HasFailedSellForMint(mint string) (bool, error) {
 // FailedSellRetryState makes the retry count and cooldown survive process
 // restarts by deriving them from persisted, definitively failed sell attempts.
 //
-// It now only counts failures for mints whose position is still open: once a
-// position is closed (e.g. by MarkSimulationSellFailed or a successful sell),
-// the historical failure is irrelevant to retry scheduling and must not pin
-// the monitor in a retry loop for a mint that has no remaining exposure.
+// It only counts failures for mints whose position is still open: once a
+// position is closed, the historical failure is irrelevant to retry
+// scheduling and must not pin the monitor in a retry loop for a mint with no
+// remaining exposure.
 func (d *DB) FailedSellRetryState(mint string) (int, time.Time, error) {
 	var attempts int
 	var lastFailure sql.NullTime
@@ -233,9 +233,9 @@ func (d *DB) FailedSellRetryState(mint string) (int, time.Time, error) {
 }
 
 // LastSellState reports the state of the most recent sell trade for a mint.
-// Callers use it to distinguish "there is no active sell, but the last one
-// failed/unknown and the position is still open" from "the mint is genuinely
-// free for a new exit attempt".
+// Callers use it to distinguish "no active sell, but the last one failed/
+// unknown and the position is still open" from "the mint is genuinely free
+// for a new exit attempt".
 func (d *DB) LastSellState(mint string) (state string, updatedAt time.Time, err error) {
 	var s string
 	var at sql.NullTime
@@ -251,6 +251,98 @@ func (d *DB) LastSellState(mint string) (state string, updatedAt time.Time, err 
 		updatedAt = at.Time.UTC()
 	}
 	return s, updatedAt, nil
+}
+
+// StuckExitMint reports whether a mint is in a state that pins the monitor:
+// an open position whose most recent sell attempt terminated as failed or
+// unknown and is older than olderThan. This is the break-glass condition used
+// to quarantine a token that cannot be reconciled automatically.
+func (d *DB) StuckExitMint(mint string, olderThan time.Time) (bool, error) {
+	var count int
+	err := d.QueryRow(d.bind(`SELECT COUNT(*)
+		FROM positions p
+		JOIN trades t ON t.mint=p.mint AND t.side='sell'
+		WHERE p.mint=? AND p.status='open'
+		AND t.state IN ('failed','unknown','prepared')
+		AND t.updated_at < ?`), mint, olderThan).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check stuck exit mint %q: %w", mint, err)
+	}
+	return count > 0, nil
+}
+
+// QuarantineStuckSimulationMint is the break-glass cleanup for a paper mint
+// whose position is open but whose latest sell attempt is terminally stuck.
+// It closes the position, marks the stuck sell trade/transaction as failed
+// with reconciliation_needed=false so the monitor stops retrying, and leaves
+// the audit trail intact. It never deletes rows; the position remains visible
+// in the panel but is closed and will no longer pin MaxOpenPositions.
+func (d *DB) QuarantineStuckSimulationMint(mint string, olderThan time.Time) (int, error) {
+	tx, err := d.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin quarantine for stuck mint %q: %w", mint, err)
+	}
+	defer tx.Rollback()
+
+	var positionOpen int
+	if err = tx.QueryRow(d.bind(`SELECT COUNT(*) FROM positions WHERE mint=? AND status='open'`), mint).Scan(&positionOpen); err != nil {
+		return 0, fmt.Errorf("read open position for stuck mint %q: %w", mint, err)
+	}
+	if positionOpen == 0 {
+		return 0, nil
+	}
+
+	now := time.Now().UTC()
+	rows, err := tx.Query(d.bind(`SELECT id FROM trades
+		WHERE mint=? AND side='sell'
+		AND state IN ('failed','unknown','prepared')
+		AND updated_at < ?`), mint, olderThan)
+	if err != nil {
+		return 0, fmt.Errorf("find stuck sells for mint %q: %w", mint, err)
+	}
+	var tradeIDs []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("read stuck sell id for mint %q: %w", mint, err)
+		}
+		tradeIDs = append(tradeIDs, id)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("iterate stuck sells for mint %q: %w", mint, err)
+	}
+	if err = rows.Close(); err != nil {
+		return 0, fmt.Errorf("close stuck sell scan for mint %q: %w", mint, err)
+	}
+
+	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=? AND status='open'`), now, mint)
+	if err != nil {
+		return 0, fmt.Errorf("close stuck position for mint %q: %w", mint, err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return 0, fmt.Errorf("check stuck position close for mint %q: %w", mint, rowsErr)
+	} else if affected != 1 {
+		return 0, fmt.Errorf("stuck position for mint %q changed during quarantine", mint)
+	}
+
+	cleaned := 0
+	for _, id := range tradeIDs {
+		if _, err = tx.Exec(d.bind(`UPDATE trades SET state='failed',reconciliation_needed=?,updated_at=?
+			WHERE id=? AND side='sell' AND state IN ('failed','unknown','prepared')`), false, now, id); err != nil {
+			return 0, fmt.Errorf("quarantine trade %q for mint %q: %w", id, mint, err)
+		}
+		if _, err = tx.Exec(d.bind(`UPDATE transactions SET state='failed',updated_at=?
+			WHERE trade_id=? AND state IN ('prepared','unknown','failed')`), now, id); err != nil {
+			return 0, fmt.Errorf("quarantine transaction for trade %q mint %q: %w", id, mint, err)
+		}
+		cleaned++
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit quarantine for stuck mint %q: %w", mint, err)
+	}
+	return cleaned, nil
 }
 
 type SimulationSellSnapshot struct {
@@ -278,8 +370,7 @@ func (d *DB) SimulationSellSnapshot(id, mint string) (SimulationSellSnapshot, er
 // MarkSimulationSellUnknown keeps an unresolved local exit active so the
 // monitor cannot retry it until persisted state has been reconciled.
 // It is intentionally idempotent: a trade/transaction already in 'unknown'
-// does not fail the update, which keeps the terminal safety barrier intact
-// even if a previous attempt partially committed.
+// does not fail the update.
 func (d *DB) MarkSimulationSellUnknown(id string) error {
 	now := time.Now().UTC()
 	tx, err := d.Begin()
