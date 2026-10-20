@@ -278,6 +278,19 @@ func (d *DB) StuckExitMint(mint string, olderThan time.Time) (bool, error) {
 // the audit trail intact. It never deletes rows; the position remains visible
 // in the panel but is closed and will no longer pin MaxOpenPositions.
 func (d *DB) QuarantineStuckSimulationMint(mint string, olderThan time.Time) (int, error) {
+	return d.quarantineStuckMint(mint, olderThan)
+}
+
+// QuarantineStuckLiveMint mirrors QuarantineStuckSimulationMint for live
+// trades. The state contract is identical: close the position, mark the
+// stuck sell trade/transaction failed with reconciliation_needed=false, and
+// leave the audit trail intact. Without this, a failed live sell would pin
+// MaxOpenPositions forever because the paper-only quarantine does not run.
+func (d *DB) QuarantineStuckLiveMint(mint string, olderThan time.Time) (int, error) {
+	return d.quarantineStuckMint(mint, olderThan)
+}
+
+func (d *DB) quarantineStuckMint(mint string, olderThan time.Time) (int, error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("begin quarantine for stuck mint %q: %w", mint, err)
@@ -351,9 +364,23 @@ type SimulationSellSnapshot struct {
 	PositionState    string
 }
 
+// LiveSellSnapshot mirrors SimulationSellSnapshot for live sells. The three
+// records must change together regardless of mode.
+type LiveSellSnapshot = SimulationSellSnapshot
+
 // SimulationSellSnapshot reads the records that must change together when a
 // paper sell is finalized.
 func (d *DB) SimulationSellSnapshot(id, mint string) (SimulationSellSnapshot, error) {
+	return d.sellSnapshot(id, mint)
+}
+
+// LiveSellSnapshot reads the records that must change together when a live
+// sell is finalized.
+func (d *DB) LiveSellSnapshot(id, mint string) (LiveSellSnapshot, error) {
+	return d.sellSnapshot(id, mint)
+}
+
+func (d *DB) sellSnapshot(id, mint string) (SimulationSellSnapshot, error) {
 	var snapshot SimulationSellSnapshot
 	err := d.QueryRow(d.bind(`SELECT t.state,COALESCE(x.state,''),COALESCE(p.status,'')
 		FROM trades t
@@ -362,7 +389,7 @@ func (d *DB) SimulationSellSnapshot(id, mint string) (SimulationSellSnapshot, er
 		WHERE t.id=? AND t.mint=? AND t.side='sell'`), id, mint).Scan(
 		&snapshot.TradeState, &snapshot.TransactionState, &snapshot.PositionState)
 	if err != nil {
-		return snapshot, fmt.Errorf("read simulated sell snapshot id=%q mint=%q: %w", id, mint, err)
+		return snapshot, fmt.Errorf("read sell snapshot id=%q mint=%q: %w", id, mint, err)
 	}
 	return snapshot, nil
 }
@@ -372,35 +399,44 @@ func (d *DB) SimulationSellSnapshot(id, mint string) (SimulationSellSnapshot, er
 // It is intentionally idempotent: a trade/transaction already in 'unknown'
 // does not fail the update.
 func (d *DB) MarkSimulationSellUnknown(id string) error {
+	return d.markSellUnknown(id)
+}
+
+// MarkLiveSellUnknown mirrors MarkSimulationSellUnknown for live sells.
+func (d *DB) MarkLiveSellUnknown(id string) error {
+	return d.markSellUnknown(id)
+}
+
+func (d *DB) markSellUnknown(id string) error {
 	now := time.Now().UTC()
 	tx, err := d.Begin()
 	if err != nil {
-		return fmt.Errorf("begin unknown simulated sell update for %q: %w", id, err)
+		return fmt.Errorf("begin unknown sell update for %q: %w", id, err)
 	}
 	defer tx.Rollback()
 
 	result, err := tx.Exec(d.bind(`UPDATE trades SET state='unknown',reconciliation_needed=?,updated_at=?
 		WHERE id=? AND side='sell' AND state IN ('prepared','unknown')`), true, now, id)
 	if err != nil {
-		return fmt.Errorf("mark simulated sell %q unknown: %w", id, err)
+		return fmt.Errorf("mark sell %q unknown: %w", id, err)
 	}
 	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-		return fmt.Errorf("check unknown state for simulated sell %q: %w", id, rowsErr)
+		return fmt.Errorf("check unknown state for sell %q: %w", id, rowsErr)
 	} else if affected != 1 {
-		return fmt.Errorf("simulated sell %q is not in a markable state", id)
+		return fmt.Errorf("sell %q is not in a markable state", id)
 	}
 	result, err = tx.Exec(d.bind(`UPDATE transactions SET state='unknown',updated_at=?
 		WHERE trade_id=? AND state IN ('prepared','unknown')`), now, id)
 	if err != nil {
-		return fmt.Errorf("mark transaction for simulated sell %q unknown: %w", id, err)
+		return fmt.Errorf("mark transaction for sell %q unknown: %w", id, err)
 	}
 	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-		return fmt.Errorf("check unknown transaction state for simulated sell %q: %w", id, rowsErr)
+		return fmt.Errorf("check unknown transaction state for sell %q: %w", id, rowsErr)
 	} else if affected != 1 {
-		return fmt.Errorf("transaction for simulated sell %q is not in a markable state", id)
+		return fmt.Errorf("transaction for sell %q is not in a markable state", id)
 	}
 	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit unknown state for simulated sell %q: %w", id, err)
+		return fmt.Errorf("commit unknown state for sell %q: %w", id, err)
 	}
 	return nil
 }
@@ -410,45 +446,56 @@ func (d *DB) MarkSimulationSellUnknown(id string) error {
 // terminal: the position is closed so MaxOpenPositions is released, the trade
 // and transaction are marked failed, and the monitor stops retrying.
 func (d *DB) MarkSimulationSellFailed(id, mint string) error {
+	return d.markSellFailed(id, mint)
+}
+
+// MarkLiveSellFailed mirrors MarkSimulationSellFailed for live sells. The
+// state contract is identical; only the transport that produced the failure
+// differs.
+func (d *DB) MarkLiveSellFailed(id, mint string) error {
+	return d.markSellFailed(id, mint)
+}
+
+func (d *DB) markSellFailed(id, mint string) error {
 	now := time.Now().UTC()
 	tx, err := d.Begin()
 	if err != nil {
-		return fmt.Errorf("begin failed simulated sell update for %q: %w", id, err)
+		return fmt.Errorf("begin failed sell update for %q: %w", id, err)
 	}
 	defer tx.Rollback()
 
 	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=?
 		WHERE mint=? AND status='open'`), now, mint)
 	if err != nil {
-		return fmt.Errorf("close paper position for failed sell %q: %w", id, err)
+		return fmt.Errorf("close position for failed sell %q: %w", id, err)
 	}
 	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-		return fmt.Errorf("check paper position close for %q: %w", id, rowsErr)
+		return fmt.Errorf("check position close for %q: %w", id, rowsErr)
 	} else if affected != 1 {
-		return fmt.Errorf("paper position for mint %q is no longer open", mint)
+		return fmt.Errorf("position for mint %q is no longer open", mint)
 	}
 	result, err = tx.Exec(d.bind(`UPDATE trades SET state='failed',reconciliation_needed=?,updated_at=?
 		WHERE id=? AND side='sell' AND state IN ('prepared','unknown')`), false, now, id)
 	if err != nil {
-		return fmt.Errorf("mark simulated sell %q failed: %w", id, err)
+		return fmt.Errorf("mark sell %q failed: %w", id, err)
 	}
 	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-		return fmt.Errorf("check failed state for simulated sell %q: %w", id, rowsErr)
+		return fmt.Errorf("check failed state for sell %q: %w", id, rowsErr)
 	} else if affected != 1 {
-		return fmt.Errorf("simulated sell %q is not in a markable state", id)
+		return fmt.Errorf("sell %q is not in a markable state", id)
 	}
 	result, err = tx.Exec(d.bind(`UPDATE transactions SET state='failed',updated_at=?
 		WHERE trade_id=? AND state IN ('prepared','unknown')`), now, id)
 	if err != nil {
-		return fmt.Errorf("mark transaction for simulated sell %q failed: %w", id, err)
+		return fmt.Errorf("mark transaction for sell %q failed: %w", id, err)
 	}
 	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-		return fmt.Errorf("check failed transaction state for simulated sell %q: %w", id, rowsErr)
+		return fmt.Errorf("check failed transaction state for sell %q: %w", id, rowsErr)
 	} else if affected != 1 {
-		return fmt.Errorf("transaction for simulated sell %q is not in a markable state", id)
+		return fmt.Errorf("transaction for sell %q is not in a markable state", id)
 	}
 	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit failed simulated sell %q: %w", id, err)
+		return fmt.Errorf("commit failed sell %q: %w", id, err)
 	}
 	return nil
 }
@@ -460,9 +507,22 @@ func (d *DB) MarkSimulationSellFailed(id, mint string) error {
 // The position is closed in the same transaction so the slot is released;
 // otherwise MaxOpenPositions pins the monitor with orphaned open positions.
 func (d *DB) ReconcileStaleSimulationSells(mint string, olderThan time.Time) (int, error) {
+	return d.reconcileStaleSells(mint, olderThan)
+}
+
+// ReconcileStaleLiveSells mirrors ReconcileStaleSimulationSells for live
+// sells. Live exits do have an external submission side effect, but once the
+// trade is definitely failed/unknown and the position is still open, the
+// definitive state transition is identical: close the position, mark the
+// trade failed, release the slot.
+func (d *DB) ReconcileStaleLiveSells(mint string, olderThan time.Time) (int, error) {
+	return d.reconcileStaleSells(mint, olderThan)
+}
+
+func (d *DB) reconcileStaleSells(mint string, olderThan time.Time) (int, error) {
 	tx, err := d.Begin()
 	if err != nil {
-		return 0, fmt.Errorf("begin stale simulated sell reconciliation for mint %q: %w", mint, err)
+		return 0, fmt.Errorf("begin stale sell reconciliation for mint %q: %w", mint, err)
 	}
 	defer tx.Rollback()
 
@@ -473,7 +533,7 @@ func (d *DB) ReconcileStaleSimulationSells(mint string, olderThan time.Time) (in
 		WHERE t.mint=? AND t.side='sell' AND t.state IN ('prepared','unknown')
 		ORDER BY t.created_at`), mint)
 	if err != nil {
-		return 0, fmt.Errorf("find stale simulated sells for mint %q: %w", mint, err)
+		return 0, fmt.Errorf("find stale sells for mint %q: %w", mint, err)
 	}
 	type staleSell struct {
 		id, tradeState, transactionState, positionState string
@@ -484,16 +544,16 @@ func (d *DB) ReconcileStaleSimulationSells(mint string, olderThan time.Time) (in
 		var candidate staleSell
 		if err = rows.Scan(&candidate.id, &candidate.tradeState, &candidate.transactionState, &candidate.positionState, &candidate.updatedAt); err != nil {
 			_ = rows.Close()
-			return 0, fmt.Errorf("read stale simulated sell for mint %q: %w", mint, err)
+			return 0, fmt.Errorf("read stale sell for mint %q: %w", mint, err)
 		}
 		candidates = append(candidates, candidate)
 	}
 	if err = rows.Err(); err != nil {
 		_ = rows.Close()
-		return 0, fmt.Errorf("iterate stale simulated sells for mint %q: %w", mint, err)
+		return 0, fmt.Errorf("iterate stale sells for mint %q: %w", mint, err)
 	}
 	if err = rows.Close(); err != nil {
-		return 0, fmt.Errorf("close stale simulated sell scan for mint %q: %w", mint, err)
+		return 0, fmt.Errorf("close stale sell scan for mint %q: %w", mint, err)
 	}
 
 	reconciled := 0
@@ -508,44 +568,45 @@ func (d *DB) ReconcileStaleSimulationSells(mint string, olderThan time.Time) (in
 				candidate.transactionState != "prepared" &&
 				candidate.transactionState != "unknown" &&
 				candidate.transactionState != "failed") {
-			return 0, fmt.Errorf("stale simulated sell id=%q mint=%q has inconsistent persisted states trade=%q transaction=%q position=%q",
+			return 0, fmt.Errorf("stale sell id=%q mint=%q has inconsistent persisted states trade=%q transaction=%q position=%q",
 				candidate.id, mint, candidate.tradeState, candidate.transactionState, candidate.positionState)
 		}
 		result, updateErr := tx.Exec(d.bind(`UPDATE trades SET state='failed',reconciliation_needed=?,updated_at=?
 			WHERE id=? AND side='sell' AND state=?`), false, now, candidate.id, candidate.tradeState)
 		if updateErr != nil {
-			return 0, fmt.Errorf("recover stale simulated sell id=%q mint=%q: %w", candidate.id, mint, updateErr)
+			return 0, fmt.Errorf("recover stale sell id=%q mint=%q: %w", candidate.id, mint, updateErr)
 		}
 		if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-			return 0, fmt.Errorf("check stale simulated sell id=%q mint=%q: %w", candidate.id, mint, rowsErr)
+			return 0, fmt.Errorf("check stale sell id=%q mint=%q: %w", candidate.id, mint, rowsErr)
 		} else if affected != 1 {
-			return 0, fmt.Errorf("stale simulated sell id=%q mint=%q changed during reconciliation", candidate.id, mint)
+			return 0, fmt.Errorf("stale sell id=%q mint=%q changed during reconciliation", candidate.id, mint)
 		}
 		if candidate.transactionState == "prepared" || candidate.transactionState == "unknown" {
 			result, updateErr = tx.Exec(d.bind(`UPDATE transactions SET state='failed',updated_at=?
 				WHERE trade_id=? AND state=?`), now, candidate.id, candidate.transactionState)
 			if updateErr != nil {
-				return 0, fmt.Errorf("recover transaction for stale simulated sell id=%q mint=%q: %w", candidate.id, mint, updateErr)
+				return 0, fmt.Errorf("recover transaction for stale sell id=%q mint=%q: %w", candidate.id, mint, updateErr)
 			}
 			if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-				return 0, fmt.Errorf("check transaction recovery for simulated sell id=%q mint=%q: %w", candidate.id, mint, rowsErr)
+				return 0, fmt.Errorf("check transaction recovery for sell id=%q mint=%q: %w", candidate.id, mint, rowsErr)
 			} else if affected != 1 {
-				return 0, fmt.Errorf("transaction for stale simulated sell id=%q mint=%q changed during reconciliation", candidate.id, mint)
+				return 0, fmt.Errorf("transaction for stale sell id=%q mint=%q changed during reconciliation", candidate.id, mint)
 			}
 		}
-		// Close the paper position in the same transaction so the slot is
-		// released and MaxOpenPositions stops pinning the monitor.
+		// Close the position in the same transaction so the slot is released
+		// and MaxOpenPositions stops pinning the monitor.
 		if _, closeErr := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=?
 			WHERE mint=? AND status='open'`), now, mint); closeErr != nil {
-			return 0, fmt.Errorf("close stale paper position for mint %q: %w", mint, closeErr)
+			return 0, fmt.Errorf("close stale position for mint %q: %w", mint, closeErr)
 		}
 		reconciled++
 	}
 	if err = tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit stale simulated sell reconciliation for mint %q: %w", mint, err)
+		return 0, fmt.Errorf("commit stale sell reconciliation for mint %q: %w", mint, err)
 	}
 	return reconciled, nil
 }
+
 func (d *DB) RecordEvent(mint, creator, raw string, at time.Time, latency int64) error {
 	query := `INSERT OR IGNORE INTO token_events(mint,creator,received_at,raw_json,latency_ms) VALUES(?,?,?,?,?)`
 	if d.postgres {

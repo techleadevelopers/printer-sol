@@ -111,7 +111,9 @@ type Monitor struct {
 
 const exitRetryDelay = 5 * time.Second
 const maxAutomaticSimulationExitAttempts = 3
+const maxAutomaticLiveExitAttempts = 3
 const staleSimulationSellRecoveryAge = time.Minute
+const staleLiveSellRecoveryAge = time.Minute
 const stuckExitQuarantineAge = 2 * time.Minute
 
 func (m *Monitor) runOperation(fn func()) bool {
@@ -222,13 +224,13 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		maxHold = maximumPositionHold
 	}
 	settings := Settings{
-		EntryDelay:        5 * time.Second,
+		EntryDelay:            5 * time.Second,
 		MinVolumeBeforeBuySOL: .02,
 		MinMarketCapSOL:       20,
-		PricePollInterval: 20 * time.Second,
-		SnipeConcurrency:  4,
-		SnipeTimeout:      15 * time.Second,
-		DedupeTTL:         60 * time.Second,
+		PricePollInterval:     20 * time.Second,
+		SnipeConcurrency:      4,
+		SnipeTimeout:          15 * time.Second,
+		DedupeTTL:             60 * time.Second,
 	}
 	if len(options) > 0 {
 		option := options[0]
@@ -263,15 +265,15 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee,
 		takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15,
 		maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size),
-		candidates:   make(map[string]*candidate),
-		snipePending: make(map[string]time.Time),
+		candidates:      make(map[string]*candidate),
+		snipePending:    make(map[string]time.Time),
 		validationSlots: make(chan struct{}, settings.SnipeConcurrency),
-	entryDelay: settings.EntryDelay,
-	minVolumeBeforeBuySOL: settings.MinVolumeBeforeBuySOL,
-	minMarketCapSOL:       settings.MinMarketCapSOL,
-		pricePollInterval: settings.PricePollInterval,
-		snipeConcurrency:  settings.SnipeConcurrency,
-		snipeTimeout:      settings.SnipeTimeout, dedupeTTL: settings.DedupeTTL,
+		entryDelay:      settings.EntryDelay,
+		minVolumeBeforeBuySOL: settings.MinVolumeBeforeBuySOL,
+		minMarketCapSOL:       settings.MinMarketCapSOL,
+		pricePollInterval:     settings.PricePollInterval,
+		snipeConcurrency:      settings.SnipeConcurrency,
+		snipeTimeout:          settings.SnipeTimeout, dedupeTTL: settings.DedupeTTL,
 		bondingCurve: settings.BondingCurve,
 		bus:          b, log: l,
 	}
@@ -524,6 +526,64 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 				}
 				continue
 			}
+		} else {
+			reconciled, reconcileErr := m.db.ReconcileStaleLiveSells(mint, now.Add(-staleLiveSellRecoveryAge))
+			if reconcileErr != nil {
+				m.log.Warn("reconcile stale live sell",
+					zap.String("mint", mint),
+					zap.Error(reconcileErr))
+				continue
+			}
+			if reconciled > 0 {
+				m.log.Warn("recovered stale live sell state",
+					zap.String("mint", mint),
+					zap.Int("attempts", reconciled))
+			}
+
+			// Same break-glass contract as paper: if the position is still
+			// open and the last sell attempt is terminally failed/unknown
+			// beyond the quarantine window, close the live position and mark
+			// the stuck sell as failed with reconciliation_needed=false. This
+			// releases MaxOpenPositions even if the monitor never observes a
+			// fresh stop-loss signal on this mint again.
+			stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-stuckExitQuarantineAge))
+			if stuckErr != nil {
+				m.log.Warn("check stuck live exit mint", zap.String("mint", mint), zap.Error(stuckErr))
+				continue
+			}
+			if stuck {
+				cleaned, quarantineErr := m.db.QuarantineStuckLiveMint(mint, now.Add(-stuckExitQuarantineAge))
+				if quarantineErr != nil {
+					m.log.Warn("quarantine stuck live mint",
+						zap.String("mint", mint),
+						zap.Error(quarantineErr))
+					continue
+				}
+				if cleaned > 0 {
+					m.log.Error("quarantined stuck live mint",
+						zap.String("mint", mint),
+						zap.Int("cleaned_sells", cleaned))
+					payload, _ := json.Marshal(map[string]any{
+						"mint": mint, "simulation": false, "cleanedSells": cleaned,
+					})
+					if logErr := m.db.LogOperational("error", "stuck_mint_quarantined",
+						"stuck live exit quarantined; position closed and slot released",
+						string(payload)); logErr != nil {
+						m.log.Warn("record quarantine audit", zap.String("mint", mint), zap.Error(logErr))
+					}
+					m.bus.Publish("risk_alert", map[string]any{
+						"mint": mint, "simulation": false,
+						"reason":          "stuck live exit quarantined; position closed and slot released",
+						"cleanedSells":    cleaned,
+						"positionRemainsOpen": false,
+					})
+					m.tracked.Delete(mint)
+					m.exitRetryAfter.Delete(mint)
+					m.exitIntents.Delete(mint)
+					m.exitRetryExhausted.Delete(mint)
+				}
+				continue
+			}
 		}
 		openedAt, open, err := m.db.PositionOpenedAt(mint)
 		if err != nil {
@@ -697,22 +757,22 @@ func (m *Monitor) connect(ctx context.Context) error {
 		})
 		return true
 	})
-		for {
-			_, b, err := c.ReadMessage()
+	for {
+		_, b, err := c.ReadMessage()
 		if err != nil {
 			return err
 		}
-			m.logWebSocketRaw(b)
-			var d struct {
-				Mint             string          `json:"mint"`
-				Creator          string          `json:"creator"`
-				User             string          `json:"user"`
-				TraderPublicKey  string          `json:"traderPublicKey"`
-				TxType           string          `json:"txType"`
-				CreatedTimestamp json.RawMessage `json:"createdTimestamp"`
-				Timestamp        json.RawMessage `json:"timestamp"`
-				BlockTime        json.RawMessage `json:"blockTime"`
-				MarketCapSol     float64         `json:"marketCapSol"`
+		m.logWebSocketRaw(b)
+		var d struct {
+			Mint             string          `json:"mint"`
+			Creator          string          `json:"creator"`
+			User             string          `json:"user"`
+			TraderPublicKey  string          `json:"traderPublicKey"`
+			TxType           string          `json:"txType"`
+			CreatedTimestamp json.RawMessage `json:"createdTimestamp"`
+			Timestamp        json.RawMessage `json:"timestamp"`
+			BlockTime        json.RawMessage `json:"blockTime"`
+			MarketCapSol     float64         `json:"marketCapSol"`
 		}
 		if err = json.Unmarshal(b, &d); err != nil {
 			m.log.Warn("invalid PumpPortal websocket JSON",
@@ -774,29 +834,29 @@ func (m *Monitor) connect(ctx context.Context) error {
 		}
 		creator := d.Creator
 		if creator == "" {
-				creator = d.TraderPublicKey
-			}
-			if creator == "" {
-				creator = d.User
+			creator = d.TraderPublicKey
 		}
-		received := time.Now().UTC()
-		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
-		if created.IsZero() && m.simulation {
-			created = received
+		if creator == "" {
+			creator = d.User
 		}
-		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
-		m.runOperation(func() {
-			if !m.rememberMint(e.Mint, received) {
-				return
+			received := time.Now().UTC()
+			created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
+			if created.IsZero() && m.simulation {
+				created = received
 			}
-			m.bus.Publish("token_detected", map[string]any{"mint": e.Mint, "creator": e.Creator, "receivedAt": e.Received.UTC()})
-			if !m.addCandidate(e) {
-				m.rejectCandidate(e, "candidate queue full")
-				return
-			}
-		})
+			e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
+			m.runOperation(func() {
+				if !m.rememberMint(e.Mint, received) {
+					return
+				}
+				m.bus.Publish("token_detected", map[string]any{"mint": e.Mint, "creator": e.Creator, "receivedAt": e.Received.UTC()})
+				if !m.addCandidate(e) {
+					m.rejectCandidate(e, "candidate queue full")
+					return
+				}
+			})
+		}
 	}
-}
 func (m *Monitor) consume(ctx context.Context) {
 	concurrency := m.snipeConcurrency
 	if concurrency < 1 {
@@ -1124,35 +1184,37 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 	// failed/unknown while the position is still open, the monitor must NOT
 	// retry automatically. The state is inconsistent and only explicit
 	// reconciliation may close it. This prevents the "10 open positions,
-	// stopped sell reached, retry loop" deadlock.
-	if m.simulation {
-		lastSellState, _, stateErr := m.db.LastSellState(mint)
-		if stateErr != nil {
-			m.log.Warn("read last sell state", zap.String("mint", mint), zap.Error(stateErr))
-			return
+	// stopped sell reached, retry loop" deadlock in both modes.
+	lastSellState, _, stateErr := m.db.LastSellState(mint)
+	if stateErr != nil {
+		m.log.Warn("read last sell state", zap.String("mint", mint), zap.Error(stateErr))
+		return
+	}
+	if lastSellState == "failed" || lastSellState == "unknown" {
+		m.blockAutomaticExitRetries(mint, reason, 0)
+		return
+	}
+	failedAttempts, lastFailure, retryErr := m.db.FailedSellRetryState(mint)
+	if retryErr != nil {
+		m.log.Warn("read persisted exit retry state", zap.String("mint", mint), zap.Error(retryErr))
+		return
+	}
+	maxAttempts := maxAutomaticSimulationExitAttempts
+	if !m.simulation {
+		maxAttempts = maxAutomaticLiveExitAttempts
+	}
+	if failedAttempts >= maxAttempts {
+		m.blockAutomaticExitRetries(mint, reason, failedAttempts)
+		return
+	}
+	if failedAttempts > 0 {
+		retryAt := lastFailure.Add(simulationExitRetryDelay(failedAttempts))
+		if memoryRetryAt, ok := m.exitRetryAfter.Load(mint); ok && memoryRetryAt.(time.Time).After(retryAt) {
+			retryAt = memoryRetryAt.(time.Time)
 		}
-		if lastSellState == "failed" || lastSellState == "unknown" {
-			m.blockAutomaticSimulationExitRetries(mint, reason, 0)
+		if time.Now().Before(retryAt) {
+			m.exitRetryAfter.Store(mint, retryAt)
 			return
-		}
-		failedAttempts, lastFailure, retryErr := m.db.FailedSellRetryState(mint)
-		if retryErr != nil {
-			m.log.Warn("read persisted simulation exit retry state", zap.String("mint", mint), zap.Error(retryErr))
-			return
-		}
-		if failedAttempts >= maxAutomaticSimulationExitAttempts {
-			m.blockAutomaticSimulationExitRetries(mint, reason, failedAttempts)
-			return
-		}
-		if failedAttempts > 0 {
-			retryAt := lastFailure.Add(simulationExitRetryDelay(failedAttempts))
-			if memoryRetryAt, ok := m.exitRetryAfter.Load(mint); ok && memoryRetryAt.(time.Time).After(retryAt) {
-				retryAt = memoryRetryAt.(time.Time)
-			}
-			if time.Now().Before(retryAt) {
-				m.exitRetryAfter.Store(mint, retryAt)
-				return
-			}
 		}
 	}
 	if m.entry == nil {
@@ -1208,55 +1270,46 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 	if err != nil {
 		writeExitAudit("position_exit_failed", id, err)
 		m.log.Warn("position exit", zap.String("mint", mint), zap.Error(err))
-		if m.simulation {
-			active, activeErr := m.db.ActiveForMint(mint)
-			if activeErr != nil {
-				m.log.Warn("check simulated exit after failure", zap.String("mint", mint), zap.Error(activeErr))
-			} else if active {
-				m.bus.Publish("risk_alert", map[string]any{
-					"mint": mint, "tradeId": id, "simulation": true,
-					"reason": "simulated exit is unresolved and remains active; automatic retry is blocked",
-				})
-			} else if id == "" {
-				m.blockAutomaticSimulationExitRetries(mint, reason, 0)
-			} else {
-				failedAttempts, lastFailure, retryErr := m.db.FailedSellRetryState(mint)
-				if retryErr != nil {
-					m.log.Warn("read simulated exit retry state after failure", zap.String("mint", mint), zap.Error(retryErr))
-					m.blockAutomaticSimulationExitRetries(mint, reason, failedAttempts)
-				} else if failedAttempts == 0 {
-					m.blockAutomaticSimulationExitRetries(mint, reason, failedAttempts)
-				} else if failedAttempts >= maxAutomaticSimulationExitAttempts {
-					m.blockAutomaticSimulationExitRetries(mint, reason, failedAttempts)
-				} else {
-					retryAt := lastFailure.Add(simulationExitRetryDelay(failedAttempts))
-					m.exitRetryAfter.Store(mint, retryAt)
-					retryIn := time.Until(retryAt)
-					if retryIn < 0 {
-						retryIn = 0
-					}
-					m.bus.Publish("exit_retry_scheduled", map[string]any{
-						"mint": mint, "tradeId": id, "reason": reason,
-						"retryInSeconds": int(retryIn.Seconds()), "simulation": true,
-						"attempt": failedAttempts + 1, "maxAttempts": maxAutomaticSimulationExitAttempts,
-					})
-				}
-			}
-		} else {
-			m.bus.Publish("exit_retry_scheduled", map[string]any{
-				"mint": mint, "reason": reason, "retryInSeconds": int(exitRetryDelay.Seconds()),
-				"simulation": false,
+		active, activeErr := m.db.ActiveForMint(mint)
+		if activeErr != nil {
+			m.log.Warn("check exit after failure", zap.String("mint", mint), zap.Error(activeErr))
+		} else if active {
+			m.bus.Publish("risk_alert", map[string]any{
+				"mint": mint, "tradeId": id, "simulation": m.simulation,
+				"reason": "exit is unresolved and remains active; automatic retry is blocked",
 			})
+		} else if id == "" {
+			m.blockAutomaticExitRetries(mint, reason, 0)
+		} else {
+			failedAttempts, lastFailure, retryErr := m.db.FailedSellRetryState(mint)
+			if retryErr != nil {
+				m.log.Warn("read exit retry state after failure", zap.String("mint", mint), zap.Error(retryErr))
+				m.blockAutomaticExitRetries(mint, reason, failedAttempts)
+			} else if failedAttempts == 0 {
+				m.blockAutomaticExitRetries(mint, reason, failedAttempts)
+			} else if failedAttempts >= maxAttempts {
+				m.blockAutomaticExitRetries(mint, reason, failedAttempts)
+			} else {
+				retryAt := lastFailure.Add(simulationExitRetryDelay(failedAttempts))
+				m.exitRetryAfter.Store(mint, retryAt)
+				retryIn := time.Until(retryAt)
+				if retryIn < 0 {
+					retryIn = 0
+				}
+				m.bus.Publish("exit_retry_scheduled", map[string]any{
+					"mint": mint, "tradeId": id, "reason": reason,
+					"retryInSeconds": int(retryIn.Seconds()), "simulation": m.simulation,
+					"attempt": failedAttempts + 1, "maxAttempts": maxAttempts,
+				})
+			}
 		}
 		return
 	}
 	writeExitAudit("position_exit_submitted", id, nil)
-	if m.simulation {
-		m.tracked.Delete(mint)
-		m.exitRetryAfter.Delete(mint)
-		m.exitIntents.Delete(mint)
-		m.exitRetryExhausted.Delete(mint)
-	}
+	m.tracked.Delete(mint)
+	m.exitRetryAfter.Delete(mint)
+	m.exitIntents.Delete(mint)
+	m.exitRetryExhausted.Delete(mint)
 	m.bus.Publish("exit_triggered", map[string]any{"mint": mint, "tradeId": id, "reason": reason, "returnPct": returnPct, "simulation": m.simulation})
 }
 
@@ -1271,20 +1324,32 @@ func simulationExitRetryDelay(failedAttempts int) time.Duration {
 	return delay
 }
 
-func (m *Monitor) blockAutomaticSimulationExitRetries(mint, reason string, failedAttempts int) {
+func (m *Monitor) blockAutomaticExitRetries(mint, reason string, failedAttempts int) {
 	if _, alreadyReported := m.exitRetryExhausted.LoadOrStore(mint, struct{}{}); alreadyReported {
 		return
 	}
-	m.log.Error("automatic simulated exit retries stopped; manual reconciliation is required",
+	maxAttempts := maxAutomaticSimulationExitAttempts
+	if !m.simulation {
+		maxAttempts = maxAutomaticLiveExitAttempts
+	}
+	m.log.Error("automatic exit retries stopped; manual reconciliation is required",
 		zap.String("mint", mint),
 		zap.String("reason", reason),
+		zap.Bool("simulation", m.simulation),
 		zap.Int("failed_attempts", failedAttempts),
-		zap.Int("max_attempts", maxAutomaticSimulationExitAttempts))
+		zap.Int("max_attempts", maxAttempts))
 	m.bus.Publish("risk_alert", map[string]any{
-		"mint": mint, "simulation": true,
-		"reason": "automatic simulated exit retries stopped; inspect the failed sell and database error before retrying",
-		"failedAttempts": failedAttempts, "maxAttempts": maxAutomaticSimulationExitAttempts,
+		"mint": mint, "simulation": m.simulation,
+		"reason": "automatic exit retries stopped; inspect the failed sell and database error before retrying",
+		"failedAttempts": failedAttempts, "maxAttempts": maxAttempts,
 	})
+}
+
+// blockAutomaticSimulationExitRetries is kept for backward compatibility with
+// callers that expect the paper-specific name. It delegates to the shared
+// implementation, which preserves the paper behaviour exactly.
+func (m *Monitor) blockAutomaticSimulationExitRetries(mint, reason string, failedAttempts int) {
+	m.blockAutomaticExitRetries(mint, reason, failedAttempts)
 }
 
 // timestampFromEvent accepts timestamp variants emitted by PumpPortal. Live

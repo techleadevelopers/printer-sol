@@ -54,8 +54,8 @@ func New(db *database.DB, w *wallet.Wallet, p *pumpportal.Client, r *rpcmanager.
 	balance, _ := wallet.SOLToLamports(simulationBalanceSOL)
 	return &Engine{db: db, wallet: w, portal: p, rpcs: r, prices: prices, log: l, simulation: sim, simulationBalance: balance, controller: c, bus: b, rootCtx: context.Background(), limits: limits, reserved: make(map[string]uint64)}
 }
-func (e *Engine) Limits() Limits                { e.mu.RLock(); defer e.mu.RUnlock(); return e.limits }
-func (e *Engine) SetLimits(l Limits)            { e.mu.Lock(); e.limits = l; e.mu.Unlock() }
+func (e *Engine) Limits() Limits     { e.mu.RLock(); defer e.mu.RUnlock(); return e.limits }
+func (e *Engine) SetLimits(l Limits) { e.mu.Lock(); e.limits = l; e.mu.Unlock() }
 func (e *Engine) SetRootContext(ctx context.Context) {
 	if ctx != nil {
 		e.mu.Lock()
@@ -532,15 +532,65 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 // ReconcileStaleSimulationSells later converts it to failed. Only when the
 // unknown state cannot be persisted at all is an error returned to the caller.
 func (e *Engine) resolveSimulationSellFinalizationError(id string, request Request, fees float64, finalizeErr error) error {
-	snapshot, snapshotErr := e.db.SimulationSellSnapshot(id, request.Mint)
+	return e.resolveSellFinalizationError(
+		id, request, fees, finalizeErr,
+		e.db.SimulationSellSnapshot,
+		e.db.MarkSimulationSellFailed,
+		e.db.MarkSimulationSellUnknown,
+		true,
+	)
+}
+
+// resolveLiveSellFinalizationError mirrors resolveSimulationSellFinalizationError
+// for live sells. The state contract is identical: a failed finalization must
+// end in either (a) complete (trade/transaction finalized + position closed) or
+// (b) definitive failure (trade/transaction failed + position closed by
+// MarkLiveSellFailed) or (c) unknown, which blocks a second sell until
+// ReconcileStaleLiveSells or QuarantineStuckLiveMint resolves it.
+func (e *Engine) resolveLiveSellFinalizationError(id string, request Request, fees float64, finalizeErr error) error {
+	return e.resolveSellFinalizationError(
+		id, request, fees, finalizeErr,
+		e.db.LiveSellSnapshot,
+		e.db.MarkLiveSellFailed,
+		e.db.MarkLiveSellUnknown,
+		false,
+	)
+}
+
+func (e *Engine) resolveSellFinalizationError(
+	id string,
+	request Request,
+	fees float64,
+	finalizeErr error,
+	snapshotFn func(string, string) (database.SimulationSellSnapshot, error),
+	markFailedFn func(string, string) error,
+	markUnknownFn func(string) error,
+	isSimulation bool,
+) error {
+	snapshot, snapshotErr := snapshotFn(id, request.Mint)
 	if snapshotErr == nil &&
 		snapshot.TradeState == "simulated" &&
 		snapshot.TransactionState == "simulated" &&
 		snapshot.PositionState == "closed" {
 		if e.log != nil {
-			e.log.Warn("simulated sell returned a finalization error but persisted as complete",
+			e.log.Warn("sell returned a finalization error but persisted as complete",
 				zap.String("trade_id", id),
 				zap.String("mint", request.Mint),
+				zap.Bool("simulation", isSimulation),
+				zap.Float64("requested_value_sol", request.Amount),
+				zap.Error(finalizeErr))
+		}
+		return nil
+	}
+	if snapshotErr == nil &&
+		snapshot.TradeState == "confirmed" &&
+		snapshot.TransactionState == "confirmed" &&
+		snapshot.PositionState == "closed" {
+		if e.log != nil {
+			e.log.Warn("sell returned a finalization error but persisted as complete",
+				zap.String("trade_id", id),
+				zap.String("mint", request.Mint),
+				zap.Bool("simulation", isSimulation),
 				zap.Float64("requested_value_sol", request.Amount),
 				zap.Error(finalizeErr))
 		}
@@ -548,28 +598,27 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 	}
 
 	definitiveFailure := snapshotErr == nil &&
-		snapshot.TradeState == "prepared" &&
-		snapshot.TransactionState == "prepared" &&
+		(snapshot.TradeState == "prepared" || snapshot.TradeState == "confirmed") &&
+		(snapshot.TransactionState == "prepared" || snapshot.TransactionState == "confirmed") &&
 		snapshot.PositionState == "open"
 	var stateErr error
 	if definitiveFailure {
-		// In simulation, a failed sell is terminal: close the paper position
-		// in the same boundary so MaxOpenPositions is released immediately.
-		stateErr = e.db.MarkSimulationSellFailed(id, request.Mint)
+		stateErr = markFailedFn(id, request.Mint)
 	} else {
-		stateErr = e.db.MarkSimulationSellUnknown(id)
+		stateErr = markUnknownFn(id)
 	}
 
 	if stateErr != nil {
-		after, verifyErr := e.db.SimulationSellSnapshot(id, request.Mint)
+		after, verifyErr := snapshotFn(id, request.Mint)
 		if verifyErr == nil &&
-			after.TradeState == "simulated" &&
-			after.TransactionState == "simulated" &&
+			((after.TradeState == "simulated" && after.TransactionState == "simulated") ||
+				(after.TradeState == "confirmed" && after.TransactionState == "confirmed")) &&
 			after.PositionState == "closed" {
 			if e.log != nil {
-				e.log.Warn("simulated sell state resolved as complete after a persistence error",
+				e.log.Warn("sell state resolved as complete after a persistence error",
 					zap.String("trade_id", id),
 					zap.String("mint", request.Mint),
+					zap.Bool("simulation", isSimulation),
 					zap.Error(finalizeErr),
 					zap.Error(stateErr))
 			}
@@ -579,10 +628,9 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 			after.TradeState == "failed" &&
 			after.TransactionState == "failed" &&
 			after.PositionState == "closed" {
-			// The failure-state transaction committed despite returning an error.
 			definitiveFailure = true
 		} else {
-			fallbackErr := e.db.MarkSimulationSellUnknown(id)
+			fallbackErr := markUnknownFn(id)
 			if fallbackErr != nil {
 				stateErr = fmt.Errorf("%w; unknown-state fallback also failed: %v", stateErr, fallbackErr)
 			}
@@ -593,29 +641,31 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 				stateErr = fmt.Errorf("%w; verification after state update failed: %v", stateErr, verifyErr)
 			}
 			if e.log != nil {
-				e.log.Error("simulated sell outcome is unresolved",
+				e.log.Error("sell outcome is unresolved",
 					zap.String("trade_id", id),
 					zap.String("mint", request.Mint),
 					zap.String("exit_reason", request.Reason),
+					zap.Bool("simulation", isSimulation),
 					zap.Float64("requested_value_sol", request.Amount),
 					zap.Float64("modeled_fees_sol", fees),
 					zap.Error(finalizeErr),
 					zap.Error(stateErr))
 			}
 			e.emit("risk_alert", map[string]any{
-				"tradeId": id, "mint": request.Mint, "simulation": true,
-				"reason": "simulated sell finalization is unresolved; automatic retry is blocked until reconciliation",
+				"tradeId": id, "mint": request.Mint, "simulation": isSimulation,
+				"reason": "sell finalization is unresolved; automatic retry is blocked until reconciliation",
 				"error":  finalizeErr.Error(),
 			})
-			return fmt.Errorf("close simulated position: %w (failure-state persistence: %v)", finalizeErr, stateErr)
+			return fmt.Errorf("close position: %w (failure-state persistence: %v)", finalizeErr, stateErr)
 		}
 	}
 
 	if e.log != nil {
-		e.log.Error("simulated sell finalization failed",
+		e.log.Error("sell finalization failed",
 			zap.String("trade_id", id),
 			zap.String("mint", request.Mint),
 			zap.String("exit_reason", request.Reason),
+			zap.Bool("simulation", isSimulation),
 			zap.Float64("requested_value_sol", request.Amount),
 			zap.Float64("modeled_fees_sol", fees),
 			zap.Bool("failure_state_persisted", definitiveFailure),
@@ -623,15 +673,15 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 	}
 	if !definitiveFailure {
 		e.emit("risk_alert", map[string]any{
-			"tradeId": id, "mint": request.Mint, "simulation": true,
-			"reason": "simulated sell outcome is unknown; automatic retry is blocked until reconciliation",
+			"tradeId": id, "mint": request.Mint, "simulation": isSimulation,
+			"reason": "sell outcome is unknown; automatic retry is blocked until reconciliation",
 			"error":  finalizeErr.Error(),
 		})
 	}
 	// The failure/unknown state is persisted and ActiveForMint will block a
 	// duplicate sell. Returning nil here is what stops the monitor from
-	// re-evaluating this mint in a tight loop. ReconcileStaleSimulationSells
-	// will close the paper position on the next monitor pass.
+	// re-evaluating this mint in a tight loop. ReconcileStale*Sells will close
+	// the position on the next monitor pass.
 	return nil
 }
 
@@ -681,8 +731,9 @@ func (e *Engine) confirm(id, sig string, r Request) {
 						return
 					}
 					if err = e.db.FinalizeLiveSell(id, r.Mint, state, sig, execution, fee); err != nil {
-						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
-						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed sell could not be committed to the live ledger"})
+						if resolutionErr := e.resolveLiveSellFinalizationError(id, r, fee, err); resolutionErr != nil {
+							e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed sell could not be committed to the live ledger"})
+						}
 						return
 					}
 				}
