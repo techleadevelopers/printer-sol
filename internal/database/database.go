@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
@@ -18,11 +19,43 @@ import (
 //go:embed migrations/*.sql migrations/postgres/*.sql
 var migrations embed.FS
 
+// SellConfirmer is injected by main (which has rpcmanager) so live-only
+// persistence paths can require an on-chain verdict before closing a
+// position. database must not import rpcmanager (cycle: rpcmanager imports
+// database for RecordRPC).
+type SellConfirmer interface {
+	ConfirmSellState(ctx context.Context, signature string) (string, error)
+}
+
 type DB struct {
 	*sql.DB
 	postgres bool
 	// markMu serializes WebSocket and public-API updates to mark rows.
-	markMu sync.Mutex
+	markMu        sync.Mutex
+	sellConfirmer SellConfirmer
+}
+
+// SetSellConfirmer wires the live on-chain verifier. Safe to call once at
+// startup; subsequent calls replace the verifier.
+func (d *DB) SetSellConfirmer(c SellConfirmer) {
+	d.markMu.Lock()
+	d.sellConfirmer = c
+	d.markMu.Unlock()
+}
+
+func (d *DB) sellConfirmation(signature string) (string, error) {
+	d.markMu.Lock()
+	c := d.sellConfirmer
+	d.markMu.Unlock()
+	if c == nil {
+		return "", fmt.Errorf("live sell confirmation is not configured")
+	}
+	if strings.TrimSpace(signature) == "" {
+		return "unknown", nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	return c.ConfirmSellState(ctx, signature)
 }
 
 func Open(target string) (*DB, error) {
@@ -209,13 +242,6 @@ func (d *DB) HasFailedSellForMint(mint string) (bool, error) {
 	return n > 0, e
 }
 
-// FailedSellRetryState makes the retry count and cooldown survive process
-// restarts by deriving them from persisted, definitively failed sell attempts.
-//
-// It only counts failures for mints whose position is still open: once a
-// position is closed, the historical failure is irrelevant to retry
-// scheduling and must not pin the monitor in a retry loop for a mint with no
-// remaining exposure.
 func (d *DB) FailedSellRetryState(mint string) (int, time.Time, error) {
 	var attempts int
 	var lastFailure sql.NullTime
@@ -232,10 +258,6 @@ func (d *DB) FailedSellRetryState(mint string) (int, time.Time, error) {
 	return attempts, lastFailure.Time.UTC(), nil
 }
 
-// LastSellState reports the state of the most recent sell trade for a mint.
-// Callers use it to distinguish "no active sell, but the last one failed/
-// unknown and the position is still open" from "the mint is genuinely free
-// for a new exit attempt".
 func (d *DB) LastSellState(mint string) (state string, updatedAt time.Time, err error) {
 	var s string
 	var at sql.NullTime
@@ -253,10 +275,22 @@ func (d *DB) LastSellState(mint string) (state string, updatedAt time.Time, err 
 	return s, updatedAt, nil
 }
 
-// StuckExitMint reports whether a mint is in a state that pins the monitor:
-// an open position whose most recent sell attempt terminated as failed or
-// unknown and is older than olderThan. This is the break-glass condition used
-// to quarantine a token that cannot be reconciled automatically.
+// LastSellTradeForMint returns the most recent sell trade id and signature
+// (read-only). Live confirmation paths use it to ask the injected
+// SellConfirmer about the on-chain outcome before any close.
+func (d *DB) LastSellTradeForMint(mint string) (id, signature string, err error) {
+	var sig sql.NullString
+	err = d.QueryRow(d.bind(`SELECT id,COALESCE(signature,'') FROM trades
+		WHERE mint=? AND side='sell' ORDER BY created_at DESC,id DESC LIMIT 1`), mint).Scan(&id, &sig)
+	if err == sql.ErrNoRows {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("read last sell trade for mint %q: %w", mint, err)
+	}
+	return id, sig.String, nil
+}
+
 func (d *DB) StuckExitMint(mint string, olderThan time.Time) (bool, error) {
 	var count int
 	err := d.QueryRow(d.bind(`SELECT COUNT(*)
@@ -271,26 +305,33 @@ func (d *DB) StuckExitMint(mint string, olderThan time.Time) (bool, error) {
 	return count > 0, nil
 }
 
-// QuarantineStuckSimulationMint is the break-glass cleanup for a paper mint
-// whose position is open but whose latest sell attempt is terminally stuck.
-// It closes the position, marks the stuck sell trade/transaction as failed
-// with reconciliation_needed=false so the monitor stops retrying, and leaves
-// the audit trail intact. It never deletes rows; the position remains visible
-// in the panel but is closed and will no longer pin MaxOpenPositions.
 func (d *DB) QuarantineStuckSimulationMint(mint string, olderThan time.Time) (int, error) {
-	return d.quarantineStuckMint(mint, olderThan)
+	return d.quarantineStuckMint(mint, olderThan, false)
 }
 
-// QuarantineStuckLiveMint mirrors QuarantineStuckSimulationMint for live
-// trades. The state contract is identical: close the position, mark the
-// stuck sell trade/transaction failed with reconciliation_needed=false, and
-// leave the audit trail intact. Without this, a failed live sell would pin
-// MaxOpenPositions forever because the paper-only quarantine does not run.
+// QuarantineStuckLiveMint quarantines a live mint only after the injected
+// SellConfirmer proves the last sell failed on-chain. If the confirmer is
+// missing, or the outcome is confirmed/finalized/unknown, no position is
+// closed and an error is returned so the monitor keeps tracking it.
 func (d *DB) QuarantineStuckLiveMint(mint string, olderThan time.Time) (int, error) {
-	return d.quarantineStuckMint(mint, olderThan)
+	return d.quarantineStuckMint(mint, olderThan, true)
 }
 
-func (d *DB) quarantineStuckMint(mint string, olderThan time.Time) (int, error) {
+func (d *DB) quarantineStuckMint(mint string, olderThan time.Time, live bool) (int, error) {
+	if live {
+		_, sig, err := d.LastSellTradeForMint(mint)
+		if err != nil {
+			return 0, fmt.Errorf("quarantine live mint %q: %w", mint, err)
+		}
+		state, err := d.sellConfirmation(sig)
+		if err != nil {
+			return 0, fmt.Errorf("quarantine live mint %q: on-chain confirmation unavailable: %w", mint, err)
+		}
+		if state != "failed" {
+			return 0, fmt.Errorf("quarantine live mint %q refused: on-chain state is %q (not failed)", mint, state)
+		}
+	}
+
 	tx, err := d.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("begin quarantine for stuck mint %q: %w", mint, err)
@@ -394,15 +435,10 @@ func (d *DB) sellSnapshot(id, mint string) (SimulationSellSnapshot, error) {
 	return snapshot, nil
 }
 
-// MarkSimulationSellUnknown keeps an unresolved local exit active so the
-// monitor cannot retry it until persisted state has been reconciled.
-// It is intentionally idempotent: a trade/transaction already in 'unknown'
-// does not fail the update.
 func (d *DB) MarkSimulationSellUnknown(id string) error {
 	return d.markSellUnknown(id)
 }
 
-// MarkLiveSellUnknown mirrors MarkSimulationSellUnknown for live sells.
 func (d *DB) MarkLiveSellUnknown(id string) error {
 	return d.markSellUnknown(id)
 }
@@ -441,22 +477,33 @@ func (d *DB) markSellUnknown(id string) error {
 	return nil
 }
 
-// MarkSimulationSellFailed definitively closes a paper position after a sell
-// that can no longer execute. Unlike MarkSimulationSellUnknown, this is
-// terminal: the position is closed so MaxOpenPositions is released, the trade
-// and transaction are marked failed, and the monitor stops retrying.
 func (d *DB) MarkSimulationSellFailed(id, mint string) error {
-	return d.markSellFailed(id, mint)
+	return d.markSellFailed(id, mint, false)
 }
 
-// MarkLiveSellFailed mirrors MarkSimulationSellFailed for live sells. The
-// state contract is identical; only the transport that produced the failure
-// differs.
+// MarkLiveSellFailed only closes the live position when the injected
+// SellConfirmer proves the on-chain state is failed. In every other case it
+// marks the trade/transaction unknown (keeps position open, keeps
+// reconciliation pending) so a confirmed-but-unpersisted sale cannot be
+// misclassified as a failure.
 func (d *DB) MarkLiveSellFailed(id, mint string) error {
-	return d.markSellFailed(id, mint)
+	var sig sql.NullString
+	err := d.QueryRow(d.bind(`SELECT COALESCE(signature,'') FROM trades WHERE id=? AND side='sell'`), id).Scan(&sig)
+	if err != nil {
+		return fmt.Errorf("read signature for live sell %q: %w", id, err)
+	}
+	state, err := d.sellConfirmation(sig.String)
+	if err != nil {
+		return d.markSellUnknown(id)
+	}
+	if state != "failed" {
+		return d.markSellUnknown(id)
+	}
+	return d.markSellFailed(id, mint, true)
 }
 
-func (d *DB) markSellFailed(id, mint string) error {
+func (d *DB) markSellFailed(id, mint string, live bool) error {
+	_ = live
 	now := time.Now().UTC()
 	tx, err := d.Begin()
 	if err != nil {
@@ -500,26 +547,33 @@ func (d *DB) markSellFailed(id, mint string) error {
 	return nil
 }
 
-// ReconcileStaleSimulationSells releases old active paper sells only when the
-// position is still open and the transaction never reached a finalized state.
-// Paper exits have no external submission side effect, so this is definitive.
-//
-// The position is closed in the same transaction so the slot is released;
-// otherwise MaxOpenPositions pins the monitor with orphaned open positions.
 func (d *DB) ReconcileStaleSimulationSells(mint string, olderThan time.Time) (int, error) {
-	return d.reconcileStaleSells(mint, olderThan)
+	return d.reconcileStaleSells(mint, olderThan, false)
 }
 
-// ReconcileStaleLiveSells mirrors ReconcileStaleSimulationSells for live
-// sells. Live exits do have an external submission side effect, but once the
-// trade is definitely failed/unknown and the position is still open, the
-// definitive state transition is identical: close the position, mark the
-// trade failed, release the slot.
+// ReconcileStaleLiveSells only closes a live position when the injected
+// SellConfirmer proves the on-chain state is failed. Otherwise the trades are
+// left unresolved (position stays open, reconciliation stays pending) and an
+// error is returned so the caller can keep tracking the mint.
 func (d *DB) ReconcileStaleLiveSells(mint string, olderThan time.Time) (int, error) {
-	return d.reconcileStaleSells(mint, olderThan)
+	return d.reconcileStaleSells(mint, olderThan, true)
 }
 
-func (d *DB) reconcileStaleSells(mint string, olderThan time.Time) (int, error) {
+func (d *DB) reconcileStaleSells(mint string, olderThan time.Time, live bool) (int, error) {
+	if live {
+		_, sig, err := d.LastSellTradeForMint(mint)
+		if err != nil {
+			return 0, fmt.Errorf("reconcile stale live sells for mint %q: %w", mint, err)
+		}
+		state, err := d.sellConfirmation(sig)
+		if err != nil {
+			return 0, fmt.Errorf("reconcile stale live sells for mint %q: on-chain confirmation unavailable: %w", mint, err)
+		}
+		if state != "failed" {
+			return 0, fmt.Errorf("reconcile stale live sells for mint %q refused: on-chain state is %q (not failed)", mint, state)
+		}
+	}
+
 	tx, err := d.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("begin stale sell reconciliation for mint %q: %w", mint, err)
@@ -824,8 +878,6 @@ func blacklistCreatorAfterStopLoss(tx *sql.Tx, d *DB, mint, reason string, now t
 	return err
 }
 
-// IsCreatorBlacklisted reports whether this creator has an active 24-hour
-// block from a closed stop-loss. Expired rows remain as an audit trail.
 func (d *DB) IsCreatorBlacklisted(creator string) (bool, error) {
 	creator = strings.TrimSpace(creator)
 	if creator == "" {
@@ -938,8 +990,6 @@ func (d *DB) updateMark(table, mint string, marketCapSOL float64) error {
 	}
 	d.markMu.Lock()
 	defer d.markMu.Unlock()
-	// Current follows real price movement (including declines); peak is
-	// monotonic so an older/lower mark can never erase the trailing-stop high.
 	_, e := d.Exec(d.bind(`UPDATE `+table+` SET current_market_cap_sol=?,peak_market_cap_sol=CASE WHEN ?>peak_market_cap_sol THEN ? ELSE peak_market_cap_sol END,updated_at=? WHERE mint=?`), marketCapSOL, marketCapSOL, marketCapSOL, time.Now().UTC(), mint)
 	return e
 }
@@ -1015,8 +1065,6 @@ func (d *DB) SetTradePnl(id string, executed, pnl float64) error {
 	return e
 }
 
-// SetTradeExecution persists values derived from the confirmed on-chain
-// transaction. It deliberately does not use a market-cap estimate for live P&L.
 func (d *DB) SetTradeExecution(id string, executed, fees, pnl float64) error {
 	_, e := d.Exec(d.bind(`UPDATE trades SET executed_value_sol=?,fees_sol=?,realized_pnl_sol=?,updated_at=? WHERE id=?`), executed, fees, pnl, time.Now().UTC(), id)
 	return e
@@ -1145,8 +1193,6 @@ func (d *DB) TradePeriodStats(start, end time.Time) (total, positive, negative i
 	return
 }
 
-// SellActivityStats counts all attempts and definite failures in the selected
-// period. Completed sells are reported by the finalized trade summaries.
 func (d *DB) SellActivityStats(start, end time.Time) (attempts, failed int, err error) {
 	err = d.QueryRow(d.bind(`SELECT COUNT(*),
 		COALESCE(SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END),0)
@@ -1175,8 +1221,6 @@ func (d *DB) RealizedPnlSOL() (float64, error) {
 	return pnl, e
 }
 
-// SimulationAvailableBalanceSOL returns the uninvested paper capital after
-// realized results and the cost of currently open paper positions.
 func (d *DB) SimulationAvailableBalanceSOL(initialBalance float64) (float64, error) {
 	var balance float64
 	err := d.QueryRow(d.bind(`SELECT ? + COALESCE((SELECT SUM(t.realized_pnl_sol) FROM trades t
@@ -1265,7 +1309,6 @@ func (d *DB) OpenExposureSOL() (float64, error) {
 func (d *DB) DailyRealizedLossSOL(simulationMode ...bool) (float64, error) {
 	var n sql.NullFloat64
 	now := time.Now().UTC()
-	// Risk limits reset at UTC midnight (calendar day), not on a rolling 24-hour window.
 	utcDayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	if len(simulationMode) > 0 && simulationMode[0] {
 		var gross, fees float64

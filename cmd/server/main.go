@@ -25,6 +25,18 @@ import (
 	"solana-sniper-backend/internal/wallet"
 )
 
+// rpcSellConfirmer adapts rpcmanager.Manager to database.SellConfirmer.
+// database intentionally does not import rpcmanager (cycle: rpcmanager
+// imports database for RecordRPC), so the live-only close paths on DB
+// receive this verifier via SetSellConfirmer at startup.
+type rpcSellConfirmer struct {
+	rpcs *rpcmanager.Manager
+}
+
+func (c rpcSellConfirmer) ConfirmSellState(ctx context.Context, signature string) (string, error) {
+	return c.rpcs.Status(ctx, signature)
+}
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -80,6 +92,10 @@ func main() {
 	}
 	bus := events.New()
 	rpcs := rpcmanager.New(cfg.RPCEndpoints, log, db, bus)
+	// 4.2: wire the live on-chain verifier before any live close path can run.
+	// Paper paths (QuarantineStuckSimulationMint, ReconcileStaleSimulationSells,
+	// MarkSimulationSellFailed) ignore this verifier entirely.
+	db.SetSellConfirmer(rpcSellConfirmer{rpcs: rpcs})
 	portal := pumpportal.New(cfg.PumpPortalURL)
 	controller := bot.New(bus)
 	// The worker is autonomous. Console credentials do not control its startup.
