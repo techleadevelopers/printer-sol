@@ -839,24 +839,34 @@ func (m *Monitor) connect(ctx context.Context) error {
 		if creator == "" {
 			creator = d.User
 		}
-			received := time.Now().UTC()
-			created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
-			if created.IsZero() && m.simulation {
-				created = received
-			}
-			e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
-			m.runOperation(func() {
-				if !m.rememberMint(e.Mint, received) {
-					return
-				}
-				m.bus.Publish("token_detected", map[string]any{"mint": e.Mint, "creator": e.Creator, "receivedAt": e.Received.UTC()})
-				if !m.addCandidate(e) {
-					m.rejectCandidate(e, "candidate queue full")
-					return
-				}
-			})
+		received := time.Now().UTC()
+		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
+		// The PumpPortal new-token feed does not include an on-chain
+		// creation timestamp (createdTimestamp/timestamp/blockTime are
+		// absent from the payload). Without a fallback the live mode would
+		// reject every newly discovered token because Created would be zero
+		// and Strategy.EvaluateFast rejects tokens with a missing creation
+		// time. Using the websocket receipt time keeps the age window honest:
+		// we are subscribed to the create/trade stream in real time, so the
+		// observed creation is effectively the on-chain creation moment
+		// (latency is milliseconds). This fallback is identical for paper and
+		// live so both modes age tokens the same way.
+		if created.IsZero() {
+			created = received
 		}
+		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
+		m.runOperation(func() {
+			if !m.rememberMint(e.Mint, received) {
+				return
+			}
+			m.bus.Publish("token_detected", map[string]any{"mint": e.Mint, "creator": e.Creator, "receivedAt": e.Received.UTC()})
+			if !m.addCandidate(e) {
+				m.rejectCandidate(e, "candidate queue full")
+				return
+			}
+		})
 	}
+}
 func (m *Monitor) consume(ctx context.Context) {
 	concurrency := m.snipeConcurrency
 	if concurrency < 1 {

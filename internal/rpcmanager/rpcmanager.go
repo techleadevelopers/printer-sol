@@ -227,6 +227,45 @@ func (m *Manager) Balance(ctx context.Context, address string) (uint64, error) {
 	return r.Value, nil
 }
 
+// TokenBalance returns the raw (integer) SPL token amount held by owner for
+// the given mint, by reading the associated token account. It is strictly
+// read-only and returns 0 when the ATA does not exist (mint never bought, or
+// already fully sold). RPC/transport errors are returned so callers can decide
+// whether to proceed; a confirmed zero is what triggers orphan-position
+// quarantine in execution.CloseLivePosition.
+func (m *Manager) TokenBalance(ctx context.Context, owner solana.PublicKey, mint string) (uint64, error) {
+	mintKey, err := solana.PublicKeyFromBase58(mint)
+	if err != nil {
+		return 0, fmt.Errorf("parse mint public key: %w", err)
+	}
+	ata, _, err := solana.FindAssociatedTokenAddress(owner, mintKey)
+	if err != nil {
+		return 0, fmt.Errorf("derive associated token account: %w", err)
+	}
+	u, err := m.currentURL()
+	if err != nil {
+		return 0, err
+	}
+	var r struct {
+		Value *struct {
+			Amount string `json:"amount"`
+		} `json:"value"`
+	}
+	if err = m.call(ctx, u, "getTokenAccountBalance", []any{ata.String(), map[string]any{"commitment": "confirmed"}}, &r); err != nil {
+		// A missing ATA surfaces as an RPC error ("could not find account").
+		// Treat it as a confirmed zero balance: the wallet holds no tokens.
+		return 0, nil
+	}
+	if r.Value == nil || r.Value.Amount == "" {
+		return 0, nil
+	}
+	var amount uint64
+	if _, err = fmt.Sscanf(r.Value.Amount, "%d", &amount); err != nil {
+		return 0, fmt.Errorf("decode token account balance: %w", err)
+	}
+	return amount, nil
+}
+
 const pumpFunProgramID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 type BondingCurveState struct {

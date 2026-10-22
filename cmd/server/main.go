@@ -115,6 +115,12 @@ func main() {
 	if err := engine.Reconcile(ctx); err != nil {
 		log.Warn("startup reconciliation", logging.Err(err))
 	}
+	// 4.1: recheck persisted 'unknown' trades on boot so live purchases are
+	// not blocked until the monitor's first 5s reconcile tick. ReconcileUnknown
+	// is a no-op in simulation and never submits a new transaction.
+	if err := engine.ReconcileUnknown(ctx); err != nil {
+		log.Warn("startup unknown-trade reconciliation", logging.Err(err))
+	}
 	go rpcs.Run(ctx, time.Duration(cfg.RPCHealthCheckIntervalSeconds)*time.Second)
 	go monitor.Run(ctx)
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: api.New(db, w, rpcs, engine, controller, monitor, bus, cfg, log, paperDB), ReadHeaderTimeout: 5 * time.Second}

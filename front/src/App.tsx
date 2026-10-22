@@ -1,3 +1,4 @@
+// front/src/App.tsx
 // TODO(auth): Clerk routes below are intentionally unmounted because the Go API
 // validates the master-password HMAC bearer token, not Clerk tokens. Revisit
 // only as part of a coordinated API authentication migration.
@@ -38,7 +39,7 @@ import { Link, Redirect, Route, Router as WouterRouter, Switch, useLocation } fr
 import { apiBaseUrl, apiConnectionLabel, hasConfiguredApiBase } from '@/services/api';
 import { createEventSocket, type BotEvent, type EventState } from '@/services/websocket';
 import { customFetch } from '@/api-client/custom-fetch';
-import { formatSol } from '@/lib/sol-format';
+import { formatSol, formatUsdFromSol, fetchSolPrice } from '@/lib/sol-format'; // NOVO IMPORT
 import NotFound from '@/pages/not-found';
 import PerformanceReportPage from '@/pages/performance-report';
 import './index.css';
@@ -105,9 +106,39 @@ function EmptyRows({ children = 'Ainda não existem registos disponíveis.' }: {
 function PanelTitle({ title, aside }: { title: string; aside?: ReactNode }) {
   return <div className="flex items-center justify-between gap-3 border-b border-[hsl(var(--border))] px-4 py-3.5"><h2 className="m-0 text-sm font-semibold">{title}</h2>{aside}</div>;
 }
-function Metric({ label, value, suffix, tone, note }: { label: string; value: string; suffix?: string; tone?: string; note?: string }) {
-  return <section className="panel metric p-4"><div className="eyebrow">{label}</div><div className={`metric-value mt-3 ${tone || ''}`}>{value}<span className="ml-1 text-xs font-normal muted">{suffix}</span></div>{note && <div className="mt-2 text-xs muted">{note}</div>}</section>;
+
+// COMPONENTE METRIC ATUALIZADO
+function Metric({ label, value, suffix, tone, note, solPrice }: { label: string; value: string; suffix?: string; tone?: string; note?: string; solPrice?: number }) {
+  const isSolMetric = suffix === 'SOL' && value !== 'Indisponível' && solPrice != null;
+  
+  let usdValue = null;
+  if (isSolMetric) {
+    // Converte a string formatada de volta para número
+    const numericValue = parseFloat(value.replace(/\./g, '').replace(',', '.'));
+    if (!isNaN(numericValue)) {
+      usdValue = formatUsdFromSol(numericValue, solPrice);
+    }
+  }
+
+  return (
+    <section className="panel metric p-4">
+      <div className="eyebrow">{label}</div>
+      {usdValue ? (
+        <div className={`metric-value mt-3 ${tone || ''}`}>
+          {usdValue}
+          <span className="ml-1 block mt-1 text-xs font-normal muted">{value} {suffix}</span>
+        </div>
+      ) : (
+        <div className={`metric-value mt-3 ${tone || ''}`}>
+          {value}
+          <span className="ml-1 text-xs font-normal muted">{suffix}</span>
+        </div>
+      )}
+      {note && <div className="mt-2 text-xs muted">{note}</div>}
+    </section>
+  );
 }
+
 function DataPageFrame({ children, eyebrow = 'CENTRO DE OPERAÇÕES', description }: { children: ReactNode; eyebrow?: string; description?: string }) {
   const [path] = useLocation();
   return <div className="page-wrap enter"><div className="mb-6"><div className="eyebrow">{eyebrow}</div><h1 className="display mb-1 mt-2 text-2xl font-semibold">{titleMap[path] || 'Operações'}</h1>{description && <p className="m-0 text-sm muted">{description}</p>}</div>{children}</div>;
@@ -122,8 +153,6 @@ function useEventMonitor() {
     onState: next => {
       setState(next);
       if (next === 'connected') {
-        // A reconnect can follow a server restart in the opposite operating
-        // mode. Remove the previous ledger before refetching its replacement.
         qc.removeQueries();
         void qc.invalidateQueries();
       }
@@ -225,6 +254,18 @@ function DashboardPage() {
   const [resetBalance, setResetBalance] = useState('');
   const [resetPending, setResetPending] = useState(false);
   const [resetError, setResetError] = useState('');
+  
+  // ESTADO PARA O PREÇO DO SOL
+  const [solPrice, setSolPrice] = useState(119);
+
+  // EFEITO PARA BUSCAR O PREÇO
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    fetchSolPrice().then(setSolPrice);
+    interval = setInterval(() => fetchSolPrice().then(setSolPrice), 60000);
+    return () => clearInterval(interval);
+  }, []);
+
   const runAction = (fn: () => Promise<unknown>, label: string) => void fn().then((result: any) => {
     if (result?.accepted) { notify({ text: `${label}: pedido aceite pelo back-end.`, kind: 'success' }); void qc.invalidateQueries({ queryKey: getGetDashboardQueryKey() }); }
     else notify({ text: result?.message || 'O back-end não confirmou o pedido.', kind: 'error' });
@@ -289,22 +330,24 @@ function DashboardPage() {
         Atualizado às {new Date(dash.dataUpdatedAt).toLocaleTimeString('pt-BR')} · {eventState === 'connected' ? 'eventos ao vivo + consulta de segurança a cada 5 s' : 'consulta de segurança a cada 5 s; fluxo de eventos reconectando'}
       </p>
       {d.botStatus === 'running' && <p className="mb-4 mt-0 text-xs warning">Parar interrompe novas operações; não fecha posições existentes.</p>}
+      
+      {/* COMPONENTES METRIC COM O PREÇO DO SOL PASSADO */}
       <div className="mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Metric label="Tokens detetados" value={fmt(d.detectedTokens, 0)} />
         <Metric label="Tokens analisados" value={fmt(d.analyzedTokens, 0)} />
         <Metric label="Operações encerradas" value={fmt(d.closedTrades, 0)} note={`${fmt(d.sellAttempts, 0)} tentativas de venda · ${fmt(d.failedSellAttempts, 0)} falhas`} />
         <Metric label="Posições abertas" value={fmt(d.openPositions, 0)} />
-        <Metric label={d.mode === 'simulation' ? 'Saldo disponível paper' : 'Saldo da carteira'} value={fmtSol(d.walletBalanceSol)} suffix="SOL" note={d.walletBalanceAvailable === false ? 'Leitura indisponível; zero não será presumido.' : undefined} />
-        {d.mode === 'simulation' && <Metric label="Patrimônio virtual paper" value={fmtSol(d.virtualEquitySol)} suffix="SOL" note={d.estimatedOpenPnlComplete === false ? 'Estimativa parcial: falta marca em uma ou mais posições.' : 'Inclui posições abertas pela última marca disponível.'} />}
-        <Metric label="Reserva de taxas" value={fmtSol(d.feesReserveSol)} suffix="SOL" />
-        <Metric label={d.mode === 'simulation' ? 'P&L realizado · paper' : 'P&L realizado · on-chain'} value={fmtSol(d.realizedPnlSol)} suffix="SOL" tone={d.realizedPnlSol == null ? undefined : d.realizedPnlSol >= 0 ? 'positive' : 'negative'} />
-        <Metric label="P&L aberto estimado" value={fmtSol(d.estimatedOpenPnlSol)} suffix="SOL" tone={d.estimatedOpenPnlSol == null ? undefined : d.estimatedOpenPnlSol >= 0 ? 'technical' : 'warning'} note={d.estimatedOpenPnlComplete === false ? `${fmt(d.unmarkedOpenPositions, 0)} posição(ões) sem marca; soma parcial.` : d.mode === 'simulation' ? 'Estimativa paper por market cap; ainda não é resultado fechado.' : 'Estimativa por market cap; apenas vendas confirmadas são realizadas.'} />
+        <Metric label={d.mode === 'simulation' ? 'Saldo disponível paper' : 'Saldo da carteira'} value={fmtSol(d.walletBalanceSol)} suffix="SOL" note={d.walletBalanceAvailable === false ? 'Leitura indisponível; zero não será presumido.' : undefined} solPrice={solPrice} />
+        {d.mode === 'simulation' && <Metric label="Patrimônio virtual paper" value={fmtSol(d.virtualEquitySol)} suffix="SOL" note={d.estimatedOpenPnlComplete === false ? 'Estimativa parcial: falta marca em uma ou mais posições.' : 'Inclui posições abertas pela última marca disponível.'} solPrice={solPrice} />}
+        <Metric label="Reserva de taxas" value={fmtSol(d.feesReserveSol)} suffix="SOL" solPrice={solPrice} />
+        <Metric label={d.mode === 'simulation' ? 'P&L realizado · paper' : 'P&L realizado · on-chain'} value={fmtSol(d.realizedPnlSol)} suffix="SOL" tone={d.realizedPnlSol == null ? undefined : d.realizedPnlSol >= 0 ? 'positive' : 'negative'} solPrice={solPrice} />
+        <Metric label="P&L aberto estimado" value={fmtSol(d.estimatedOpenPnlSol)} suffix="SOL" tone={d.estimatedOpenPnlSol == null ? undefined : d.estimatedOpenPnlSol >= 0 ? 'technical' : 'warning'} note={d.estimatedOpenPnlComplete === false ? `${fmt(d.unmarkedOpenPositions, 0)} posição(ões) sem marca; soma parcial.` : d.mode === 'simulation' ? 'Estimativa paper por market cap; ainda não é resultado fechado.' : 'Estimativa por market cap; apenas vendas confirmadas são realizadas.'} solPrice={solPrice} />
       </div>
       <div className="mb-4 grid gap-3 lg:grid-cols-[1.4fr_.8fr]">
         <section className="panel"><PanelTitle title={d.mode === 'simulation' ? 'Evolução do patrimônio paper' : 'Histórico do saldo SOL'} aside={<span className="eyebrow">SOL · API</span>} />
           {line ? <div className="px-4 py-5"><svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-44 w-full overflow-visible" role="img" aria-label={d.mode === 'simulation' ? 'Evolução do património paper' : 'Histórico do saldo SOL'}><defs><linearGradient id="chart-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor="#55d99a" stopOpacity=".22" /><stop offset="1" stopColor="#55d99a" stopOpacity="0" /></linearGradient></defs><path d={`${line} L100 100 L0 100 Z`} className="chart-area" /><path d={line} className="chart-line" /></svg><div className="mt-3 flex justify-between text-[10px] mono muted"><span>{fmtDate(balancePoints[0]?.timestamp)}</span><span>{fmtDate(balancePoints.at(-1)?.timestamp)}</span></div></div> : <EmptyRows>{d.mode === 'real' ? 'O saldo SOL atual é exibido acima; histórico de saldo live não é persistido. Consulte abaixo a curva de P&L confirmado.' : 'Aguardando pontos de patrimônio paper.'}</EmptyRows>}
         </section>
-        <section className="panel"><PanelTitle title="Resultado total estimado" /><div className="grid grid-cols-2 gap-3 p-4"><Metric label="Realizado + aberto estimado" value={fmtSol(totalEstimatedPnl)} suffix="SOL" tone={totalEstimatedPnl == null ? undefined : totalEstimatedPnl >= 0 ? 'positive' : 'negative'} note={d.totalEstimatedPnlComplete === false ? 'Parcial: há posições sem marca de preço.' : 'A parcela aberta é estimada, não uma venda confirmada.'} /><Metric label="Custos" value={fmtSol(d.costsSol)} suffix="SOL" tone={d.costsSol == null ? undefined : 'warning'} /><div className="col-span-2 rounded-md border border-[hsl(var(--border))] p-3"><div className="eyebrow mb-3">OPERAÇÕES POR PERÍODO</div>{tradesByPeriod.length ? tradesByPeriod.map((p) => <div key={p.period} className="flex justify-between border-t border-[hsl(var(--border))] py-2 text-xs"><span>{p.period}</span><span><b className={p.positive == null ? 'muted' : 'positive'}>{fmt(p.positive, 0)}</b><span className="mx-2 muted">/</span><b className={p.negative == null ? 'muted' : 'negative'}>{fmt(p.negative, 0)}</b><span className="ml-2 muted">de {fmt(p.total, 0)}</span></span></div>) : <div className="text-xs muted">Indisponível</div>}</div></div></section>
+        <section className="panel"><PanelTitle title="Resultado total estimado" /><div className="grid grid-cols-2 gap-3 p-4"><Metric label="Realizado + aberto estimado" value={fmtSol(totalEstimatedPnl)} suffix="SOL" tone={totalEstimatedPnl == null ? undefined : totalEstimatedPnl >= 0 ? 'positive' : 'negative'} note={d.totalEstimatedPnlComplete === false ? 'Parcial: há posições sem marca de preço.' : 'A parcela aberta é estimada, não uma venda confirmada.'} solPrice={solPrice} /><Metric label="Custos" value={fmtSol(d.costsSol)} suffix="SOL" tone={d.costsSol == null ? undefined : 'warning'} solPrice={solPrice} /><div className="col-span-2 rounded-md border border-[hsl(var(--border))] p-3"><div className="eyebrow mb-3">OPERAÇÕES POR PERÍODO</div>{tradesByPeriod.length ? tradesByPeriod.map((p) => <div key={p.period} className="flex justify-between border-t border-[hsl(var(--border))] py-2 text-xs"><span>{p.period}</span><span><b className={p.positive == null ? 'muted' : 'positive'}>{fmt(p.positive, 0)}</b><span className="mx-2 muted">/</span><b className={p.negative == null ? 'muted' : 'negative'}>{fmt(p.negative, 0)}</b><span className="ml-2 muted">de {fmt(p.total, 0)}</span></span></div>) : <div className="text-xs muted">Indisponível</div>}</div></div></section>
       </div>
       <div className="mb-4 grid gap-3 xl:grid-cols-2">
         <section className="panel"><PanelTitle title="P&L realizado acumulado" aside={<span className="eyebrow">SOL · OPERAÇÕES FECHADAS</span>} />{resultChartData.length ? <div className="p-4"><ResponsiveContainer width="100%" height={210}><AreaChart data={resultChartData}><CartesianGrid strokeDasharray="3 3" stroke="hsl(210 12% 24%)" /><XAxis dataKey="timestamp" tickFormatter={value => new Date(String(value)).toLocaleDateString('pt-BR')} tick={{ fill: '#8997a1', fontSize: 10 }} /><YAxis tick={{ fill: '#8997a1', fontSize: 10 }} /><ChartTooltip formatter={value => [fmtSol(Number(value)), 'SOL']} labelFormatter={value => fmtDate(String(value))} /><Area type="monotone" dataKey="value" name="P&L realizado" stroke="#55d99a" fill="#55d99a" fillOpacity={0.14} connectNulls={false} dot={{ r: 3, fill: '#55d99a' }} /></AreaChart></ResponsiveContainer></div> : <EmptyRows>Série de resultado realizado indisponível.</EmptyRows>}</section>
@@ -490,11 +533,20 @@ function WalletPage() {
   const q = useGetWallet({ query: { refetchInterval: LIVE_DATA_REFRESH_MS } });
   const tokenHoldings = q.data?.tokenHoldings ?? [];
   const [copied, setCopied] = useState(false);
+  const [solPrice, setSolPrice] = useState(119); // Preço do SOL na carteira
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    fetchSolPrice().then(setSolPrice);
+    interval = setInterval(() => fetchSolPrice().then(setSolPrice), 60000);
+    return () => clearInterval(interval);
+  }, []);
+
   const copy = async () => { if (!q.data?.publicAddress) return; try { await navigator.clipboard.writeText(q.data.publicAddress); setCopied(true); setTimeout(() => setCopied(false), 1600); } catch { notify({ text: 'Não foi possível copiar o endereço.', kind: 'error' }); } };
   return <DataPageFrame description="Visualização pública e sincronização reportada. Nenhuma chave privada é apresentada.">
     <QueryState loading={q.isLoading} error={q.isError} onRetry={() => void q.refetch()} />
     {!q.isLoading && !q.isError && q.data && <>
-      <div className="mb-4 grid gap-3 sm:grid-cols-3"><Metric label="Saldo" value={fmtSol(q.data.balanceSol)} suffix="SOL" /><Metric label="Reserva de taxas" value={fmtSol(q.data.feesReserveSol)} suffix="SOL" tone="warning" /><section className="panel metric p-4"><div className="eyebrow">SINCRONIZAÇÃO</div><div className="mt-3"><StatusTag value={q.data.syncStatus} positive={['synced']} warning={['syncing', 'stale']} negative={['unavailable']} /></div><div className="mt-2 text-xs muted">{fmtDate(q.data.updatedAt)}</div></section></div>
+      <div className="mb-4 grid gap-3 sm:grid-cols-3"><Metric label="Saldo" value={fmtSol(q.data.balanceSol)} suffix="SOL" solPrice={solPrice} /><Metric label="Reserva de taxas" value={fmtSol(q.data.feesReserveSol)} suffix="SOL" tone="warning" solPrice={solPrice} /><section className="panel metric p-4"><div className="eyebrow">SINCRONIZAÇÃO</div><div className="mt-3"><StatusTag value={q.data.syncStatus} positive={['synced']} warning={['syncing', 'stale']} negative={['unavailable']} /></div><div className="mt-2 text-xs muted">{fmtDate(q.data.updatedAt)}</div></section></div>
       <section className="panel mb-4"><PanelTitle title="Endereço público" aside={<StatusTag value={q.data.syncStatus} positive={['synced']} warning={['syncing', 'stale']} negative={['unavailable']} />} /><div className="flex flex-wrap items-center justify-between gap-3 p-4"><code className="mono break-all text-xs">{q.data.publicAddress || 'Indisponível'}</code><button className="button button-small" disabled={!q.data.publicAddress} onClick={() => void copy()}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? 'Copiado' : 'Copiar endereço'}</button></div></section>
       <section className="panel"><PanelTitle title="Ativos monitorizados" aside={<span className="eyebrow">{tokenHoldings.length} ATIVOS</span>} />{tokenHoldings.length ? <div className="table-wrap"><table><thead><tr><th>Ativo</th><th>Mint</th><th>Quantidade</th><th>Explorer</th></tr></thead><tbody>{tokenHoldings.map(t => <tr key={t.mint}><td className="text-xs font-medium">{t.symbol || 'Símbolo indisponível'}</td><td className="mono text-xs">{shortKey(t.mint)}</td><td className="mono text-xs">{fmt(t.quantity)}</td><td><a className="technical text-xs" href={`https://solscan.io/account/${encodeURIComponent(t.mint)}`} target="_blank" rel="noreferrer">Solscan <ExternalLink className="inline" size={12} /></a></td></tr>)}</tbody></table></div> : <EmptyRows>Não existem ativos reportados.</EmptyRows>}</section>
     </>}
