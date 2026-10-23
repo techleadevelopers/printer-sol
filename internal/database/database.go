@@ -1269,6 +1269,29 @@ func (d *DB) OpenPositionMints() ([]string, error) {
 	}
 	return mints, rows.Err()
 }
+func (d *DB) OpenPositionMintsWithStaleMarks(simulation bool, staleBefore time.Time) ([]string, error) {
+marks := "live_marks"
+if simulation {
+marks = "paper_marks"
+}
+rows, err := d.Query(d.bind(`SELECT p.mint FROM positions p
+LEFT JOIN `+marks+` m ON m.mint=p.mint
+WHERE p.status='open' AND (m.mint IS NULL OR m.updated_at<=?)
+ORDER BY p.updated_at`), staleBefore)
+if err != nil {
+return nil, err
+}
+defer rows.Close()
+mints := make([]string, 0)
+for rows.Next() {
+var mint string
+if err := rows.Scan(&mint); err != nil {
+return nil, err
+}
+mints = append(mints, mint)
+}
+return mints, rows.Err()
+}
 func (d *DB) OpenPositionCount() (int, error) {
 	var n int
 	e := d.QueryRow(`SELECT COUNT(*) FROM positions WHERE status='open'`).Scan(&n)

@@ -139,26 +139,59 @@ func TestCandidateGateRejectsAboveMaximumRealReserves(t *testing.T) {
 	}
 }
 
-func TestCandidateGateUsesWebSocketOnlyAndSkipsReserveGate(t *testing.T) {
+func TestCandidateGateUsesWebSocketMarketCapAndEnforcesReserveRange(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		reservesSOL float64
+		wantQueued  bool
+	}{
+		{name: "inclusive lower bound", reservesSOL: 0, wantQueued: true},
+		{name: "inclusive upper bound", reservesSOL: 1.5, wantQueued: true},
+		{name: "above upper bound", reservesSOL: 1.500001, wantQueued: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			monitor, closeDB := newMarketDataTestMonitor(t)
+			defer closeDB()
+			monitor.useWSMarketCap = true
+			monitor.bondingCurve = fixedBondingCurveMarketCap{marketCapSOL: 30, reservesSOL: test.reservesSOL}
+			event := testCandidate("websocket-market-cap-entry-" + test.name)
+			event.MarketCapSOL = 55
+			if !monitor.addCandidate(event) {
+				t.Fatal("candidate was not queued")
+			}
+			monitor.checkCandidate(context.Background(), event.Mint)
+
+			if test.wantQueued {
+				select {
+				case queued := <-monitor.q:
+					if queued.MarketCapSOL != 55 {
+						t.Fatalf("entry baseline market cap = %f, want WebSocket value 55", queued.MarketCapSOL)
+					}
+				default:
+					t.Fatalf("candidate with %.6f SOL real reserves was not queued", test.reservesSOL)
+				}
+				return
+			}
+			if len(monitor.q) != 0 {
+				t.Fatalf("candidate with %.6f SOL real reserves was queued above configured maximum", test.reservesSOL)
+			}
+		})
+	}
+}
+
+func TestCandidateGateAppliesMarketCapMaximumWithoutTolerance(t *testing.T) {
 	monitor, closeDB := newMarketDataTestMonitor(t)
 	defer closeDB()
 	monitor.useWSMarketCap = true
-	monitor.bondingCurve = nil
-	monitor.minVolumeBeforeBuySOL = 10
-	monitor.maxVolumeBeforeBuySOL = 0.01
-	event := testCandidate("websocket-market-cap-entry")
-	event.MarketCapSOL = 55
+	monitor.maxMarketCapSOL = 150
+	event := testCandidate("market-cap-over-configured-maximum")
+	event.MarketCapSOL = 150.000001
 	if !monitor.addCandidate(event) {
 		t.Fatal("candidate was not queued")
 	}
 	monitor.checkCandidate(context.Background(), event.Mint)
-	select {
-	case queued := <-monitor.q:
-		if queued.MarketCapSOL != 55 {
-			t.Fatalf("entry baseline market cap = %f, want WebSocket value 55", queued.MarketCapSOL)
-		}
-	default:
-		t.Fatal("candidate with a valid WebSocket market cap was not queued")
+	if len(monitor.q) != 0 {
+		t.Fatal("candidate above MAX_MARKET_CAP_SOL was queued")
 	}
 }
 

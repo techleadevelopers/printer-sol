@@ -327,9 +327,7 @@ func (m *Monitor) Run(ctx context.Context) {
 	go m.runMaxHoldChecker(ctx)
 	go m.runSeenJanitor(ctx)
 	go m.runCandidateChecker(ctx)
-	if !m.useWSMarketCap {
 		go m.runPricePoller(ctx)
-	}
 	m.runConnections(ctx)
 }
 
@@ -860,11 +858,11 @@ func (m *Monitor) connect(ctx context.Context) error {
 			created = received
 		}
 
-		if m.useWSMarketCap && m.maxMarketCapSOL > 0 && d.MarketCapSol > (m.maxMarketCapSOL*1.15) {
-			m.log.Info("token rejected instantly by websocket max market cap tolerance",
+if m.useWSMarketCap && m.maxMarketCapSOL > 0 && d.MarketCapSol > m.maxMarketCapSOL {
+m.log.Info("token rejected instantly by websocket max market cap",
 				zap.String("mint", d.Mint),
 				zap.Float64("ws_mcap_sol", d.MarketCapSol),
-				zap.Float64("max_allowed", m.maxMarketCapSOL*1.15))
+zap.Float64("max_allowed", m.maxMarketCapSOL))
 			continue
 		}
 
@@ -1008,8 +1006,8 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 		return
 	}
 
-	if m.maxMarketCapSOL > 0 && e.MarketCapSOL > (m.maxMarketCapSOL*1.15) {
-		reason := "market cap exceeds max tolerance configured"
+if m.maxMarketCapSOL > 0 && e.MarketCapSOL > m.maxMarketCapSOL {
+reason := fmt.Sprintf("market cap %.6f SOL exceeds configured maximum %.6f SOL", e.MarketCapSOL, m.maxMarketCapSOL)
 		_ = m.db.RecordAssessment(e.Mint, false, reason)
 		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 		m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.String("reason", reason))
