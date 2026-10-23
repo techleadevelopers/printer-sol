@@ -155,6 +155,19 @@ func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 		return
 	}
 
+	// The WebSocket path is the low-latency entry path. Do not wait for or
+	// reject an otherwise eligible entry because an RPC price/reserve snapshot
+	// is late or disagrees; the trade request is bounded by configured slippage.
+	if m.useWSMarketCap {
+		if parent.Err() != nil {
+			return
+		}
+		m.runOperationAt(generation, func() {
+			m.finishCandidate(mint, event, 0, 0, nil)
+		})
+		return
+	}
+
 	rpcCtx, rpcCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer rpcCancel()
 
@@ -187,26 +200,28 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 	delete(m.candidates, mint)
 	m.candidateMu.Unlock()
 
-	if rpcErr != nil {
+	if rpcErr != nil && !m.useWSMarketCap {
 		m.rejectCandidate(event, fmt.Sprintf("bonding-curve RPC could not verify real SOL reserves: %v", rpcErr))
 		return
 	}
 
 	marketCapToCheck := rpcMarketCapSOL
 	marketCapSource := "RPC"
+	reserveGateEnabled := true
 	if m.useWSMarketCap {
 		marketCapToCheck = event.MarketCapSOL
 		marketCapSource = "WebSocket"
+		reserveGateEnabled = false
 	}
-	// Real bonding-curve SOL reserves are checked in every mode before market
-	// cap rejection, including when PumpPortal supplies the market-cap mark.
-	if realSOLReservesSOL < m.minVolumeBeforeBuySOL {
-		m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL are below minimum %.6f SOL", realSOLReservesSOL, m.minVolumeBeforeBuySOL))
-		return
-	}
-	if realSOLReservesSOL > m.maxVolumeBeforeBuySOL {
-		m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL exceed maximum %.6f SOL", realSOLReservesSOL, m.maxVolumeBeforeBuySOL))
-		return
+	if reserveGateEnabled {
+		if realSOLReservesSOL < m.minVolumeBeforeBuySOL {
+			m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL are below minimum %.6f SOL", realSOLReservesSOL, m.minVolumeBeforeBuySOL))
+			return
+		}
+		if realSOLReservesSOL > m.maxVolumeBeforeBuySOL {
+			m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL exceed maximum %.6f SOL", realSOLReservesSOL, m.maxVolumeBeforeBuySOL))
+			return
+		}
 	}
 
 if marketCapToCheck <= 0 || math.IsNaN(marketCapToCheck) || math.IsInf(marketCapToCheck, 0) {
@@ -233,9 +248,12 @@ return
 		zap.String("mint", mint),
 		zap.Float64("market_cap_sol", marketCapToCheck),
 		zap.String("market_cap_source", marketCapSource),
-	zap.Bool("reserve_gate_enabled", true),
+		zap.Bool("reserve_gate_enabled", reserveGateEnabled),
+		zap.Float64("max_slippage_pct", m.slippage),
 	}
-	fields = append(fields, zap.Float64("real_sol_reserves", realSOLReservesSOL))
+	if reserveGateEnabled {
+		fields = append(fields, zap.Float64("real_sol_reserves", realSOLReservesSOL))
+	}
 	m.log.Info("entry approved", fields...)
 	queued, enqueueReason := m.enqueueSnipe(event)
 	if !queued {

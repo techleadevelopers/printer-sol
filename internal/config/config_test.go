@@ -177,7 +177,7 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 		"MAX_VOLUME_BEFORE_BUY", "USE_WS_MARKET_CAP",
 		"MIN_MARKET_CAP_SOL", "MAX_MARKET_CAP_SOL",
 		"PRICE_POLL_SECONDS", "SNIPE_CONCURRENCY", "SNIPE_TIMEOUT_MS", "DEDUPE_TTL_MS",
-		"TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
+		"TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL", "MAX_SLIPPAGE_PCT",
 		"LIVE_UNLOCK_REQUIRES_PAPER", "SKIP_PREFLIGHT",
 "TOKEN_MAX_AGE_SECONDS", "TAKE_PROFIT_GROSS_PCT", "STOP_LOSS_PCT", "TRAILING_STOP_PCT", "MAX_HOLD_SECONDS", "STUCK_EXIT_QUARANTINE_SECONDS",
 	}
@@ -213,7 +213,7 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.StuckExitQuarantineSeconds != 120 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinVolumeBeforeBuySOL != 0 || cfg.MaxVolumeBeforeBuySOL != 1.5 || !cfg.UseWSMarketCap || cfg.MinMarketCapSOL != 20 || cfg.PricePollSeconds != 20 || cfg.SnipeConcurrency != 4 || cfg.SnipeTimeoutMS != 15000 || cfg.DedupeTTLMS != 60000 || cfg.TokenMaxAgeSeconds != 30 {
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.StuckExitQuarantineSeconds != 120 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || cfg.MaxSlippagePct != 15 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinVolumeBeforeBuySOL != 0 || cfg.MaxVolumeBeforeBuySOL != 1.5 || !cfg.UseWSMarketCap || cfg.MinMarketCapSOL != 20 || cfg.PricePollSeconds != 20 || cfg.SnipeConcurrency != 4 || cfg.SnipeTimeoutMS != 15000 || cfg.DedupeTTLMS != 60000 || cfg.TokenMaxAgeSeconds != 30 {
 		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f priorityFee=%.9f liveGate=%v skipPreflight=%v entryDelay=%d minVolumeSOL=%.3f minMarketCapSOL=%.1f pricePoll=%d snipeConcurrency=%d snipeTimeoutMs=%d dedupeTtlMs=%d tokenMaxAge=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.MaxPriorityFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.SkipPreflight, cfg.EntryDelaySeconds, cfg.MinVolumeBeforeBuySOL, cfg.MinMarketCapSOL, cfg.PricePollSeconds, cfg.SnipeConcurrency, cfg.SnipeTimeoutMS, cfg.DedupeTTLMS, cfg.TokenMaxAgeSeconds)
 	}
 
@@ -297,5 +297,39 @@ func TestValidateURLRejectsWrongSchemeAndRelativeURL(t *testing.T) {
 	}
 	if err := validateURL("/relative", "http", "https"); err == nil {
 		t.Fatal("expected relative URL to be rejected")
+	}
+}
+
+func TestLiveRequiresTakeProfitAndPositiveCurveSlippageLimit(t *testing.T) {
+	for key, value := range map[string]string{
+		"SIMULATION":                  "false",
+		"ENABLE_LIVE_TRADING":         "true",
+		"LIVE_UNLOCK_REQUIRES_PAPER":  "false",
+		"SIMULATION_DATABASE_URL":     "postgres://test@localhost/simulation",
+		"REAL_DATABASE_URL":           "postgres://test@localhost/live",
+		"DATABASE_URL":                "",
+		"ADMIN_PASSWORD":              "test-password",
+		"BOT_PRIVATE_KEY":             "test-only-key-reference",
+		"KEY_PROVIDER_REF":            "test-provider-ref",
+		"WALLET_PUBLIC_ADDRESS":       "test-wallet",
+		"PUMPPORTAL_API_KEY":          "test-pumpportal-key",
+		"TRADE_USD":                   "3",
+		"TAKE_PROFIT_GROSS_PCT":       "0",
+		"STOP_LOSS_PCT":               "25",
+		"TRAILING_STOP_PCT":           "12",
+		"MAX_HOLD_SECONDS":            "300",
+		"MAX_SLIPPAGE_PCT":            "15",
+	} {
+		t.Setenv(key, value)
+	}
+
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "TAKE_PROFIT_GROSS_PCT") {
+		t.Fatalf("live mode without take-profit should fail clearly, got %v", err)
+	}
+
+	t.Setenv("TAKE_PROFIT_GROSS_PCT", "50")
+	t.Setenv("MAX_SLIPPAGE_PCT", "0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "MAX_SLIPPAGE_PCT") {
+		t.Fatalf("live mode without a positive slippage cap should fail clearly, got %v", err)
 	}
 }

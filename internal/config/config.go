@@ -228,6 +228,12 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}
 	}
+	if c.TakeProfitGrossPct <= 0 {
+		return c, fmt.Errorf("TAKE_PROFIT_GROSS_PCT must be positive in simulation and live modes")
+	}
+	if c.MaxSlippagePct <= 0 {
+		return c, fmt.Errorf("MAX_SLIPPAGE_PCT must be positive to bound curve execution slippage")
+	}
 	if !c.Simulation && (!c.EnableLiveTrading || c.PrivateKey == "" || c.KeyProviderRef == "" || c.WalletPublicAddress == "" || c.PumpPortalKey == "") {
 		return c, fmt.Errorf("live trading requires ENABLE_LIVE_TRADING=true, BOT_PRIVATE_KEY via KEY_PROVIDER_REF, WALLET_PUBLIC_ADDRESS and PUMPPORTAL_API_KEY")
 	}
@@ -240,8 +246,8 @@ func Load() (Config, error) {
 	if !c.Simulation && (c.StopLossPct <= 0 || c.MaxHoldSeconds <= 0) {
 		return c, fmt.Errorf("live trading requires STOP_LOSS_PCT > 0 and MAX_HOLD_SECONDS > 0")
 	}
-	if c.Simulation && (c.StopLossPct <= 0 || c.TakeProfitGrossPct <= 0 || c.TrailingStopPct <= 0) {
-		return c, fmt.Errorf("simulation requires STOP_LOSS_PCT, TAKE_PROFIT_GROSS_PCT and TRAILING_STOP_PCT to be positive")
+	if c.Simulation && (c.StopLossPct <= 0 || c.TrailingStopPct <= 0) {
+		return c, fmt.Errorf("simulation requires STOP_LOSS_PCT and TRAILING_STOP_PCT to be positive")
 	}
 	if !c.Simulation && c.TrailingStopPct <= 0 {
 		return c, fmt.Errorf("live trading requires TRAILING_STOP_PCT > 0")

@@ -148,15 +148,14 @@ func TestCandidateGateRejectsAboveMaximumRealReserves(t *testing.T) {
 	}
 }
 
-func TestCandidateGateUsesWebSocketMarketCapAndEnforcesReserveRange(t *testing.T) {
+func TestCandidateGateUsesWebSocketMarketCapWithoutWaitingForRPCReserves(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		reservesSOL float64
-		wantQueued  bool
 	}{
-		{name: "inclusive lower bound", reservesSOL: 0, wantQueued: true},
-		{name: "inclusive upper bound", reservesSOL: 1.5, wantQueued: true},
-		{name: "above upper bound", reservesSOL: 1.500001, wantQueued: false},
+		{name: "below reserve minimum", reservesSOL: .01},
+		{name: "within range", reservesSOL: 1.5},
+		{name: "above reserve maximum", reservesSOL: 1.500001},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			monitor, closeDB := newMarketDataTestMonitor(t)
@@ -170,21 +169,31 @@ func TestCandidateGateUsesWebSocketMarketCapAndEnforcesReserveRange(t *testing.T
 			}
 			monitor.checkCandidate(context.Background(), event.Mint)
 
-			if test.wantQueued {
-				select {
-				case queued := <-monitor.q:
-					if queued.MarketCapSOL != 55 {
-						t.Fatalf("entry baseline market cap = %f, want WebSocket value 55", queued.MarketCapSOL)
-					}
-				default:
-					t.Fatalf("candidate with %.6f SOL real reserves was not queued", test.reservesSOL)
+			select {
+			case queued := <-monitor.q:
+				if queued.MarketCapSOL != 55 {
+					t.Fatalf("entry baseline market cap = %f, want WebSocket value 55", queued.MarketCapSOL)
 				}
-				return
-			}
-			if len(monitor.q) != 0 {
-				t.Fatalf("candidate with %.6f SOL real reserves was queued above configured maximum", test.reservesSOL)
+			default:
+				t.Fatalf("candidate was blocked by unavailable/not-required RPC reserves (fixture %.6f SOL)", test.reservesSOL)
 			}
 		})
+	}
+}
+
+func TestCandidateGateUsesWebSocketWhenRPCIsUnavailable(t *testing.T) {
+	monitor, closeDB := newMarketDataTestMonitor(t)
+	defer closeDB()
+	monitor.useWSMarketCap = true
+	monitor.bondingCurve = fixedBondingCurveMarketCap{err: errors.New("RPC unavailable")}
+	event := testCandidate("websocket-rpc-unavailable")
+	event.MarketCapSOL = 55
+	if !monitor.addCandidate(event) {
+		t.Fatal("candidate was not queued")
+	}
+	monitor.checkCandidate(context.Background(), event.Mint)
+	if len(monitor.q) != 1 {
+		t.Fatal("valid WebSocket market cap was blocked by unavailable RPC")
 	}
 }
 
