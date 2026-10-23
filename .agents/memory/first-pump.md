@@ -14,3 +14,9 @@ Preserve TP/SL, trailing stop, financial limits, duplicate-entry prevention, and
 **Why:** the user wants first-seconds Pump.fun sniping while preserving risk and settlement safeguards, and requires max hold to close only positions with `change <= 0`.
 
 **How to apply:** delay the buy only for the configured entry gate, not for RugCheck. Keep WebSocket as the primary fast price source and `PRICE_POLL_SECONDS` as a stale-mark RPC fallback. Alert about RPC degradation only when an RPC operation is actually expected or attempted.
+
+`TOKEN_MAX_AGE_SECONDS` defaults to 30 and is authoritative in both the strategy and monitor, with no tolerance multiplier or fixed override. A value of `0` disables only the token-age filter in simulation and live modes; positive values reject tokens at or above the configured age boundary. This cutoff is independent of the entry delay.
+
+**Why:** the user explicitly requires `TOKEN_MAX_AGE_SECONDS` to be obeyed exactly, including disabling it with zero and not forcing it above the entry delay.
+
+**How to apply:** pass the configured seconds to both `strategy.New` and `tokenmonitor.Settings.MaxTokenAge`; preserve `EvaluateFast`'s strict `age >= maxAge` check and skip monitor age checks when the configured duration is zero.

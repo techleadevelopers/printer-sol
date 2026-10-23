@@ -179,24 +179,20 @@ func TestCandidateGateUsesWebSocketMarketCapAndEnforcesReserveRange(t *testing.T
 	}
 }
 
-func TestCandidateGateAppliesConfiguredMarketCapTolerance(t *testing.T) {
+func TestCandidateGateUsesStrictConfiguredMarketCapBounds(t *testing.T) {
 	for _, test := range []struct {
 		name         string
 		marketCapSOL float64
-		tolerancePct float64
 		wantQueued   bool
 	}{
-		{name: "strict at configured maximum", marketCapSOL: 150, tolerancePct: 0, wantQueued: true},
-		{name: "strict above configured maximum", marketCapSOL: 150.000001, tolerancePct: 0, wantQueued: false},
-		{name: "at 15 percent tolerance boundary", marketCapSOL: 172.5, tolerancePct: 15, wantQueued: true},
-		{name: "above 15 percent tolerance boundary", marketCapSOL: 172.500001, tolerancePct: 15, wantQueued: false},
+		{name: "at configured maximum", marketCapSOL: 150, wantQueued: true},
+		{name: "above configured maximum", marketCapSOL: 150.000001, wantQueued: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			monitor, closeDB := newMarketDataTestMonitor(t)
 			defer closeDB()
 			monitor.useWSMarketCap = true
 			monitor.maxMarketCapSOL = 150
-			monitor.marketCapTolerancePct = test.tolerancePct
 			event := testCandidate("market-cap-" + test.name)
 			event.MarketCapSOL = test.marketCapSOL
 			if !monitor.addCandidate(event) {
@@ -204,10 +200,10 @@ func TestCandidateGateAppliesConfiguredMarketCapTolerance(t *testing.T) {
 			}
 			monitor.checkCandidate(context.Background(), event.Mint)
 			if test.wantQueued && len(monitor.q) != 1 {
-				t.Fatalf("candidate at market cap %.6f with %.2f%% tolerance was rejected", test.marketCapSOL, test.tolerancePct)
+				t.Fatalf("candidate at market cap %.6f was rejected", test.marketCapSOL)
 			}
 			if !test.wantQueued && len(monitor.q) != 0 {
-				t.Fatalf("candidate at market cap %.6f with %.2f%% tolerance was queued", test.marketCapSOL, test.tolerancePct)
+				t.Fatalf("candidate at market cap %.6f was queued above the configured maximum", test.marketCapSOL)
 			}
 		})
 	}

@@ -175,7 +175,7 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 		"MAX_OPEN_POSITIONS", "MAX_CONFIRMATION_WAIT_SECONDS", "MAX_SUBMISSION_ATTEMPTS",
 		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "ENTRY_DELAY_SECONDS", "MIN_VOLUME_BEFORE_BUY",
 		"MAX_VOLUME_BEFORE_BUY", "USE_WS_MARKET_CAP",
-"MIN_MARKET_CAP_SOL", "MAX_MARKET_CAP_SOL", "MARKET_CAP_TOLERANCE_PCT",
+		"MIN_MARKET_CAP_SOL", "MAX_MARKET_CAP_SOL",
 		"PRICE_POLL_SECONDS", "SNIPE_CONCURRENCY", "SNIPE_TIMEOUT_MS", "DEDUPE_TTL_MS",
 		"TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
 		"LIVE_UNLOCK_REQUIRES_PAPER", "SKIP_PREFLIGHT",
@@ -213,29 +213,33 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.StuckExitQuarantineSeconds != 120 || cfg.MarketCapTolerancePct != 15 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinVolumeBeforeBuySOL != 0 || cfg.MaxVolumeBeforeBuySOL != 1.5 || !cfg.UseWSMarketCap || cfg.MinMarketCapSOL != 20 || cfg.PricePollSeconds != 20 || cfg.SnipeConcurrency != 4 || cfg.SnipeTimeoutMS != 15000 || cfg.DedupeTTLMS != 60000 || cfg.TokenMaxAgeSeconds != 30 {
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.StuckExitQuarantineSeconds != 120 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinVolumeBeforeBuySOL != 0 || cfg.MaxVolumeBeforeBuySOL != 1.5 || !cfg.UseWSMarketCap || cfg.MinMarketCapSOL != 20 || cfg.PricePollSeconds != 20 || cfg.SnipeConcurrency != 4 || cfg.SnipeTimeoutMS != 15000 || cfg.DedupeTTLMS != 60000 || cfg.TokenMaxAgeSeconds != 30 {
 		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f priorityFee=%.9f liveGate=%v skipPreflight=%v entryDelay=%d minVolumeSOL=%.3f minMarketCapSOL=%.1f pricePoll=%d snipeConcurrency=%d snipeTimeoutMs=%d dedupeTtlMs=%d tokenMaxAge=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.MaxPriorityFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.SkipPreflight, cfg.EntryDelaySeconds, cfg.MinVolumeBeforeBuySOL, cfg.MinMarketCapSOL, cfg.PricePollSeconds, cfg.SnipeConcurrency, cfg.SnipeTimeoutMS, cfg.DedupeTTLMS, cfg.TokenMaxAgeSeconds)
 	}
 
 	_ = os.Setenv("MIN_VOLUME_BEFORE_BUY", "0.25")
 	_ = os.Setenv("MAX_VOLUME_BEFORE_BUY", "2")
 	_ = os.Setenv("USE_WS_MARKET_CAP", "false")
-_ = os.Setenv("MARKET_CAP_TOLERANCE_PCT", "0")
 _ = os.Setenv("STUCK_EXIT_QUARANTINE_SECONDS", "240")
 _ = os.Setenv("MAX_HOLD_SECONDS", "420")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-if cfg.MinVolumeBeforeBuySOL != .25 || cfg.MaxVolumeBeforeBuySOL != 2 || cfg.UseWSMarketCap || cfg.MarketCapTolerancePct != 0 || cfg.StuckExitQuarantineSeconds != 240 || cfg.MaxHoldSeconds != 420 {
+	if cfg.MinVolumeBeforeBuySOL != .25 || cfg.MaxVolumeBeforeBuySOL != 2 || cfg.UseWSMarketCap || cfg.StuckExitQuarantineSeconds != 240 || cfg.MaxHoldSeconds != 420 {
 		t.Fatalf("entry env overrides were not applied: min=%.2f max=%.2f useWSMarketCap=%v", cfg.MinVolumeBeforeBuySOL, cfg.MaxVolumeBeforeBuySOL, cfg.UseWSMarketCap)
 	}
 
-_ = os.Setenv("MARKET_CAP_TOLERANCE_PCT", "101")
-if _, err = Load(); err == nil || !strings.Contains(err.Error(), "MARKET_CAP_TOLERANCE_PCT") {
-t.Fatalf("market-cap tolerance above 100%% should fail clearly, got %v", err)
+	_ = os.Setenv("TOKEN_MAX_AGE_SECONDS", "0")
+	cfg, err = Load()
+	if err != nil || cfg.TokenMaxAgeSeconds != 0 {
+		t.Fatalf("zero TOKEN_MAX_AGE_SECONDS should disable the age filter, got value=%d err=%v", cfg.TokenMaxAgeSeconds, err)
 }
-_ = os.Setenv("MARKET_CAP_TOLERANCE_PCT", "0")
+	_ = os.Setenv("TOKEN_MAX_AGE_SECONDS", "5")
+	cfg, err = Load()
+	if err != nil || cfg.TokenMaxAgeSeconds != 5 {
+		t.Fatalf("TOKEN_MAX_AGE_SECONDS should accept the exact configured age, got value=%d err=%v", cfg.TokenMaxAgeSeconds, err)
+	}
 
 	_ = os.Setenv("MAX_HOLD_SECONDS", `"120"`)
 	cfg, err = Load()

@@ -51,8 +51,6 @@ type Settings struct {
 	MaxVolumeBeforeBuySOL float64
 	MinMarketCapSOL       float64
 	MaxMarketCapSOL       float64
-MarketCapTolerancePct float64
-TokenMaxAgeTolerancePct float64
 StuckExitQuarantine   time.Duration
 TrailingStopArmPct    float64
 ExitTriggerBufferPct  float64
@@ -90,7 +88,6 @@ type Monitor struct {
 	trailingStop                    float64
 	maxHold                         time.Duration
 	maxTokenAge                     time.Duration
-tokenMaxAgeTolerancePct          float64
 trailingStopArmPct               float64
 exitTriggerBufferPct              float64
 	simulation                      bool
@@ -122,7 +119,6 @@ exitTriggerBufferPct              float64
 	maxVolumeBeforeBuySOL           float64
 	minMarketCapSOL                 float64
 	maxMarketCapSOL                 float64
-marketCapTolerancePct           float64
 stuckExitQuarantineAge          time.Duration
 	useWSMarketCap                  bool
 	pricePollInterval               time.Duration
@@ -244,17 +240,12 @@ subscriptions:
 }
 
 func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit, stopLoss float64, maxHold time.Duration, simulation bool, b *events.Bus, l *zap.Logger, options ...Settings) *Monitor {
-	if maxHold <= 0 {
-		maxHold = 5 * time.Minute
-	}
 	settings := Settings{
 		EntryDelay:            5 * time.Second,
 		MinVolumeBeforeBuySOL: 0,
 		MaxVolumeBeforeBuySOL: 1.5,
 		MinMarketCapSOL:       20,
 		MaxMarketCapSOL:       0,
-MarketCapTolerancePct: 15,
-TokenMaxAgeTolerancePct: 15,
 StuckExitQuarantine:   defaultStuckExitQuarantineAge,
 TrailingStopArmPct:    10,
 ExitTriggerBufferPct:  0.5,
@@ -273,23 +264,15 @@ ExitTriggerBufferPct:  0.5,
 		if option.MaxVolumeBeforeBuySOL > 0 {
 			settings.MaxVolumeBeforeBuySOL = option.MaxVolumeBeforeBuySOL
 		}
-		if option.MinMarketCapSOL > 0 {
-			settings.MinMarketCapSOL = option.MinMarketCapSOL
-		}
-		if option.MaxMarketCapSOL > 0 {
-			settings.MaxMarketCapSOL = option.MaxMarketCapSOL
-		}
-settings.MarketCapTolerancePct = option.MarketCapTolerancePct
-settings.TokenMaxAgeTolerancePct = option.TokenMaxAgeTolerancePct
+		settings.MinMarketCapSOL = option.MinMarketCapSOL
+		settings.MaxMarketCapSOL = option.MaxMarketCapSOL
 settings.TrailingStopArmPct = option.TrailingStopArmPct
 settings.ExitTriggerBufferPct = option.ExitTriggerBufferPct
 if option.StuckExitQuarantine > 0 {
 settings.StuckExitQuarantine = option.StuckExitQuarantine
 }
 		settings.UseWSMarketCap = option.UseWSMarketCap
-		if option.MaxTokenAge > 0 {
-			settings.MaxTokenAge = option.MaxTokenAge
-		}
+		settings.MaxTokenAge = option.MaxTokenAge
 		if option.PricePollInterval > 0 {
 			settings.PricePollInterval = option.PricePollInterval
 		}
@@ -312,7 +295,6 @@ settings.StuckExitQuarantine = option.StuckExitQuarantine
 		tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee,
 		takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15,
 		maxHold: maxHold, maxTokenAge: settings.MaxTokenAge,
-tokenMaxAgeTolerancePct: settings.TokenMaxAgeTolerancePct,
 trailingStopArmPct: settings.TrailingStopArmPct,
 exitTriggerBufferPct: settings.ExitTriggerBufferPct,
 		simulation: simulation, subscriptions: make(chan string, size),
@@ -326,7 +308,6 @@ exitTriggerBufferPct: settings.ExitTriggerBufferPct,
 		maxVolumeBeforeBuySOL: settings.MaxVolumeBeforeBuySOL,
 		minMarketCapSOL:       settings.MinMarketCapSOL,
 		maxMarketCapSOL:       settings.MaxMarketCapSOL,
-marketCapTolerancePct: settings.MarketCapTolerancePct,
 stuckExitQuarantineAge: settings.StuckExitQuarantine,
 		useWSMarketCap:        settings.UseWSMarketCap,
 		pricePollInterval:     settings.PricePollInterval,
@@ -885,17 +866,6 @@ func (m *Monitor) connect(ctx context.Context) error {
 			created = received
 		}
 
-maxMarketCapWithTolerance := m.maxMarketCapSOL * (1 + m.marketCapTolerancePct/100)
-if m.useWSMarketCap && m.maxMarketCapSOL > 0 && d.MarketCapSol > maxMarketCapWithTolerance {
-m.log.Info("token rejected instantly by websocket max market cap tolerance",
-				zap.String("mint", d.Mint),
-				zap.Float64("ws_mcap_sol", d.MarketCapSol),
-zap.Float64("configured_max", m.maxMarketCapSOL),
-zap.Float64("max_allowed", maxMarketCapWithTolerance),
-zap.Float64("tolerance_pct", m.marketCapTolerancePct))
-			continue
-		}
-
 		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
 		m.runOperation(func() {
 			if !m.rememberMint(e.Mint, received) {
@@ -1012,10 +982,9 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 
 	if m.maxTokenAge > 0 && !e.Created.IsZero() {
 		age := time.Since(e.Created)
-maxToleranceAge := time.Duration(float64(m.maxTokenAge) * (1 + m.tokenMaxAgeTolerancePct/100))
-		if age > maxToleranceAge {
-			reason := fmt.Sprintf("token age %s exceeds max tolerance %s",
-				age.Truncate(time.Second), maxToleranceAge)
+		if age > m.maxTokenAge {
+			reason := fmt.Sprintf("token age %s exceeds maximum %s",
+				age.Truncate(time.Second), m.maxTokenAge)
 			_ = m.db.RecordAssessment(e.Mint, false, reason)
 			m.bus.Publish("token_rejected", map[string]any{
 				"mint": e.Mint, "reason": reason, "latencyMs": latency,
@@ -1023,7 +992,7 @@ maxToleranceAge := time.Duration(float64(m.maxTokenAge) * (1 + m.tokenMaxAgeTole
 			m.log.Info("token rejected by age gate",
 				zap.String("mint", e.Mint),
 				zap.Duration("age", age),
-				zap.Duration("max_age", maxToleranceAge))
+				zap.Duration("max_age", m.maxTokenAge))
 			return
 		}
 	}
@@ -1036,9 +1005,14 @@ maxToleranceAge := time.Duration(float64(m.maxTokenAge) * (1 + m.tokenMaxAgeTole
 		return
 	}
 
-maxMarketCapWithTolerance := m.maxMarketCapSOL * (1 + m.marketCapTolerancePct/100)
-if m.maxMarketCapSOL > 0 && e.MarketCapSOL > maxMarketCapWithTolerance {
-reason := fmt.Sprintf("market cap %.6f SOL exceeds maximum %.6f SOL with %.2f%% tolerance", e.MarketCapSOL, m.maxMarketCapSOL, m.marketCapTolerancePct)
+	if e.MarketCapSOL < m.minMarketCapSOL {
+		reason := fmt.Sprintf("market cap %.6f SOL is below minimum %.6f SOL", e.MarketCapSOL, m.minMarketCapSOL)
+		_ = m.db.RecordAssessment(e.Mint, false, reason)
+		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
+		return
+	}
+	if m.maxMarketCapSOL > 0 && e.MarketCapSOL > m.maxMarketCapSOL {
+		reason := fmt.Sprintf("market cap %.6f SOL exceeds maximum %.6f SOL", e.MarketCapSOL, m.maxMarketCapSOL)
 		_ = m.db.RecordAssessment(e.Mint, false, reason)
 		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 		m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.String("reason", reason))

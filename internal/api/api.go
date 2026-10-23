@@ -755,6 +755,9 @@ func (s *Server) emergency(w http.ResponseWriter, r *http.Request) {
 func corsPolicy(next http.Handler) http.Handler {
 	allowed := configuredOrigins()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		origin := r.Header.Get("Origin")
 		if _, ok := allowed[origin]; ok {
 			w.Header().Set("Access-Control-Allow-Origin", origin)

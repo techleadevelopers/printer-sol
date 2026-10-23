@@ -117,8 +117,6 @@ func main() {
 			MaxVolumeBeforeBuySOL: cfg.MaxVolumeBeforeBuySOL,
 			MinMarketCapSOL:       cfg.MinMarketCapSOL,
 			MaxMarketCapSOL:       cfg.MaxMarketCapSOL,
-MarketCapTolerancePct: cfg.MarketCapTolerancePct,
-TokenMaxAgeTolerancePct: cfg.TokenMaxAgeTolerancePct,
 StuckExitQuarantine:   time.Duration(cfg.StuckExitQuarantineSeconds) * time.Second,
 TrailingStopArmPct:    cfg.TrailingStopArmPct,
 ExitTriggerBufferPct:  cfg.ExitTriggerBufferPct,

@@ -198,25 +198,8 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 		marketCapToCheck = event.MarketCapSOL
 		marketCapSource = "WebSocket"
 	}
-	if marketCapToCheck <= 0 || math.IsNaN(marketCapToCheck) || math.IsInf(marketCapToCheck, 0) {
-		m.rejectCandidate(event, fmt.Sprintf("%s market cap is missing or invalid", marketCapSource))
-		return
-	}
-	event.MarketCapSOL = marketCapToCheck
-
-maxMarketCapWithTolerance := m.maxMarketCapSOL * (1 + m.marketCapTolerancePct/100)
-minMarketCapWithTolerance := m.minMarketCapSOL * (1 - m.marketCapTolerancePct/100)
-
-if m.maxMarketCapSOL > 0 && marketCapToCheck > maxMarketCapWithTolerance {
-m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL exceeds maximum %.6f SOL with %.2f%% tolerance", marketCapSource, marketCapToCheck, m.maxMarketCapSOL, m.marketCapTolerancePct))
-		return
-	}
-
-if marketCapToCheck < minMarketCapWithTolerance {
-m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL is below minimum %.6f SOL with %.2f%% tolerance", marketCapSource, marketCapToCheck, m.minMarketCapSOL, m.marketCapTolerancePct))
-		return
-	}
-
+	// Real bonding-curve SOL reserves are checked in every mode before market
+	// cap rejection, including when PumpPortal supplies the market-cap mark.
 	if realSOLReservesSOL < m.minVolumeBeforeBuySOL {
 		m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL are below minimum %.6f SOL", realSOLReservesSOL, m.minVolumeBeforeBuySOL))
 		return
@@ -225,6 +208,21 @@ m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL is below minimum %.
 		m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL exceed maximum %.6f SOL", realSOLReservesSOL, m.maxVolumeBeforeBuySOL))
 		return
 	}
+
+if marketCapToCheck <= 0 || math.IsNaN(marketCapToCheck) || math.IsInf(marketCapToCheck, 0) {
+m.rejectCandidate(event, fmt.Sprintf("%s market cap is missing or invalid", marketCapSource))
+return
+}
+
+	if marketCapToCheck < m.minMarketCapSOL {
+		m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL is below minimum %.6f SOL", marketCapSource, marketCapToCheck, m.minMarketCapSOL))
+		return
+	}
+	if m.maxMarketCapSOL > 0 && marketCapToCheck > m.maxMarketCapSOL {
+		m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL exceeds maximum %.6f SOL", marketCapSource, marketCapToCheck, m.maxMarketCapSOL))
+		return
+	}
+	event.MarketCapSOL = marketCapToCheck
 
 	if reason := m.creatorBlacklistReason(event.Creator); reason != "" {
 		m.rejectCandidate(event, reason)

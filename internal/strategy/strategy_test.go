@@ -81,4 +81,16 @@ func TestEvaluateRejectsTokenAtFiveMinuteAgeBoundary(t *testing.T) {
 	if !ok {
 		t.Fatalf("token younger than five minutes was rejected: %q", reason)
 	}
+
+	strict := New(db, 5*time.Second)
+	ok, reason = strict.Evaluate(context.Background(), "five-second-token", time.Now().UTC().Add(-5*time.Second))
+	if ok || reason != "token creation exceeded maximum entry age" {
+		t.Fatalf("token at the configured age boundary should be rejected: %v, %q", ok, reason)
+	}
+
+	disabled := New(db, 0)
+	ok, reason = disabled.Evaluate(context.Background(), "old-token-age-filter-disabled", time.Now().UTC().Add(-10*time.Minute))
+	if !ok {
+		t.Fatalf("zero maximum age should disable the age filter, got %q", reason)
+	}
 }
