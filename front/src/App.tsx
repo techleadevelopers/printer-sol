@@ -455,7 +455,7 @@ function PositionsPage() {
      {!page.isLoading && !page.isError && <section className="panel">
        <PanelTitle title="Posições" aside={<span className="eyebrow">{page.data?.items.length ?? 0} REGISTOS</span>} />
        {page.data?.items.length ? <div className="table-wrap"><table>
-          <thead><tr><th>Token / Mint</th><th>Capital investido</th><th>Taxas pagas</th><th>Valor estimado</th><th>P&L aberto estimado</th><th>P&L realizado líquido</th><th>Última marca</th><th>Aberta</th><th>Retenção</th><th>Posição / ordem de venda</th><th>Ação</th></tr></thead>
+          <thead><tr><th>Token / Mint</th><th>Capital investido</th><th>Taxas pagas</th><th>Valor estimado</th><th>P&L aberto estimado</th><th>P&L realizado líquido</th><th>Última marca</th><th>Aberta</th><th>Retenção</th><th>Estado da posição</th><th>Estado da ordem de venda</th><th>Ação</th></tr></thead>
          <tbody>{page.data.items.map(p => {
            const markAge = p.markAgeSeconds;
            const markIsStale = markAge != null && markAge > 30;
@@ -471,7 +471,8 @@ function PositionsPage() {
              </td>
              <td className="whitespace-nowrap text-xs muted">{fmtDate(p.openedAt)}</td>
              <td className="whitespace-nowrap text-xs muted">{elapsedSince(p.openedAt)}</td>
-              <td><div className="flex items-center gap-1"><span className="eyebrow">Posição</span><StatusTag value={p.status} positive={['open', 'closed']} warning={['closing']} negative={['failed']} /></div><div className="mt-1 flex items-center gap-1"><span className="eyebrow">Venda</span><StatusTag value={p.sellStatus} positive={['confirmed']} warning={['submitted']} negative={['failed']} /></div></td>
+              <td><StatusTag value={p.status} positive={['open', 'closed']} warning={['closing']} negative={['failed']} /></td>
+              <td><StatusTag value={p.sellStatus} positive={['confirmed']} warning={['submitted']} negative={['failed']} /></td>
              <td><button className="button button-small button-danger" disabled={p.status !== 'open' || sell.isPending} onClick={() => setSellId(p.id)}>Solicitar venda</button></td>
            </tr>;
          })}</tbody>

@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -134,6 +135,13 @@ func TestFailedSimulationSellClosesPositionWithoutChargingIt(t *testing.T) {
 	}
 	if transactionState != "failed" {
 		t.Fatalf("failed simulated sell transaction state = %q; want failed", transactionState)
+	}
+	var realizedPnl sql.NullFloat64
+	if err = db.QueryRow(`SELECT realized_pnl_sol FROM trades WHERE id=?`, id).Scan(&realizedPnl); err != nil {
+		t.Fatal(err)
+	}
+	if realizedPnl.Valid {
+		t.Fatalf("failed simulated sell realized P&L = %+v; want NULL", realizedPnl)
 	}
 	stats, err := db.Performance(true)
 	if err != nil {

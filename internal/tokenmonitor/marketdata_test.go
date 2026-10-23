@@ -22,6 +22,11 @@ type fixedBondingCurveMarketCap struct {
 	err          error
 }
 
+type testHTTPStatusError int
+
+func (e testHTTPStatusError) Error() string   { return fmt.Sprintf("HTTP %d", int(e)) }
+func (e testHTTPStatusError) StatusCode() int { return int(e) }
+
 type blockingBondingCurveEntry struct {
 	called  chan struct{}
 	release chan struct{}
@@ -372,5 +377,27 @@ func TestRPCPriceSourceAlertLogsAfterThreeConsecutiveFailures(t *testing.T) {
 	monitor.recordPriceSourceResult(nil)
 	if monitor.priceSourceFailures != 0 || monitor.priceSourceAlerted {
 		t.Fatalf("recovery did not reset alert state: (%d, %v)", monitor.priceSourceFailures, monitor.priceSourceAlerted)
+	}
+}
+
+func TestOnlyHTTP429ActivatesPriceBackoff(t *testing.T) {
+	cases := []struct {
+		name        string
+		err         error
+		wantBackoff bool
+	}{
+		{name: "HTTP 429", err: testHTTPStatusError(429), wantBackoff: true},
+		{name: "HTTP 500", err: testHTTPStatusError(500)},
+		{name: "429 in ordinary error text", err: errors.New("HTTP 429: too many requests")},
+		{name: "ordinary timeout", err: errors.New("request timed out")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			monitor := &Monitor{}
+			monitor.recordPriceSourceResult(tc.err)
+			if got := monitor.rpcRateLimitActive(time.Now().UTC()); got != tc.wantBackoff {
+				t.Fatalf("rate-limit backoff active = %v; want %v", got, tc.wantBackoff)
+			}
+		})
 	}
 }

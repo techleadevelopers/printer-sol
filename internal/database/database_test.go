@@ -475,8 +475,8 @@ func TestSimulationFinalizationUpdatesAvailableBankroll(t *testing.T) {
 	if err = db.QueryRow(`SELECT realized_pnl_sol FROM trades WHERE id='sim-sell'`).Scan(&pendingPnl); err != nil {
 		t.Fatal(err)
 	}
-	if !pendingPnl.Valid || pendingPnl.Float64 != 0 {
-		t.Fatalf("prepared simulated sell P&L = %+v; want non-NULL 0", pendingPnl)
+	if pendingPnl.Valid {
+		t.Fatalf("prepared simulated sell P&L = %+v; want NULL until finalization", pendingPnl)
 	}
 	if _, err = db.Exec(`UPDATE trades SET exit_reason='' WHERE id='sim-sell'`); err != nil {
 		t.Fatal(err)
