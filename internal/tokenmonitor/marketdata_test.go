@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -276,13 +277,18 @@ func TestCandidateGateUsesStrictConfiguredMarketCapBounds(t *testing.T) {
 		marketCapSOL float64
 		wantQueued   bool
 	}{
+		{name: "at configured minimum", marketCapSOL: 20, wantQueued: true},
+		{name: "below configured minimum", marketCapSOL: 19.999999, wantQueued: false},
 		{name: "at configured maximum", marketCapSOL: 150, wantQueued: true},
 		{name: "above configured maximum", marketCapSOL: 150.000001, wantQueued: false},
+		{name: "not a number", marketCapSOL: math.NaN(), wantQueued: false},
+		{name: "positive infinity", marketCapSOL: math.Inf(1), wantQueued: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			monitor, closeDB := newMarketDataTestMonitor(t)
 			defer closeDB()
 			monitor.useWSMarketCap = true
+			monitor.minMarketCapSOL = 20
 			monitor.maxMarketCapSOL = 150
 			event := testCandidate("market-cap-" + test.name)
 			event.MarketCapSOL = test.marketCapSOL

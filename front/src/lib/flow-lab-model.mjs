@@ -3,8 +3,14 @@ const finite = (...values) => values.every(Number.isFinite);
 
 export function evaluateEntryFlow(input) {
   const elapsedAge = input.ageAtDetection + input.entryDelay + input.networkDelayMs / 1000;
+  // Runtime applies the fixed legacy RPC read timeout inside the overall
+  // snipe context, so the effective deadline is whichever expires first.
+  const effectiveLegacyEntryTimeoutMs = Math.min(
+    input.legacyEntryRpcTimeoutMs,
+    input.liveSnipeTimeoutMs,
+  );
   const rpcResponsiveForEntry = input.rpcAvailable
-    && input.rpcLatencyMs <= input.legacyEntryRpcTimeoutMs;
+    && input.rpcLatencyMs <= effectiveLegacyEntryTimeoutMs;
   const rpcResponsiveForLive = input.rpcAvailable
     && input.rpcLatencyMs <= input.liveSnipeTimeoutMs;
   const marketCapSource = input.websocketMarketCap ? 'WebSocket' : 'RPC';
@@ -85,7 +91,7 @@ export function evaluateEntryFlow(input) {
       'Market cap de entrada',
       (!input.websocketMarketCap && !rpcResponsiveForEntry) || !marketCapPass ? 'fail' : 'pass',
       !input.websocketMarketCap && !rpcResponsiveForEntry
-        ? `RPC indisponível ou acima do timeout legado (${input.legacyEntryRpcTimeoutMs} ms).`
+        ? `RPC indisponível ou acima do timeout efetivo legado (${effectiveLegacyEntryTimeoutMs} ms).`
         : `${Number.isFinite(effectiveMarketCap) ? effectiveMarketCap.toFixed(2) : 'inválido'} SOL via ${marketCapSource}`
           + ` · mínimo ${input.minMarketCap} SOL`
           + (input.maxMarketCap > 0 ? ` · máximo ${input.maxMarketCap} SOL` : ' · teto desativado'),
@@ -104,7 +110,7 @@ export function evaluateEntryFlow(input) {
       : !reserveValueAvailable
         ? input.websocketMarketCap
           ? 'RPC atrasado/indisponível: reserva não confirmada; não bloqueia a admissão WebSocket.'
-          : `RPC indisponível ou acima do timeout legado (${input.legacyEntryRpcTimeoutMs} ms); gate RPC bloqueia a admissão.`
+          : `RPC indisponível ou acima do timeout efetivo legado (${effectiveLegacyEntryTimeoutMs} ms); gate RPC bloqueia a admissão.`
         : reservesPass
           ? `${input.realSolReserves.toFixed(3)} SOL dentro da faixa inclusiva ${input.minReserves.toFixed(3)}–${input.maxReserves.toFixed(3)} SOL.`
           : `${input.realSolReserves.toFixed(3)} SOL fora da faixa ${input.minReserves.toFixed(3)}–${input.maxReserves.toFixed(3)} SOL.`

@@ -999,7 +999,7 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 
 	if m.maxTokenAge > 0 && !e.Created.IsZero() {
 		age := time.Since(e.Created)
-		if age > m.maxTokenAge {
+		if age >= m.maxTokenAge {
 			reason := fmt.Sprintf("token age %s exceeds maximum %s",
 				age.Truncate(time.Second), m.maxTokenAge)
 			_ = m.db.RecordAssessment(e.Mint, false, reason)

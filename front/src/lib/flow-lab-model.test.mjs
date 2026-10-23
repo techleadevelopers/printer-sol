@@ -95,6 +95,22 @@ test('legacy admission fails closed when its RPC snapshot is unavailable', () =>
   assert.equal(result.reserveCheck.blocksCandidate, true);
 });
 
+test('legacy RPC admission uses the earlier of the RPC and overall snipe timeouts', () => {
+  const result = evaluateEntryFlow({
+    ...defaults,
+    websocketMarketCap: false,
+    rpcLatencyMs: 1500,
+    legacyEntryRpcTimeoutMs: 2000,
+    liveSnipeTimeoutMs: 1000,
+  });
+
+  assert.equal(result.candidateAllowed, false);
+  assert.match(
+    result.admissionChecks.find(item => item.label === 'Market cap de entrada').detail,
+    /timeout efetivo legado \(1000 ms\)/,
+  );
+});
+
 test('stale quote, excess slippage, and high impact affect execution only', () => {
   for (const patch of [
     { quoteAgeMs: 2200 },
