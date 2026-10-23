@@ -8,7 +8,7 @@ import { publishableKeyFromHost } from '@clerk/react/internal';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
 import {
   Activity, ArrowRight, BarChart3, Bell, Check, CirclePause, CirclePlay, Copy, ExternalLink,
-  FileText, Layers3, LayoutDashboard, ListFilter, LockKeyhole, LogOut, Menu,
+  FileText, FlaskConical, Layers3, LayoutDashboard, ListFilter, LockKeyhole, LogOut, Menu,
   Radio, RefreshCw, Search, Server, Settings2, ShieldCheck, WalletCards, X,
 } from 'lucide-react';
 import {
@@ -42,6 +42,7 @@ import { customFetch } from '@/api-client/custom-fetch';
 import { formatSol, formatUsdFromSol, fetchSolPrice } from '@/lib/sol-format'; // NOVO IMPORT
 import NotFound from '@/pages/not-found';
 import PerformanceReportPage from '@/pages/performance-report';
+import FlowLabPage from '@/pages/flow-lab';
 import './index.css';
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 5000, refetchOnWindowFocus: true } } });
@@ -72,8 +73,9 @@ const navItems = [
   { href: '/user-portal/strategy', label: 'Estratégia', icon: Settings2 },
   { href: '/user-portal/wallet', label: 'Carteira', icon: WalletCards },
   { href: '/user-portal/logs', label: 'Registos', icon: FileText },
+  { href: '/user-portal/lab', label: 'Laboratório de fluxo', icon: FlaskConical },
 ];
-const navShort = navItems.slice(0, 5);
+const navShort = [...navItems.slice(0, 4), navItems[navItems.length - 1]];
 const locale = 'pt-BR';
 const fmt = (value: number | null | undefined, digits = 3) => value == null || !Number.isFinite(value) ? 'Indisponível' : value.toLocaleString(locale, { maximumFractionDigits: digits, minimumFractionDigits: 0 });
 const fmtSol = formatSol;
@@ -83,6 +85,7 @@ const titleMap: Record<string, string> = {
   '/user-portal': 'Visão geral', '/user-portal/reports': 'Relatório de desempenho', '/user-portal/tokens': 'Tokens detetados', '/user-portal/positions': 'Posições',
   '/user-portal/trades': 'Histórico de operações', '/user-portal/rpcs': 'Infraestrutura RPC',
   '/user-portal/strategy': 'Configuração da estratégia', '/user-portal/wallet': 'Carteira', '/user-portal/logs': 'Registos do sistema',
+  '/user-portal/lab': 'Laboratório de fluxo',
 };
 
 function StatusTag({ value, positive = [], negative = [], warning = [] }: { value?: string | null; positive?: string[]; negative?: string[]; warning?: string[] }) {
@@ -641,6 +644,7 @@ function ClerkRoutes() {
         <Route path="/user-portal/strategy"><PortalRoute><AppShell><StrategyPage /></AppShell></PortalRoute></Route>
         <Route path="/user-portal/wallet"><PortalRoute><AppShell><WalletPage /></AppShell></PortalRoute></Route>
         <Route path="/user-portal/logs"><PortalRoute><AppShell><LogsPage /></AppShell></PortalRoute></Route>
+        <Route path="/user-portal/lab"><PortalRoute><AppShell><FlowLabPage /></AppShell></PortalRoute></Route>
         <Route component={NotFound} />
       </Switch>
       <ToastHost />
@@ -693,6 +697,7 @@ function MasterRoutes() {
           <Route path="/user-portal/strategy"><MasterPortalRoute><AppShell><StrategyPage /></AppShell></MasterPortalRoute></Route>
           <Route path="/user-portal/wallet"><MasterPortalRoute><AppShell><WalletPage /></AppShell></MasterPortalRoute></Route>
           <Route path="/user-portal/logs"><MasterPortalRoute><AppShell><LogsPage /></AppShell></MasterPortalRoute></Route>
+          <Route path="/user-portal/lab"><MasterPortalRoute><AppShell><FlowLabPage /></AppShell></MasterPortalRoute></Route>
           <Route component={NotFound} />
         </Switch>
         <ToastHost />
