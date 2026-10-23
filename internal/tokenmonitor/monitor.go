@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
@@ -30,8 +31,6 @@ type Event struct {
 	queuedAt     time.Time
 }
 
-// Entrier is implemented by the execution engine. Keeping the dependency as
-// an interface lets discovery remain independent from transaction signing.
 type Entrier interface {
 	BuyNewTokenUSD(context.Context, string, float64, float64, float64, string, string) (string, error)
 	ClosePaperPosition(context.Context, string, float64, string) (string, error)
@@ -50,6 +49,8 @@ type Settings struct {
 	EntryDelay            time.Duration
 	MinVolumeBeforeBuySOL float64
 	MinMarketCapSOL       float64
+	MaxMarketCapSOL       float64
+	MaxTokenAge           time.Duration
 	PricePollInterval     time.Duration
 	SnipeConcurrency      int
 	SnipeTimeout          time.Duration
@@ -75,6 +76,7 @@ type Monitor struct {
 	takeProfit, stopLoss            float64
 	trailingStop                    float64
 	maxHold                         time.Duration
+	maxTokenAge                     time.Duration
 	simulation                      bool
 	subscriptions                   chan string
 	tracked                         sync.Map
@@ -99,6 +101,7 @@ type Monitor struct {
 	entryDelay                      time.Duration
 	minVolumeBeforeBuySOL           float64
 	minMarketCapSOL                 float64
+	maxMarketCapSOL                 float64
 	pricePollInterval               time.Duration
 	snipeConcurrency                int
 	snipeTimeout                    time.Duration
@@ -133,9 +136,6 @@ func (m *Monitor) runOperationAt(generation uint64, fn func()) bool {
 	return true
 }
 
-// WithReset blocks event processing while the database and in-memory paper
-// state are reset, then forces the feed connection to reconnect without old
-// tracked-position subscriptions.
 func (m *Monitor) WithReset(reset func() error) error {
 	if !m.resetting.CompareAndSwap(false, true) {
 		return errors.New("monitor reset already in progress")
@@ -167,7 +167,6 @@ func (m *Monitor) closeConnection() {
 	}
 }
 
-// ResetInMemoryState is called only while WithReset holds the operation lock.
 func (m *Monitor) ResetInMemoryState() {
 	m.tracked.Range(func(key, _ any) bool {
 		m.tracked.Delete(key)
@@ -219,14 +218,15 @@ subscriptions:
 }
 
 func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry Entrier, tradeUSD, slippage, priorityFee, takeProfit, stopLoss float64, maxHold time.Duration, simulation bool, b *events.Bus, l *zap.Logger, options ...Settings) *Monitor {
-	const maximumPositionHold = 5 * time.Minute
-	if maxHold <= 0 || maxHold > maximumPositionHold {
-		maxHold = maximumPositionHold
+	if maxHold <= 0 {
+		maxHold = 5 * time.Minute
 	}
 	settings := Settings{
 		EntryDelay:            5 * time.Second,
 		MinVolumeBeforeBuySOL: .02,
 		MinMarketCapSOL:       20,
+		MaxMarketCapSOL:       0,
+		MaxTokenAge:           0,
 		PricePollInterval:     20 * time.Second,
 		SnipeConcurrency:      4,
 		SnipeTimeout:          15 * time.Second,
@@ -242,6 +242,12 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		}
 		if option.MinMarketCapSOL > 0 {
 			settings.MinMarketCapSOL = option.MinMarketCapSOL
+		}
+		if option.MaxMarketCapSOL > 0 {
+			settings.MaxMarketCapSOL = option.MaxMarketCapSOL
+		}
+		if option.MaxTokenAge > 0 {
+			settings.MaxTokenAge = option.MaxTokenAge
 		}
 		if option.PricePollInterval > 0 {
 			settings.PricePollInterval = option.PricePollInterval
@@ -264,13 +270,15 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry,
 		tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee,
 		takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15,
-		maxHold: maxHold, simulation: simulation, subscriptions: make(chan string, size),
+		maxHold: maxHold, maxTokenAge: settings.MaxTokenAge,
+		simulation: simulation, subscriptions: make(chan string, size),
 		candidates:      make(map[string]*candidate),
 		snipePending:    make(map[string]time.Time),
 		validationSlots: make(chan struct{}, settings.SnipeConcurrency),
 		entryDelay:      settings.EntryDelay,
 		minVolumeBeforeBuySOL: settings.MinVolumeBeforeBuySOL,
 		minMarketCapSOL:       settings.MinMarketCapSOL,
+		maxMarketCapSOL:       settings.MaxMarketCapSOL,
 		pricePollInterval:     settings.PricePollInterval,
 		snipeConcurrency:      settings.SnipeConcurrency,
 		snipeTimeout:          settings.SnipeTimeout, dedupeTTL: settings.DedupeTTL,
@@ -290,8 +298,6 @@ func (m *Monitor) MaxHoldSeconds() int {
 	return int(m.maxHold / time.Second)
 }
 func (m *Monitor) Run(ctx context.Context) {
-	// The selected database is mode-isolated, so restoring its open positions
-	// keeps live and paper marks separate while resuming exits after a restart.
 	m.restoreOpenPositions()
 	go m.consume(ctx)
 	go m.runMaxHoldChecker(ctx)
@@ -365,7 +371,7 @@ func (m *Monitor) snipeEventExpired(event Event, now time.Time) bool {
 
 func (m *Monitor) runMaxHoldChecker(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
-	reconcileTicker := time.NewTicker(5 * time.Second)
+	reconcileTicker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	defer reconcileTicker.Stop()
 	if ctx.Err() != nil {
@@ -482,12 +488,6 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 					zap.Int("attempts", reconciled))
 			}
 
-			// Break-glass: if the position is still open and the last sell
-			// attempt is terminally failed/unknown beyond the quarantine
-			// window, close the paper position and mark the stuck sell as
-			// failed with reconciliation_needed=false. This releases
-			// MaxOpenPositions even if the monitor never observes a fresh
-			// stop-loss signal on this mint again.
 			stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-stuckExitQuarantineAge))
 			if stuckErr != nil {
 				m.log.Warn("check stuck exit mint", zap.String("mint", mint), zap.Error(stuckErr))
@@ -540,12 +540,6 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 					zap.Int("attempts", reconciled))
 			}
 
-			// Same break-glass contract as paper: if the position is still
-			// open and the last sell attempt is terminally failed/unknown
-			// beyond the quarantine window, close the live position and mark
-			// the stuck sell as failed with reconciliation_needed=false. This
-			// releases MaxOpenPositions even if the monitor never observes a
-			// fresh stop-loss signal on this mint again.
 			stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-stuckExitQuarantineAge))
 			if stuckErr != nil {
 				m.log.Warn("check stuck live exit mint", zap.String("mint", mint), zap.Error(stuckErr))
@@ -623,10 +617,6 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 		case hasExitIntent:
 			reason = exitIntent.(string)
 		case failedExitAttempts > 0:
-			// The position is still open and the last sell failed. Force a
-			// definitive exit decision rather than waiting for the mark to
-			// drift back into the stop-loss band; otherwise MaxOpenPositions
-			// pins the monitor with orphaned positions.
 			reason = "reconcile pending exit"
 		case known:
 			reason = m.positionExitReason(mint, returnPct, openedAt, now)
@@ -738,7 +728,6 @@ func (m *Monitor) connect(ctx context.Context) error {
 					m.bus.Publish("operational_error", map[string]any{
 						"component": "token_monitor", "mint": mint, "message": "price subscription failed; reconnecting",
 					})
-					// Reconnect in both modes so tracked positions are subscribed again.
 					_ = c.Close()
 					return
 				}
@@ -841,19 +830,18 @@ func (m *Monitor) connect(ctx context.Context) error {
 		}
 		received := time.Now().UTC()
 		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
-		// The PumpPortal new-token feed does not include an on-chain
-		// creation timestamp (createdTimestamp/timestamp/blockTime are
-		// absent from the payload). Without a fallback the live mode would
-		// reject every newly discovered token because Created would be zero
-		// and Strategy.EvaluateFast rejects tokens with a missing creation
-		// time. Using the websocket receipt time keeps the age window honest:
-		// we are subscribed to the create/trade stream in real time, so the
-		// observed creation is effectively the on-chain creation moment
-		// (latency is milliseconds). This fallback is identical for paper and
-		// live so both modes age tokens the same way.
 		if created.IsZero() {
 			created = received
 		}
+
+		if m.maxMarketCapSOL > 0 && d.MarketCapSol > (m.maxMarketCapSOL*1.15) {
+			m.log.Info("token rejected instantly by websocket max market cap tolerance",
+				zap.String("mint", d.Mint),
+				zap.Float64("ws_mcap_sol", d.MarketCapSol),
+				zap.Float64("max_allowed", m.maxMarketCapSOL*1.15))
+			continue
+		}
+
 		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
 		m.runOperation(func() {
 			if !m.rememberMint(e.Mint, received) {
@@ -967,6 +955,25 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 		return
 	}
+
+	if m.maxTokenAge > 0 && !e.Created.IsZero() {
+		age := time.Since(e.Created)
+		maxToleranceAge := time.Duration(float64(m.maxTokenAge) * 1.15)
+		if age > maxToleranceAge {
+			reason := fmt.Sprintf("token age %s exceeds max tolerance %s",
+				age.Truncate(time.Second), maxToleranceAge)
+			_ = m.db.RecordAssessment(e.Mint, false, reason)
+			m.bus.Publish("token_rejected", map[string]any{
+				"mint": e.Mint, "reason": reason, "latencyMs": latency,
+			})
+			m.log.Info("token rejected by age gate",
+				zap.String("mint", e.Mint),
+				zap.Duration("age", age),
+				zap.Duration("max_age", maxToleranceAge))
+			return
+		}
+	}
+
 	ok, reason := m.strategy.EvaluateFast(e.Mint, e.Created)
 	m.log.Info("token evaluated", zap.String("mint", e.Mint), zap.Bool("eligible", ok), zap.String("reason", reason), zap.Int64("latency_ms", latency))
 	if !ok || m.entry == nil {
@@ -974,6 +981,15 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 		return
 	}
+
+	if m.maxMarketCapSOL > 0 && e.MarketCapSOL > (m.maxMarketCapSOL*1.15) {
+		reason := "market cap exceeds max tolerance configured"
+		_ = m.db.RecordAssessment(e.Mint, false, reason)
+		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
+		m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.String("reason", reason))
+		return
+	}
+
 	id, entryErr := m.entry.BuyNewTokenUSD(ctx, e.Mint, m.tradeUSD, m.slippage, m.priorityFee, "pump", reason)
 	if entryErr != nil {
 		_ = m.db.RecordAssessment(e.Mint, false, entryErr.Error())
@@ -1001,7 +1017,7 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 	m.bus.Publish("token_approved", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 	m.bus.Publish("entry_submitted", map[string]any{"mint": e.Mint, "tradeId": id, "simulation": m.simulation})
 	if m.strategy.HasScreen() {
-		m.screenAfterEntry(ctx, e.Mint)
+		m.screenAfterEntry(context.Background(), e.Mint)
 	}
 }
 
@@ -1093,6 +1109,12 @@ func (m *Monitor) markTradeLocked(ctx context.Context, mint string, marketCapSOL
 			zap.Bool("simulation", m.simulation))
 		return
 	}
+
+	// CORREÇÃO: limita o returnPct a 1000% para evitar P&L absurdo
+	if returnPct > 1000 {
+		returnPct = 1000
+	}
+
 	m.log.Info("mark update",
 		zap.String("mint", mint),
 		zap.Float64("mcap_sol", marketCapSOL),
@@ -1190,11 +1212,6 @@ func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, re
 	if active {
 		return
 	}
-	// Position-state guard: if the last sell attempt already terminated as
-	// failed/unknown while the position is still open, the monitor must NOT
-	// retry automatically. The state is inconsistent and only explicit
-	// reconciliation may close it. This prevents the "10 open positions,
-	// stopped sell reached, retry loop" deadlock in both modes.
 	lastSellState, _, stateErr := m.db.LastSellState(mint)
 	if stateErr != nil {
 		m.log.Warn("read last sell state", zap.String("mint", mint), zap.Error(stateErr))
@@ -1355,16 +1372,10 @@ func (m *Monitor) blockAutomaticExitRetries(mint, reason string, failedAttempts 
 	})
 }
 
-// blockAutomaticSimulationExitRetries is kept for backward compatibility with
-// callers that expect the paper-specific name. It delegates to the shared
-// implementation, which preserves the paper behaviour exactly.
 func (m *Monitor) blockAutomaticSimulationExitRetries(mint, reason string, failedAttempts int) {
 	m.blockAutomaticExitRetries(mint, reason, failedAttempts)
 }
 
-// timestampFromEvent accepts timestamp variants emitted by PumpPortal. Live
-// entries reject missing timestamps; simulation may use receipt time because
-// its feed is observation-only.
 func timestampFromEvent(values ...json.RawMessage) time.Time {
 	for _, raw := range values {
 		if len(raw) == 0 || string(raw) == "null" {

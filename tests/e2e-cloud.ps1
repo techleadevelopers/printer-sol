@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [string]$BaseUrl = 'https://quantum-sniper-sol-production.up.railway.app',
+  [string]$BaseUrl = 'http://54.196.187.210:8080',
   [string]$AdminPassword = $env:ADMIN_PASSWORD,
   [int]$TimeoutSeconds = 20
 )

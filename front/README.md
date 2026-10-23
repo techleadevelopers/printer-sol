@@ -6,7 +6,7 @@ Portuguese-language operations UI for the independently hosted Go API. This arti
 
 Install dependencies with `npm install`, then start the dashboard with `npm run dev`. Run `npm run typecheck` to validate the frontend types.
 
-`VITE_API_BASE_URL` is the Go API origin without the `/api` suffix. When unset, the frontend uses the production Railway API at `https://quantum-sniper-sol-production.up.railway.app`. Set it explicitly when connecting this frontend to another Go API. Vercel currently rewrites unmatched paths to `index.html`; it does not proxy same-origin `/api` requests. Set `VITE_WS_URL` only when the event service is not reachable at the API host's `/ws/events`.
+`VITE_API_BASE_URL` is the Go API origin without the `/api` suffix. When unset, the frontend uses the production Railway API at `http://54.196.187.210:8080`. Set it explicitly when connecting this frontend to another Go API. Vercel currently rewrites unmatched paths to `index.html`; it does not proxy same-origin `/api` requests. Set `VITE_WS_URL` only when the event service is not reachable at the API host's `/ws/events`.
 
 ## Authentication and runtime
 

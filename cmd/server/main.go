@@ -25,10 +25,6 @@ import (
 	"solana-sniper-backend/internal/wallet"
 )
 
-// rpcSellConfirmer adapts rpcmanager.Manager to database.SellConfirmer.
-// database intentionally does not import rpcmanager (cycle: rpcmanager
-// imports database for RecordRPC), so the live-only close paths on DB
-// receive this verifier via SetSellConfirmer at startup.
 type rpcSellConfirmer struct {
 	rpcs *rpcmanager.Manager
 }
@@ -40,13 +36,12 @@ func (c rpcSellConfirmer) ConfirmSellState(ctx context.Context, signature string
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		// Invalid deployment variables must not produce a Go stack trace or
-		// trigger a noisy crash loop with no actionable configuration message.
 		_, _ = os.Stderr.WriteString("configuration error: " + err.Error() + "\n")
 		os.Exit(1)
 	}
 	log, closeLog := logging.New()
 	defer closeLog()
+
 	var paperDB *database.DB
 	if !cfg.Simulation && cfg.LiveUnlockRequiresPaper {
 		paperDB, err = database.Open(cfg.SimulationDatabaseURL)
@@ -92,19 +87,25 @@ func main() {
 	}
 	bus := events.New()
 	rpcs := rpcmanager.New(cfg.RPCEndpoints, log, db, bus)
-	// 4.2: wire the live on-chain verifier before any live close path can run.
-	// Paper paths (QuarantineStuckSimulationMint, ReconcileStaleSimulationSells,
-	// MarkSimulationSellFailed) ignore this verifier entirely.
 	db.SetSellConfirmer(rpcSellConfirmer{rpcs: rpcs})
 	portal := pumpportal.New(cfg.PumpPortalURL)
 	controller := bot.New(bus)
-	// The worker is autonomous. Console credentials do not control its startup.
 	controller.Start()
-	limits := execution.Limits{MaxTradeSOL: cfg.MaxTradeSOL, MaxExposureSOL: cfg.MaxExposureSOL, MaxDailyLossSOL: cfg.MaxDailyLossSOL, MaxSlippagePct: cfg.MaxSlippagePct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL, SimulationBaseFeeSOL: cfg.SimulationBaseFeeSOL, MaxOpenPositions: cfg.MaxOpenPositions, MaxWaitSeconds: cfg.MaxConfirmationWaitSeconds, MaxAttempts: cfg.MaxSubmissionAttempts, SkipPreflight: cfg.SkipPreflight}
+
+	limits := execution.Limits{
+		MaxTradeSOL: cfg.MaxTradeSOL, MaxExposureSOL: cfg.MaxExposureSOL, MaxDailyLossSOL: cfg.MaxDailyLossSOL,
+		MaxSlippagePct: cfg.MaxSlippagePct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL,
+		SimulationBaseFeeSOL: cfg.SimulationBaseFeeSOL, MaxOpenPositions: cfg.MaxOpenPositions,
+		MaxWaitSeconds: cfg.MaxConfirmationWaitSeconds, MaxAttempts: cfg.MaxSubmissionAttempts,
+		SkipPreflight: cfg.SkipPreflight,
+	}
 	prices := pricefeed.New(cfg.SOLUSDPriceURL)
 	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, simulationBalanceSOL, controller, bus, limits)
 	strat := strategy.New(db, time.Duration(cfg.TokenMaxAgeSeconds)*time.Second)
-	strat.SetScreen(screener.RugCheck)
+	if cfg.EnableRugCheck {
+		strat.SetScreen(screener.RugCheck)
+	}
+
 	monitor := tokenmonitor.New(
 		cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine,
 		cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL,
@@ -114,6 +115,8 @@ func main() {
 			EntryDelay:            time.Duration(cfg.EntryDelaySeconds) * time.Second,
 			MinVolumeBeforeBuySOL: cfg.MinVolumeBeforeBuySOL,
 			MinMarketCapSOL:       cfg.MinMarketCapSOL,
+			MaxMarketCapSOL:       cfg.MaxMarketCapSOL,
+			MaxTokenAge:           time.Duration(cfg.TokenMaxAgeSeconds) * time.Second,
 			PricePollInterval:     time.Duration(cfg.PricePollSeconds) * time.Second,
 			SnipeConcurrency:      cfg.SnipeConcurrency,
 			SnipeTimeout:          time.Duration(cfg.SnipeTimeoutMS) * time.Millisecond,
@@ -131,9 +134,6 @@ func main() {
 	if err := engine.Reconcile(ctx); err != nil {
 		log.Warn("startup reconciliation", logging.Err(err))
 	}
-	// 4.1: recheck persisted 'unknown' trades on boot so live purchases are
-	// not blocked until the monitor's first 5s reconcile tick. ReconcileUnknown
-	// is a no-op in simulation and never submits a new transaction.
 	if err := engine.ReconcileUnknown(ctx); err != nil {
 		log.Warn("startup unknown-trade reconciliation", logging.Err(err))
 	}

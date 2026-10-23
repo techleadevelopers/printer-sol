@@ -13,18 +13,33 @@ import (
 
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
-	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, SkipPreflight                                                                                                                                   bool
+	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, SkipPreflight, EnableRugCheck                                                                                                                  bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
 	SnipeConcurrency, SnipeTimeoutMS, DedupeTTLMS                                                                                                                                                           int
-EntryDelaySeconds, PricePollSeconds                                                                                                                                                                      int
-	MinVolumeBeforeBuySOL, MinMarketCapSOL                                                                                                                                                                   float64
+	EntryDelaySeconds, PricePollSeconds                                                                                                                                                                      int
+	MinVolumeBeforeBuySOL, MinMarketCapSOL, MaxMarketCapSOL                                                                                                                                                  float64
 	RPCEndpoints                                                                                                                                                                                            []string
 }
 
 func Load() (Config, error) {
-	c := Config{HTTPAddr: env("HTTP_ADDR", ":8080"), DatabaseURL: strings.TrimSpace(os.Getenv("DATABASE_URL")), DatabasePath: env("DATABASE_PATH", "./data/sniper.db"), SimulationDatabaseURL: strings.TrimSpace(os.Getenv("SIMULATION_DATABASE_URL")), RealDatabaseURL: strings.TrimSpace(os.Getenv("REAL_DATABASE_URL")), PrivateKey: os.Getenv("BOT_PRIVATE_KEY"), KeyProviderRef: os.Getenv("KEY_PROVIDER_REF"), WalletPublicAddress: os.Getenv("WALLET_PUBLIC_ADDRESS"), PumpPortalKey: os.Getenv("PUMPPORTAL_API_KEY"), AdminPassword: os.Getenv("ADMIN_PASSWORD"), PumpPortalURL: env("PUMPPORTAL_URL", "https://pumpportal.fun/api/trade-local"), PumpPortalWS: env("PUMPPORTAL_WS", "wss://pumpportal.fun/api/data"), SOLUSDPriceURL: env("SOL_USD_PRICE_URL", "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"), RPCEndpoints: splitEndpoints(env("RPC_ENDPOINTS", "https://api.mainnet.solana.com,https://solana-rpc.publicnode.com"))}
+	c := Config{
+		HTTPAddr:              env("HTTP_ADDR", ":8080"),
+		DatabaseURL:           strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		DatabasePath:          env("DATABASE_PATH", "./data/sniper.db"),
+		SimulationDatabaseURL: strings.TrimSpace(os.Getenv("SIMULATION_DATABASE_URL")),
+		RealDatabaseURL:       strings.TrimSpace(os.Getenv("REAL_DATABASE_URL")),
+		PrivateKey:            os.Getenv("BOT_PRIVATE_KEY"),
+		KeyProviderRef:        os.Getenv("KEY_PROVIDER_REF"),
+		WalletPublicAddress:   os.Getenv("WALLET_PUBLIC_ADDRESS"),
+		PumpPortalKey:         os.Getenv("PUMPPORTAL_API_KEY"),
+		AdminPassword:         os.Getenv("ADMIN_PASSWORD"),
+		PumpPortalURL:         env("PUMPPORTAL_URL", "https://pumpportal.fun/api/trade-local"),
+		PumpPortalWS:          env("PUMPPORTAL_WS", "wss://pumpportal.fun/api/data"),
+		SOLUSDPriceURL:        env("SOL_USD_PRICE_URL", "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"),
+		RPCEndpoints:          splitEndpoints(env("RPC_ENDPOINTS", "https://api.mainnet.solana.com,https://solana-rpc.publicnode.com")),
+	}
 	var err error
 	if c.Simulation, err = boolEnv("SIMULATION", true); err != nil {
 		return c, err
@@ -36,6 +51,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.SkipPreflight, err = boolEnv("SKIP_PREFLIGHT", true); err != nil {
+		return c, err
+	}
+	if c.EnableRugCheck, err = boolEnv("ENABLE_RUGCHECK", true); err != nil {
 		return c, err
 	}
 	if c.SimulationDatabaseURL != "" || c.RealDatabaseURL != "" {
@@ -53,9 +71,6 @@ func Load() (Config, error) {
 	} else if c.DatabaseURL != "" {
 		return c, fmt.Errorf("DATABASE_URL cannot be shared between simulation and real modes; configure SIMULATION_DATABASE_URL and REAL_DATABASE_URL")
 	} else if !c.Simulation {
-		// A local SQLite fallback is convenient for paper trading, but it must
-		// never become the live ledger: it could contain simulated positions,
-		// P&L, and trade history from a previous run.
 		return c, fmt.Errorf("live trading requires separate SIMULATION_DATABASE_URL and REAL_DATABASE_URL; DATABASE_PATH is simulation-only")
 	}
 	if c.MaxTradeSOL, err = floatEnv("MAX_TRADE_SOL", .035); err != nil {
@@ -100,6 +115,9 @@ func Load() (Config, error) {
 	if c.MinMarketCapSOL, err = floatEnv("MIN_MARKET_CAP_SOL", 20); err != nil {
 		return c, err
 	}
+	if c.MaxMarketCapSOL, err = floatEnv("MAX_MARKET_CAP_SOL", 0); err != nil {
+		return c, err
+	}
 	if c.PricePollSeconds, err = intEnv("PRICE_POLL_SECONDS", 20); err != nil {
 		return c, err
 	}
@@ -114,8 +132,6 @@ func Load() (Config, error) {
 	}
 	tradeUSDDefault := 3.0
 	if !c.Simulation {
-		// Live notional must be an explicit operator decision. Do not silently
-		// carry the paper-trading default into a real wallet.
 		tradeUSDDefault = 0
 	}
 	if c.TradeUSD, err = floatEnv("TRADE_USD", tradeUSDDefault); err != nil {
@@ -169,12 +185,13 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("RPC_ENDPOINTS: %w", err)
 		}
 	}
-if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.PricePollSeconds < 1 {
-return c, fmt.Errorf("queue, position, and timing values must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
+	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.PricePollSeconds < 1 {
+		return c, fmt.Errorf("queue, position, and timing values must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
 	}
-if c.MinVolumeBeforeBuySOL <= 0 || c.MinMarketCapSOL <= 0 {
-return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY and MIN_MARKET_CAP_SOL must be greater than zero")
-}
+	// ALTERADO: aceita 0 no MinVolumeBeforeBuySOL e MinMarketCapSOL (antes era <= 0)
+	if c.MinVolumeBeforeBuySOL < 0 || c.MinMarketCapSOL < 0 {
+		return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY and MIN_MARKET_CAP_SOL must be non-negative")
+	}
 	if c.SnipeConcurrency < 1 || c.SnipeConcurrency > 10 || c.SnipeTimeoutMS < 1 || c.SnipeTimeoutMS > 120000 || c.DedupeTTLMS < 1 || c.DedupeTTLMS > 3600000 {
 		return c, fmt.Errorf("SNIPE_CONCURRENCY must be 1-10, SNIPE_TIMEOUT_MS must be 1-120000, and DEDUPE_TTL_MS must be 1-3600000")
 	}
@@ -184,7 +201,7 @@ return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY and MIN_MARKET_CAP_SOL must be great
 	if !c.Simulation && c.TokenMaxAgeSeconds == 0 {
 		return c, fmt.Errorf("live trading requires TOKEN_MAX_AGE_SECONDS > 0")
 	}
-for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuySOL, c.MinMarketCapSOL} {
+	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuySOL, c.MinMarketCapSOL, c.MaxMarketCapSOL} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}
@@ -277,9 +294,6 @@ func intEnv(k string, d int) (int, error) {
 	return parsed, nil
 }
 
-// cleanScalar accepts values copied from JSON, Docker/Railway forms, and .env
-// files. Those interfaces commonly leave a leading escaped or unclosed quote
-// around otherwise valid scalar values (for example \"1 or "1).
 func cleanScalar(v string) string {
 	v = strings.TrimSpace(v)
 	for strings.HasPrefix(v, `\"`) {

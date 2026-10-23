@@ -349,13 +349,21 @@ func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint stri
 			zap.Int("data_len", len(data)),
 			zap.String("first_48_bytes_hex", fmt.Sprintf("%x", data[:48])))
 	}
+	
+	// CORRIGIDO: NÃO REJEITAR quando reserves ou supply são zero.
+	// Se VirtualTokenReserves ou VirtualSOLReserves forem zero, retorna MarketCapSOL = 0 e RealSOLReserves = 0 (sem erro).
+	// O marketdata.go vai usar o WebSocket como fallback.
 	if state.VirtualTokenReserves == 0 || state.VirtualSOLReserves == 0 || state.TokenSupply == 0 {
-		return BondingCurveState{}, fmt.Errorf("Pump.fun bonding-curve reserves or supply are zero")
+		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0}, nil
 	}
+
+	// CORRIGIDO: Pump.fun usa 6 decimais. Para calcular o MC em SOL corretamente:
+	// O token supply está em 1e6 (não 1e9).
 	priceFromReserves := float64(state.VirtualSOLReserves) / float64(state.VirtualTokenReserves)
-	state.MarketCapSOL = priceFromReserves * float64(state.TokenSupply) / 1e9
+	state.MarketCapSOL = priceFromReserves * float64(state.TokenSupply) / 1e6
+
 	if state.MarketCapSOL <= 0 || math.IsNaN(state.MarketCapSOL) || math.IsInf(state.MarketCapSOL, 0) {
-		return BondingCurveState{}, fmt.Errorf("derived Pump.fun market cap is not positive and finite")
+		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0}, nil
 	}
 	return state, nil
 }
