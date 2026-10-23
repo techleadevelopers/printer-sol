@@ -249,16 +249,16 @@ func TestOpenPnlAndPriceCoverageFollowSimulationMode(t *testing.T) {
 	if err = db.OpenPosition("without-mark", 0.3); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.RecordPaperMark("paper-marked", 100); err != nil {
+	if err = db.RecordVerifiedPaperMark("paper-marked", 100, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.UpdatePaperMark("paper-marked", 150); err != nil {
+	if err = db.UpdateVerifiedPaperMark("paper-marked", 150, 1.5); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.RecordLiveMark("live-marked", 200); err != nil {
+	if err = db.RecordVerifiedLiveMark("live-marked", 200, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.UpdateLiveMark("live-marked", 100); err != nil {
+	if err = db.UpdateVerifiedLiveMark("live-marked", 100, .5); err != nil {
 		t.Fatal(err)
 	}
 
@@ -329,6 +329,38 @@ func TestPositionPeakMarkSurvivesRetracement(t *testing.T) {
 	currentReturn, known, err := db.PaperReturnPct("peak-mint")
 	if err != nil || !known || currentReturn != 30 {
 		t.Fatalf("current return = %.2f, known=%v, err=%v; want 30%%", currentReturn, known, err)
+	}
+}
+
+func TestSpotReturnsRequireRPCVerifiedTokenPrice(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "verified-spot-price.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = db.RecordPaperMark("unverified-mint", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdatePaperMark("unverified-mint", 300); err != nil {
+		t.Fatal(err)
+	}
+	if _, known, err := db.PaperSpotReturnPct("unverified-mint"); err != nil || known {
+		t.Fatalf("market-cap-only mark returned a usable spot price: known=%v err=%v", known, err)
+	}
+
+	if err = db.RecordVerifiedPaperMark("verified-mint", 100, 0.001); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdateVerifiedPaperMark("verified-mint", 900, 0.0012); err != nil {
+		t.Fatal(err)
+	}
+	returnPct, known, err := db.PaperSpotReturnPct("verified-mint")
+	if err != nil || !known || returnPct < 19.999999 || returnPct > 20.000001 {
+		t.Fatalf("spot return = %.9f, known=%v, err=%v; want 20%% despite changed market cap", returnPct, known, err)
 	}
 }
 

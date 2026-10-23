@@ -43,6 +43,7 @@ type unknownTradeReconciler interface {
 type BondingCurveMarketCapSource interface {
 	BondingCurveMarketCapSOL(context.Context, string) (float64, error)
 	BondingCurveEntryMetrics(context.Context, string) (float64, float64, error)
+	BondingCurvePositionMetrics(context.Context, string) (float64, float64, error)
 }
 
 type Settings struct {
@@ -624,16 +625,23 @@ cleaned, quarantineErr := m.db.QuarantineStuckLiveMint(mint, now.Add(-m.stuckExi
 		var exitMarketCap float64
 		var known bool
 		if m.simulation {
-			returnPct, known, err = m.db.PaperReturnPct(mint)
+			returnPct, known, err = m.db.PaperSpotReturnPct(mint)
 		} else {
-			returnPct, known, err = m.db.LiveReturnPct(mint)
+			returnPct, known, err = m.db.LiveSpotReturnPct(mint)
 		}
 		_, exitMarketCap, _, markKnown, markErr := m.db.MarkMarketCaps(mint, m.simulation)
-		if err != nil || markErr != nil || !known || !markKnown || exitMarketCap <= 0 {
+		_, currentTokenPrice, _, priceSource, markUpdatedAt, priceKnown, priceErr := m.db.PositionMarkPrices(mint, m.simulation)
+		freshMark := priceKnown && priceSource == database.VerifiedPositionPriceSource &&
+			currentTokenPrice > 0 && m.positionMarkIsFresh(markUpdatedAt, now)
+		if err != nil || markErr != nil || priceErr != nil || !known || !markKnown || !freshMark || exitMarketCap <= 0 {
 			if err != nil {
 				m.alertMissingMark(mint, err)
-			} else {
+			} else if markErr != nil {
 				m.alertMissingMark(mint, markErr)
+			} else if priceErr != nil {
+				m.alertMissingMark(mint, priceErr)
+			} else {
+				m.alertMissingMark(mint, errors.New("fresh RPC-verified bonding-curve spot price is unavailable"))
 			}
 			continue
 		}
@@ -668,7 +676,16 @@ func (m *Monitor) restoreOpenPositions() {
 	for _, mint := range mints {
 		m.tracked.Store(mint, struct{}{})
 		_, currentMarketCap, _, known, markErr := m.db.MarkMarketCaps(mint, m.simulation)
-		if markErr != nil || !known || currentMarketCap <= 0 {
+		_, currentTokenPrice, _, source, updatedAt, priceKnown, priceErr := m.db.PositionMarkPrices(mint, m.simulation)
+		freshMark := priceKnown && source == database.VerifiedPositionPriceSource &&
+			currentTokenPrice > 0 && m.positionMarkIsFresh(updatedAt, time.Now().UTC())
+		if markErr != nil || !known || currentMarketCap <= 0 || !freshMark {
+			if markErr == nil {
+				markErr = priceErr
+			}
+			if markErr == nil {
+				markErr = errors.New("fresh RPC-verified bonding-curve spot price is unavailable")
+			}
 			m.alertMissingMark(mint, markErr)
 		}
 	}
@@ -681,7 +698,7 @@ func (m *Monitor) alertMissingMark(mint string, markErr error) {
 	if _, alreadyReported := m.missingMarks.LoadOrStore(mint, struct{}{}); alreadyReported {
 		return
 	}
-	reason := "open position has no usable market-cap mark; position remains open"
+	reason := "open position has no fresh RPC-verified bonding-curve spot price; position remains open"
 	payload, _ := json.Marshal(map[string]any{
 		"mint": mint, "simulation": m.simulation, "reason": reason,
 	})
@@ -689,7 +706,7 @@ func (m *Monitor) alertMissingMark(mint string, markErr error) {
 	if markErr != nil {
 		fields = append(fields, zap.Error(markErr))
 	}
-	m.log.Warn("open position has no valid mark; keeping it open", fields...)
+	m.log.Warn("open position has no fresh RPC-verified price; keeping it open", fields...)
 	m.bus.Publish("risk.alert", map[string]any{
 		"mint": mint, "reason": reason, "positionRemainsOpen": true,
 		"simulation": m.simulation,
@@ -1134,38 +1151,66 @@ func (m *Monitor) markTradeWithSource(ctx context.Context, mint string, marketCa
 	m.markTradeWithSourceAt(m.resetGeneration.Load(), ctx, mint, marketCapSOL, source)
 }
 
-func (m *Monitor) markTradeWithSourceAt(generation uint64, ctx context.Context, mint string, marketCapSOL float64, source string) {
-	m.runOperationAt(generation, func() {
-		m.markTradeLocked(ctx, mint, marketCapSOL, source)
-	})
+func (m *Monitor) markTradeWithSourceAt(generation uint64, ctx context.Context, mint string, signalMarketCap float64, signalSource string) bool {
+	updated := false
+	if !m.runOperationAt(generation, func() {
+		m.log.Debug("position price refresh signal received",
+			zap.String("mint", mint),
+			zap.String("signal_source", signalSource),
+			zap.Float64("signal_market_cap_sol", signalMarketCap))
+		updated = m.markTradeLocked(ctx, mint)
+	}) {
+		return false
+	}
+	return updated
 }
 
-func (m *Monitor) markTradeLocked(ctx context.Context, mint string, marketCapSOL float64, source string) {
-	var err error
+func (m *Monitor) markTradeLocked(ctx context.Context, mint string) bool {
+	marketCapSOL, tokenPriceSOL, err := m.readBondingCurvePositionMetrics(ctx, mint)
+	if err != nil {
+		m.log.Warn("skip position mark without RPC-verified bonding-curve price",
+			zap.String("mint", mint), zap.Error(err))
+		return false
+	}
+	_, priorCurrentPrice, _, _, _, priorMarkKnown, priorMarkErr := m.db.PositionMarkPrices(mint, m.simulation)
+	openedAt, positionOpen, openedAtErr := m.db.PositionOpenedAt(mint)
+	legacyBaselineRebased := priorMarkErr == nil && openedAtErr == nil && priorMarkKnown &&
+		priorCurrentPrice <= 0 && positionOpen && time.Since(openedAt) > 2*m.pricePollInterval
 	if m.simulation {
-		err = m.db.RecordPaperMark(mint, marketCapSOL)
+		err = m.db.RecordVerifiedPaperMark(mint, marketCapSOL, tokenPriceSOL)
 	} else {
-		err = m.db.RecordLiveMark(mint, marketCapSOL)
+		err = m.db.RecordVerifiedLiveMark(mint, marketCapSOL, tokenPriceSOL)
 	}
 	if err != nil {
 		m.log.Warn("record take-profit mark", zap.Error(err))
-		return
+		return false
 	}
 	if m.simulation {
-		err = m.db.UpdatePaperMark(mint, marketCapSOL)
+		err = m.db.UpdateVerifiedPaperMark(mint, marketCapSOL, tokenPriceSOL)
 	} else {
-		err = m.db.UpdateLiveMark(mint, marketCapSOL)
+		err = m.db.UpdateVerifiedLiveMark(mint, marketCapSOL, tokenPriceSOL)
 	}
 	if err != nil {
 		m.log.Warn("update take-profit mark", zap.Error(err))
-		return
+		return false
+	}
+	if legacyBaselineRebased {
+		detail := "legacy position was re-anchored to a fresh RPC spot price; P&L before re-anchoring is unavailable"
+		payload, _ := json.Marshal(map[string]any{"mint": mint, "detail": detail})
+		m.log.Warn(detail, zap.String("mint", mint))
+		m.bus.Publish("risk.alert", map[string]any{
+			"mint": mint, "reason": detail, "positionRemainsOpen": true, "simulation": m.simulation,
+		})
+		if logErr := m.db.LogOperational("warn", "position_mark_rebased", detail, string(payload)); logErr != nil {
+			m.log.Warn("record legacy position mark rebase", zap.String("mint", mint), zap.Error(logErr))
+		}
 	}
 	var returnPct float64
 	var known bool
 	if m.simulation {
-		returnPct, known, err = m.db.PaperReturnPct(mint)
+		returnPct, known, err = m.db.PaperSpotReturnPct(mint)
 	} else {
-		returnPct, known, err = m.db.LiveReturnPct(mint)
+		returnPct, known, err = m.db.LiveSpotReturnPct(mint)
 	}
 	if err != nil {
 		m.log.Warn("read return after mark update",
@@ -1173,34 +1218,35 @@ func (m *Monitor) markTradeLocked(ctx context.Context, mint string, marketCapSOL
 			zap.Float64("mcap_sol", marketCapSOL),
 			zap.Bool("simulation", m.simulation),
 			zap.Error(err))
-		return
+		return false
 	}
 	if !known {
 		m.log.Warn("mark row missing after update",
 			zap.String("mint", mint),
 			zap.Float64("mcap_sol", marketCapSOL),
 			zap.Bool("simulation", m.simulation))
-		return
+		return false
 	}
 
 	m.log.Info("mark update",
 		zap.String("mint", mint),
 		zap.Float64("mcap_sol", marketCapSOL),
+		zap.Float64("spot_price_sol", tokenPriceSOL),
 		zap.Float64("return_pct", returnPct),
 		zap.Bool("simulation", m.simulation))
 	if !m.simulation {
 		active, activeErr := m.db.ActiveForMint(mint)
 		if activeErr != nil || active {
-			return
+			return true
 		}
 	}
 	openedAt, ok, err := m.db.PositionOpenedAt(mint)
 	if err != nil {
-		return
+		return false
 	}
 	if !ok {
 		m.tracked.Delete(mint)
-		return
+		return true
 	}
 	reason := m.positionExitReason(mint, returnPct, openedAt, time.Now().UTC())
 	var estimatedPnl, estimatedValue any
@@ -1208,23 +1254,34 @@ func (m *Monitor) markTradeLocked(ctx context.Context, mint string, marketCapSOL
 		estimatedPnl = cost * returnPct / 100
 		estimatedValue = cost + cost*returnPct/100
 	}
-	var entryMarketCap any
-	if marketCapRatio := 1 + returnPct/100; marketCapRatio > 0 {
-		entryMarketCap = marketCapSOL / marketCapRatio
+	var entryMarketCapValue, currentMarketCapValue any
+	entryMarketCap, currentMarketCap, _, marketCapsKnown, marketCapsErr := m.db.MarkMarketCaps(mint, m.simulation)
+	if marketCapsErr == nil && marketCapsKnown {
+		entryMarketCapValue, currentMarketCapValue = entryMarketCap, currentMarketCap
 	}
+	entryTokenPrice, currentTokenPrice, _, _, _, priceKnown, priceErr := m.db.PositionMarkPrices(mint, m.simulation)
+	if priceErr != nil || !priceKnown {
+		m.log.Warn("position price mark unavailable after database update",
+			zap.String("mint", mint), zap.Error(priceErr))
+		return false
+	}
+	var entryTokenPriceValue, currentTokenPriceValue any
+	entryTokenPriceValue, currentTokenPriceValue = entryTokenPrice, currentTokenPrice
 	m.bus.Publish("position_mark_updated", map[string]any{
-		"mint": mint, "marketCapSol": marketCapSOL, "entryMarketCapSol": entryMarketCap,
-		"currentMarketCapSol": marketCapSOL, "returnPct": returnPct,
+		"mint": mint, "marketCapSol": marketCapSOL, "entryMarketCapSol": entryMarketCapValue,
+		"currentMarketCapSol": currentMarketCapValue, "returnPct": returnPct,
+		"entryTokenPriceSol": entryTokenPriceValue, "currentTokenPriceSol": currentTokenPriceValue,
 		"estimatedPnlSol": estimatedPnl, "estimatedValueSol": estimatedValue,
 		"markAvailable": true, "markUpdatedAt": time.Now().UTC(),
-		"markSource": source, "tokenPriceAvailable": false,
-		"pnlBasis": "market_cap_ratio_estimate", "takeProfitPct": m.takeProfit,
+		"markSource": database.VerifiedPositionPriceSource, "tokenPriceAvailable": true,
+		"pnlBasis": "bonding_curve_spot_price_ratio_estimate", "takeProfitPct": m.takeProfit,
 		"stopLossPct": m.stopLoss, "trailingStopPct": m.trailingStop, "simulation": m.simulation,
 	})
 	if reason == "" {
-		return
+		return true
 	}
 	m.submitExit(ctx, mint, marketCapSOL, returnPct, reason)
+	return true
 }
 
 func (m *Monitor) positionExitReason(mint string, returnPct float64, openedAt, now time.Time) string {
@@ -1232,9 +1289,9 @@ func (m *Monitor) positionExitReason(mint string, returnPct float64, openedAt, n
 	if err != nil || cost <= 0 {
 		return ""
 	}
-	peakReturnPct, peakKnown, peakErr := m.db.PaperPeakReturnPct(mint)
+	peakReturnPct, peakKnown, peakErr := m.db.PaperPeakSpotReturnPct(mint)
 	if !m.simulation {
-		peakReturnPct, peakKnown, peakErr = m.db.LivePeakReturnPct(mint)
+		peakReturnPct, peakKnown, peakErr = m.db.LivePeakSpotReturnPct(mint)
 	}
 	peakValue := cost * (1 + returnPct/100)
 	if peakErr == nil && peakKnown && peakReturnPct > returnPct {
@@ -1252,6 +1309,33 @@ MaxHold: m.maxHold,
 },
 		now,
 	)
+}
+
+func (m *Monitor) positionMarkIsFresh(markUpdatedAt string, now time.Time) bool {
+	layouts := []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05",
+	}
+	var markedAt time.Time
+	for _, layout := range layouts {
+		if parsed, err := time.Parse(layout, markUpdatedAt); err == nil {
+			markedAt = parsed
+			break
+		}
+	}
+	if markedAt.IsZero() {
+		return false
+	}
+	maxAge := 2 * m.pricePollInterval
+	if maxAge < 30*time.Second {
+		maxAge = 30 * time.Second
+	}
+	age := now.Sub(markedAt)
+	return age >= 0 && age <= maxAge
 }
 
 func (m *Monitor) submitExit(ctx context.Context, mint string, exitMarketCap, returnPct float64, reason string) {

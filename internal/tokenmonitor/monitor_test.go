@@ -22,6 +22,21 @@ type recordingEntrier struct {
 	buyCalls         int
 }
 
+type mutableBondingCurvePrice struct {
+	marketCapSOL float64
+	spotPriceSOL float64
+}
+
+func (source *mutableBondingCurvePrice) BondingCurveMarketCapSOL(context.Context, string) (float64, error) {
+	return source.marketCapSOL, nil
+}
+func (source *mutableBondingCurvePrice) BondingCurveEntryMetrics(context.Context, string) (float64, float64, error) {
+	return source.marketCapSOL, 0.05, nil
+}
+func (source *mutableBondingCurvePrice) BondingCurvePositionMetrics(context.Context, string) (float64, float64, error) {
+	return source.marketCapSOL, source.spotPriceSOL, nil
+}
+
 type concurrentEntrier struct {
 	active  atomic.Int32
 	maximum atomic.Int32
@@ -346,13 +361,14 @@ func TestSimulationMarksTriggerVirtualTakeProfitAndStopLoss(t *testing.T) {
 			if err = db.OpenSimulationPosition("paper-mint", 0.05); err != nil {
 				t.Fatal(err)
 			}
-			if err = db.RecordPaperMark("paper-mint", 100); err != nil {
+		if err = db.RecordVerifiedPaperMark("paper-mint", 100, 1); err != nil {
 				t.Fatal(err)
 			}
 
 			bus := events.New()
 			engine := execution.New(db, nil, nil, nil, nil, zap.NewNop(), true, 1, nil, bus, execution.Limits{})
 			monitor := New("", "", 8, db, nil, engine, 0, 0, 0, test.takeProfitPct, test.stopLossPct, 0, true, bus, zap.NewNop())
+		monitor.bondingCurve = &mutableBondingCurvePrice{marketCapSOL: test.currentCap, spotPriceSOL: test.currentCap / 100}
 			monitor.markTrade(context.Background(), "paper-mint", test.currentCap)
 
 			open, err := db.OpenPositionCount()
@@ -396,13 +412,15 @@ func TestLiveMonitorRestoresOpenPositionsAndWaitsForConfirmedExit(t *testing.T) 
 	if err = db.OpenPosition("live-mint", 0.05); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.RecordLiveMark("live-mint", 100); err != nil {
+	if err = db.RecordVerifiedLiveMark("live-mint", 100, 1); err != nil {
 		t.Fatal(err)
 	}
 
 	bus := events.New()
 	entry := &recordingEntrier{}
 	monitor := New("", "", 8, db, nil, entry, 0, 0, 0, 50, 30, time.Minute, false, bus, zap.NewNop())
+	priceSource := &mutableBondingCurvePrice{marketCapSOL: 149, spotPriceSOL: 1.49}
+	monitor.bondingCurve = priceSource
 	monitor.restoreOpenPositions()
 	if _, tracked := monitor.tracked.Load("live-mint"); !tracked {
 		t.Fatal("live open position was not restored for price monitoring")
@@ -412,6 +430,7 @@ func TestLiveMonitorRestoresOpenPositionsAndWaitsForConfirmedExit(t *testing.T) 
 	if entry.liveExitCalls != 0 {
 		t.Fatalf("take-profit fired below configured 50%% threshold: %d exits", entry.liveExitCalls)
 	}
+	priceSource.marketCapSOL, priceSource.spotPriceSOL = 150, 1.5
 	monitor.markTrade(context.Background(), "live-mint", 150)
 	if entry.liveExitCalls != 1 {
 		t.Fatalf("take-profit should submit one live exit, got %d", entry.liveExitCalls)
@@ -449,12 +468,13 @@ func TestLivePendingBuyKeepsMarkTrackingUntilConfirmation(t *testing.T) {
 	if err = db.InsertTrade(database.Trade{ID: "pending-buy", Mint: "pending-mint", Side: "buy", Quantity: "0.05", Requested: 0.05, State: "submitted"}); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.RecordLiveMark("pending-mint", 100); err != nil {
+	if err = db.RecordVerifiedLiveMark("pending-mint", 100, 1); err != nil {
 		t.Fatal(err)
 	}
 
 	entry := &recordingEntrier{}
 	monitor := New("", "", 8, db, nil, entry, 0, 0, 0, 50, 30, 5*time.Minute, false, events.New(), zap.NewNop())
+	monitor.bondingCurve = &mutableBondingCurvePrice{marketCapSOL: 150, spotPriceSOL: 1.5}
 	monitor.tracked.Store("pending-mint", struct{}{})
 	monitor.markTrade(context.Background(), "pending-mint", 150)
 	if _, tracked := monitor.tracked.Load("pending-mint"); !tracked {
@@ -524,10 +544,10 @@ func TestLiveTakeProfitRetriesAfterSellFailureWithoutNewPriceEvent(t *testing.T)
 	if err = db.OpenPosition("retry-live-mint", 0.05); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.RecordLiveMark("retry-live-mint", 100); err != nil {
+	if err = db.RecordVerifiedLiveMark("retry-live-mint", 100, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.UpdateLiveMark("retry-live-mint", 150); err != nil {
+	if err = db.UpdateVerifiedLiveMark("retry-live-mint", 150, 1.5); err != nil {
 		t.Fatal(err)
 	}
 
@@ -538,7 +558,7 @@ func TestLiveTakeProfitRetriesAfterSellFailureWithoutNewPriceEvent(t *testing.T)
 		t.Fatalf("take-profit should attempt the first live exit, got %d", entry.liveExitCalls)
 	}
 
-	if err = db.UpdateLiveMark("retry-live-mint", 120); err != nil {
+	if err = db.UpdateVerifiedLiveMark("retry-live-mint", 120, 1.2); err != nil {
 		t.Fatal(err)
 	}
 	monitor.expireOpenPositions(context.Background())
@@ -564,10 +584,10 @@ func TestLiveFailedSellRetriesEvenAfterPriceFallsBelowTakeProfit(t *testing.T) {
 	if err = db.OpenPosition("failed-sell-mint", 0.05); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.RecordLiveMark("failed-sell-mint", 100); err != nil {
+	if err = db.RecordVerifiedLiveMark("failed-sell-mint", 100, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.UpdateLiveMark("failed-sell-mint", 120); err != nil {
+	if err = db.UpdateVerifiedLiveMark("failed-sell-mint", 120, 1.2); err != nil {
 		t.Fatal(err)
 	}
 	if err = db.InsertTrade(database.Trade{ID: "confirmed-failed-sell", Mint: "failed-sell-mint", Side: "sell", Quantity: "100", Requested: 100, State: "prepared"}); err != nil {
@@ -601,6 +621,43 @@ func TestSimulationExitRetryDelayBacksOff(t *testing.T) {
 	}
 }
 
+func TestStaleRPCSpotPriceCannotTriggerAutomaticExit(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "stale-rpc-spot-mark.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenPosition("stale-rpc-mint", 0.05); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RecordVerifiedLiveMark("stale-rpc-mint", 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdateVerifiedLiveMark("stale-rpc-mint", 150, 1.5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`UPDATE live_marks SET updated_at=? WHERE mint=?`,
+		time.Now().UTC().Add(-time.Hour), "stale-rpc-mint"); err != nil {
+		t.Fatal(err)
+	}
+
+	entry := &recordingEntrier{}
+	monitor := New("", "", 8, db, nil, entry, 0, 0, 0, 50, 30, time.Minute, false, events.New(), zap.NewNop())
+	monitor.tracked.Store("stale-rpc-mint", struct{}{})
+	monitor.expireOpenPositions(context.Background())
+
+	if entry.liveExitCalls != 0 {
+		t.Fatalf("stale RPC price triggered %d automatic exits; want none", entry.liveExitCalls)
+	}
+	open, err := db.OpenPositionCount()
+	if err != nil || open != 1 {
+		t.Fatalf("position state after stale-price check: open=%d err=%v; want still open", open, err)
+	}
+}
+
 func TestSimulationMaxHoldReleasesFlatPosition(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "paper-max-hold.db"))
 	if err != nil {
@@ -613,7 +670,7 @@ func TestSimulationMaxHoldReleasesFlatPosition(t *testing.T) {
 	if err = db.OpenSimulationPosition("paper-mint", 0.05); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.RecordPaperMark("paper-mint", 100); err != nil {
+	if err = db.RecordVerifiedPaperMark("paper-mint", 100, 1); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-time.Hour), "paper-mint"); err != nil {
@@ -623,6 +680,7 @@ func TestSimulationMaxHoldReleasesFlatPosition(t *testing.T) {
 	bus := events.New()
 	engine := execution.New(db, nil, nil, nil, nil, zap.NewNop(), true, 1, nil, bus, execution.Limits{})
 	monitor := New("", "", 8, db, nil, engine, 0, 0, 0, 70, 30, time.Minute, true, bus, zap.NewNop())
+	monitor.bondingCurve = &mutableBondingCurvePrice{marketCapSOL: 100, spotPriceSOL: 1}
 	monitor.markTrade(context.Background(), "paper-mint", 100)
 
 	open, err := db.OpenPositionCount()
@@ -655,7 +713,7 @@ func TestSimulationMaxHoldClosesOnlyNonPositivePositions(t *testing.T) {
 			if err = db.OpenSimulationPosition("paper-mint", 0.05); err != nil {
 				t.Fatal(err)
 			}
-			if err = db.RecordPaperMark("paper-mint", 100); err != nil {
+			if err = db.RecordVerifiedPaperMark("paper-mint", 100, 1); err != nil {
 				t.Fatal(err)
 			}
 			if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-2*time.Minute), "paper-mint"); err != nil {
@@ -665,6 +723,7 @@ func TestSimulationMaxHoldClosesOnlyNonPositivePositions(t *testing.T) {
 			bus := events.New()
 			engine := execution.New(db, nil, nil, nil, nil, zap.NewNop(), true, 1, nil, bus, execution.Limits{})
 			monitor := New("", "", 8, db, nil, engine, 0, 0, 0, 70, 30, time.Minute, true, bus, zap.NewNop())
+			monitor.bondingCurve = &mutableBondingCurvePrice{marketCapSOL: test.marketCap, spotPriceSOL: test.marketCap / 100}
 			monitor.markTrade(context.Background(), "paper-mint", test.marketCap)
 
 			open, err := db.OpenPositionCount()

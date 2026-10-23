@@ -288,6 +288,26 @@ func (m *Monitor) readBondingCurveMarketCap(ctx context.Context, mint string) (f
 	return marketCapSOL, nil
 }
 
+func (m *Monitor) readBondingCurvePositionMetrics(ctx context.Context, mint string) (float64, float64, error) {
+	if m.bondingCurve == nil {
+		err := fmt.Errorf("bonding-curve RPC source is not configured")
+		m.recordPriceSourceResult(err)
+		return 0, 0, err
+	}
+	marketCapSOL, tokenPriceSOL, err := m.bondingCurve.BondingCurvePositionMetrics(ctx, mint)
+	if err == nil && (marketCapSOL <= 0 || math.IsNaN(marketCapSOL) || math.IsInf(marketCapSOL, 0)) {
+		err = fmt.Errorf("bonding-curve RPC market cap is not positive and finite")
+	}
+	if err == nil && (tokenPriceSOL <= 0 || math.IsNaN(tokenPriceSOL) || math.IsInf(tokenPriceSOL, 0)) {
+		err = fmt.Errorf("bonding-curve RPC spot price is not positive and finite")
+	}
+	m.recordPriceSourceResult(err)
+	if err != nil {
+		return 0, 0, err
+	}
+	return marketCapSOL, tokenPriceSOL, nil
+}
+
 func (m *Monitor) recordPriceSourceResult(err error) {
 	m.priceSourceStatusMu.Lock()
 	if err == nil {
@@ -400,16 +420,9 @@ func (m *Monitor) refreshOpenPositionPrice(ctx context.Context, mint string, gen
 }
 
 func (m *Monitor) refreshBondingCurveMarketCap(ctx context.Context, mint string, generation uint64) bool {
-	marketCapSOL, err := m.readBondingCurveMarketCap(ctx, mint)
-	if err != nil {
-		if m.bondingCurve != nil {
-			m.log.Debug("bonding-curve market-cap refresh failed",
-				zap.String("mint", mint), zap.Error(err))
-		}
-		return false
+	updated := m.markTradeWithSourceAt(generation, ctx, mint, 0, "solana_rpc_bonding_curve")
+	if !updated && m.bondingCurve != nil {
+		m.log.Debug("RPC bonding-curve position-price refresh failed", zap.String("mint", mint))
 	}
-	m.log.Info("polling source=solana_rpc_bonding_curve",
-		zap.String("mint", mint), zap.Float64("mcap", marketCapSOL))
-	m.markTradeWithSourceAt(generation, ctx, mint, marketCapSOL, "solana_bonding_curve_rpc")
-	return true
+	return updated
 }

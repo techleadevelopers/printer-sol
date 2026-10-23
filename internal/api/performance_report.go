@@ -69,7 +69,7 @@ func (s *Server) performanceReport(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusInternalServerError, "database_unavailable", "could not build simulation report")
 			return
 		}
-		openPnl, err = s.db.OpenPnlSOL(true)
+	openPnl, err = s.db.OpenPnlSOLFresh(true, s.positionMarkCutoff(time.Now().UTC()))
 		if err != nil {
 			fail(w, http.StatusInternalServerError, "database_unavailable", "could not load estimated open P&L")
 			return
@@ -89,7 +89,7 @@ func (s *Server) performanceReport(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusInternalServerError, "database_unavailable", "could not load confirmed live fees")
 			return
 		}
-		openPnl, err = s.db.OpenPnlSOL(false)
+	openPnl, err = s.db.OpenPnlSOLFresh(false, s.positionMarkCutoff(time.Now().UTC()))
 		if err != nil {
 			fail(w, http.StatusInternalServerError, "database_unavailable", "could not load estimated open P&L")
 			return
@@ -137,7 +137,7 @@ func (s *Server) performanceReport(w http.ResponseWriter, r *http.Request) {
 		"openPnlSol":      openPnlReported,
 		"openPnlComplete": unmarkedPositions == 0,
 		"unmarkedOpenPositions": unmarkedPositions,
-		"openPnlBasis":    "market_cap_ratio_estimate",
+"openPnlBasis":    "bonding_curve_spot_price_ratio_estimate",
 		"feeModel":        feeModel,
 		"paperReadiness":  s.paperReadiness(),
 	})

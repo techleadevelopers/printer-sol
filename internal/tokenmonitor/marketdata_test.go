@@ -16,6 +16,7 @@ import (
 
 type fixedBondingCurveMarketCap struct {
 	marketCapSOL float64
+	spotPriceSOL float64
 	reservesSOL  float64
 	err          error
 }
@@ -26,6 +27,14 @@ func (source fixedBondingCurveMarketCap) BondingCurveMarketCapSOL(context.Contex
 
 func (source fixedBondingCurveMarketCap) BondingCurveEntryMetrics(context.Context, string) (float64, float64, error) {
 	return source.marketCapSOL, source.reservesSOL, source.err
+}
+
+func (source fixedBondingCurveMarketCap) BondingCurvePositionMetrics(context.Context, string) (float64, float64, error) {
+	price := source.spotPriceSOL
+	if price == 0 {
+		price = source.marketCapSOL / 1_000_000_000
+	}
+	return source.marketCapSOL, price, source.err
 }
 
 func newMarketDataTestMonitor(t *testing.T) (*Monitor, func()) {

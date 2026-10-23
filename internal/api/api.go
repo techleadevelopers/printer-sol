@@ -105,7 +105,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load token analysis count")
 		return
 	}
-	openPnl, err := s.db.OpenPnlSOL(s.cfg.Simulation)
+	openPnl, err := s.db.OpenPnlSOLFresh(s.cfg.Simulation, s.positionMarkCutoff(time.Now().UTC()))
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load estimated open P&L")
 		return
@@ -249,7 +249,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		"totalEstimatedPnlComplete": unmarkedPositions == 0,
 		"netPnlSol": totalEstimatedPnl, "estimatedOpenPnlComplete": unmarkedPositions == 0,
 		"unmarkedOpenPositions": unmarkedPositions, "costsSol": feesPaid, "feesPaidSol": feesPaid,
-		"openPnlBasis":     "pumpportal_market_cap_ratio_estimate",
+"openPnlBasis":     "bonding_curve_spot_price_ratio_estimate",
 		"performance":      performancePayload,
 		"cumulativeResult": cumulativeResult,
 		"tradesByPeriod":   []map[string]any{{"period": now.Format("2006-01-02"), "total": periodTotal, "positive": positive, "negative": negative}},
@@ -332,19 +332,25 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var mint, q, status, opened, updated, markUpdated, latestSellState string
-		var cost, entryMarketCap, currentMarketCap, positionFees float64
+		var mint, q, status, opened, updated, markUpdated, markSource, latestSellState string
+		var cost, entryMarketCap, currentMarketCap, entryTokenPrice, currentTokenPrice, positionFees float64
 		var realized sql.NullFloat64
-		if err := rows.Scan(&mint, &q, &cost, &status, &opened, &updated, &entryMarketCap, &currentMarketCap, &markUpdated, &positionFees, &realized, &latestSellState); err != nil {
+		if err := rows.Scan(&mint, &q, &cost, &status, &opened, &updated,
+			&entryMarketCap, &currentMarketCap, &markUpdated, &markSource,
+			&entryTokenPrice, &currentTokenPrice, &positionFees, &realized, &latestSellState); err != nil {
 			fail(w, http.StatusInternalServerError, "database_unavailable", "could not read position data")
 			return
 		}
 		quantity, _ := strconv.ParseFloat(q, 64)
-		markAvailable := entryMarketCap > 0 && currentMarketCap > 0
+		now := time.Now().UTC()
+		markAgeSeconds, markAgeKnown := positionMarkAgeSeconds(markUpdated, now)
+		markAvailable := markSource == database.VerifiedPositionPriceSource &&
+			entryTokenPrice > 0 && currentTokenPrice > 0 && markAgeKnown &&
+			markAgeSeconds <= positionMarkMaxAge(s.cfg.PricePollSeconds).Seconds()
 		var returnPct, estimatedValue, estimatedPnl any
 		if markAvailable && status == "open" && cost > 0 {
-			pct := (currentMarketCap - entryMarketCap) / entryMarketCap * 100
-			value := cost * currentMarketCap / entryMarketCap
+			pct := (currentTokenPrice - entryTokenPrice) / entryTokenPrice * 100
+			value := cost * currentTokenPrice / entryTokenPrice
 			returnPct, estimatedValue, estimatedPnl = pct, value, value-cost
 		}
 		var realizedPnl any
@@ -372,21 +378,22 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 			"quantity": quantity, "quantityUnit": "SOL allocation", "investedSol": cost,
 			"averageEntryPriceSol": nil, "buyValueSol": cost, "costsSol": positionFees,
 			"entryMarketCapSol": nil, "currentMarketCapSol": nil,
-			"entryTokenPriceSol": nil, "currentTokenPriceSol": nil, "tokenPriceAvailable": false,
+			"entryTokenPriceSol": nil, "currentTokenPriceSol": nil, "tokenPriceAvailable": markAvailable,
 			"returnPct": returnPct, "estimatedValueSol": estimatedValue, "estimatedPnlSol": estimatedPnl,
 			"markAvailable": markAvailable, "pnlEstimateAvailable": pnlEstimateAvailable,
 			"markUpdatedAt": nil, "markAgeSeconds": nil,
-			"markSource": "market_cap_feed", "pnlBasis": "market_cap_ratio_estimate",
+			"markSource": markSource, "pnlBasis": "bonding_curve_spot_price_ratio_estimate",
 			"realizedPnlSol": realizedPnl, "openedAt": opened, "updatedAt": updated, "status": status,
 			"sellStatus": sellStatus, "simulation": s.cfg.Simulation,
 		}
 		if markAvailable {
+			position["averageEntryPriceSol"] = entryTokenPrice
 			position["entryMarketCapSol"] = entryMarketCap
 			position["currentMarketCapSol"] = currentMarketCap
+			position["entryTokenPriceSol"] = entryTokenPrice
+			position["currentTokenPriceSol"] = currentTokenPrice
 			position["markUpdatedAt"] = markUpdated
-			if age, ok := positionMarkAgeSeconds(markUpdated, time.Now().UTC()); ok {
-				position["markAgeSeconds"] = age
-			}
+			position["markAgeSeconds"] = markAgeSeconds
 		}
 		out = append(out, position)
 	}
@@ -577,6 +584,18 @@ func positionMarkAgeSeconds(markUpdated string, now time.Time) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func positionMarkMaxAge(pollSeconds int) time.Duration {
+	maxAge := 2 * time.Duration(pollSeconds) * time.Second
+	if maxAge < 30*time.Second {
+		return 30 * time.Second
+	}
+	return maxAge
+}
+
+func (s *Server) positionMarkCutoff(now time.Time) time.Time {
+	return now.Add(-positionMarkMaxAge(s.cfg.PricePollSeconds))
 }
 func (s *Server) mode() string {
 	if s.cfg.Simulation {

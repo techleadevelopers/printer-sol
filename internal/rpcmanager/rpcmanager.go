@@ -276,6 +276,7 @@ type BondingCurveState struct {
 	TokenSupply          uint64
 	Complete             bool
 	MarketCapSOL         float64
+	SpotPriceSOL         float64
 }
 
 // GetBondingCurveState reads Pump.fun's bonding-curve PDA via getAccountInfo
@@ -363,9 +364,11 @@ func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint stri
 	virtualTokenReserves := float64(state.VirtualTokenReserves) / 1e6
 	tokenSupply := float64(state.TokenSupply) / 1e6
 	priceFromReserves := virtualSOLReservesSOL / virtualTokenReserves
+	state.SpotPriceSOL = priceFromReserves
 	state.MarketCapSOL = priceFromReserves * tokenSupply
 
-	if state.MarketCapSOL <= 0 || math.IsNaN(state.MarketCapSOL) || math.IsInf(state.MarketCapSOL, 0) {
+	if state.SpotPriceSOL <= 0 || math.IsNaN(state.SpotPriceSOL) || math.IsInf(state.SpotPriceSOL, 0) ||
+		state.MarketCapSOL <= 0 || math.IsNaN(state.MarketCapSOL) || math.IsInf(state.MarketCapSOL, 0) {
 		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0}, nil
 	}
 	return state, nil
@@ -389,6 +392,19 @@ func (m *Manager) BondingCurveEntryMetrics(ctx context.Context, mint string) (fl
 		return 0, 0, err
 	}
 	return state.MarketCapSOL, float64(state.RealSOLReserves) / 1e9, nil
+}
+
+// BondingCurvePositionMetrics returns the market-cap risk metric and the
+// marginal SOL/token spot price derived from the same on-chain reserve snapshot.
+func (m *Manager) BondingCurvePositionMetrics(ctx context.Context, mint string) (float64, float64, error) {
+	state, err := m.GetBondingCurveStateWithContext(ctx, mint)
+	if err != nil {
+		return 0, 0, err
+	}
+	if state.SpotPriceSOL <= 0 || math.IsNaN(state.SpotPriceSOL) || math.IsInf(state.SpotPriceSOL, 0) {
+		return 0, 0, fmt.Errorf("bonding-curve spot price is not positive and finite")
+	}
+	return state.MarketCapSOL, state.SpotPriceSOL, nil
 }
 
 // Execution reads the confirmed transaction receipt and returns the SOL delta

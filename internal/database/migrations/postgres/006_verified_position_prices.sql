@@ -1,0 +1,9 @@
+ALTER TABLE paper_marks ADD COLUMN entry_token_price_sol DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE paper_marks ADD COLUMN current_token_price_sol DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE paper_marks ADD COLUMN peak_token_price_sol DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE paper_marks ADD COLUMN price_source TEXT NOT NULL DEFAULT 'unverified';
+
+ALTER TABLE live_marks ADD COLUMN entry_token_price_sol DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE live_marks ADD COLUMN current_token_price_sol DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE live_marks ADD COLUMN peak_token_price_sol DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE live_marks ADD COLUMN price_source TEXT NOT NULL DEFAULT 'unverified';

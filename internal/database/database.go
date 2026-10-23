@@ -944,6 +944,32 @@ func (d *DB) RecordPaperMark(mint string, marketCapSOL float64) error {
 func (d *DB) RecordLiveMark(mint string, marketCapSOL float64) error {
 	return d.recordMark("live_marks", mint, marketCapSOL)
 }
+const VerifiedPositionPriceSource = "solana_rpc_bonding_curve"
+
+func (d *DB) RecordVerifiedPaperMark(mint string, marketCapSOL, tokenPriceSOL float64) error {
+	return d.recordVerifiedMark("paper_marks", mint, marketCapSOL, tokenPriceSOL)
+}
+func (d *DB) RecordVerifiedLiveMark(mint string, marketCapSOL, tokenPriceSOL float64) error {
+	return d.recordVerifiedMark("live_marks", mint, marketCapSOL, tokenPriceSOL)
+}
+func (d *DB) recordVerifiedMark(table, mint string, marketCapSOL, tokenPriceSOL float64) error {
+	if marketCapSOL <= 0 || tokenPriceSOL <= 0 {
+		return nil
+	}
+	d.markMu.Lock()
+	defer d.markMu.Unlock()
+	now := time.Now().UTC()
+	_, err := d.Exec(d.bind(`INSERT INTO `+table+`(
+		mint,entry_market_cap_sol,current_market_cap_sol,peak_market_cap_sol,updated_at,
+		entry_token_price_sol,current_token_price_sol,peak_token_price_sol,price_source
+	) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(mint) DO NOTHING`),
+		mint, marketCapSOL, marketCapSOL, marketCapSOL, now,
+		tokenPriceSOL, tokenPriceSOL, tokenPriceSOL, VerifiedPositionPriceSource)
+	if err != nil {
+		return err
+	}
+	return nil
+}
 func (d *DB) recordMark(table, mint string, marketCapSOL float64) error {
 	if marketCapSOL <= 0 {
 		return nil
@@ -992,6 +1018,79 @@ func (d *DB) updateMark(table, mint string, marketCapSOL float64) error {
 	defer d.markMu.Unlock()
 	_, e := d.Exec(d.bind(`UPDATE `+table+` SET current_market_cap_sol=?,peak_market_cap_sol=CASE WHEN ?>peak_market_cap_sol THEN ? ELSE peak_market_cap_sol END,updated_at=? WHERE mint=?`), marketCapSOL, marketCapSOL, marketCapSOL, time.Now().UTC(), mint)
 	return e
+}
+func (d *DB) UpdateVerifiedPaperMark(mint string, marketCapSOL, tokenPriceSOL float64) error {
+	return d.updateVerifiedMark("paper_marks", mint, marketCapSOL, tokenPriceSOL)
+}
+func (d *DB) UpdateVerifiedLiveMark(mint string, marketCapSOL, tokenPriceSOL float64) error {
+	return d.updateVerifiedMark("live_marks", mint, marketCapSOL, tokenPriceSOL)
+}
+func (d *DB) updateVerifiedMark(table, mint string, marketCapSOL, tokenPriceSOL float64) error {
+	if marketCapSOL <= 0 || tokenPriceSOL <= 0 {
+		return nil
+	}
+	d.markMu.Lock()
+	defer d.markMu.Unlock()
+	now := time.Now().UTC()
+	_, err := d.Exec(d.bind(`UPDATE `+table+` SET
+		current_market_cap_sol=?,
+		entry_market_cap_sol=CASE WHEN entry_token_price_sol<=0 THEN ? ELSE entry_market_cap_sol END,
+		peak_market_cap_sol=CASE WHEN entry_token_price_sol<=0 THEN ? WHEN ?>peak_market_cap_sol THEN ? ELSE peak_market_cap_sol END,
+		current_token_price_sol=?,
+		peak_token_price_sol=CASE WHEN ?>peak_token_price_sol THEN ? ELSE peak_token_price_sol END,
+		entry_token_price_sol=CASE WHEN entry_token_price_sol<=0 THEN ? ELSE entry_token_price_sol END,
+		price_source=?,updated_at=? WHERE mint=?`),
+		marketCapSOL, marketCapSOL, marketCapSOL, marketCapSOL, marketCapSOL,
+		tokenPriceSOL, tokenPriceSOL, tokenPriceSOL, tokenPriceSOL,
+		VerifiedPositionPriceSource, now, mint)
+	return err
+}
+
+func (d *DB) PositionMarkPrices(mint string, simulation bool) (entry, current, peak float64, source, updatedAt string, known bool, err error) {
+	table := "live_marks"
+	if simulation {
+		table = "paper_marks"
+	}
+	err = d.QueryRow(d.bind(`SELECT entry_token_price_sol,current_token_price_sol,peak_token_price_sol,
+		price_source,COALESCE(CAST(updated_at AS TEXT),'') FROM `+table+` WHERE mint=?`), mint).
+		Scan(&entry, &current, &peak, &source, &updatedAt)
+	if err == sql.ErrNoRows {
+		return 0, 0, 0, "", "", false, nil
+	}
+	return entry, current, peak, source, updatedAt, err == nil, err
+}
+
+func (d *DB) PaperSpotReturnPct(mint string) (float64, bool, error) {
+	return d.markSpotReturnPct("paper_marks", mint, false)
+}
+func (d *DB) LiveSpotReturnPct(mint string) (float64, bool, error) {
+	return d.markSpotReturnPct("live_marks", mint, false)
+}
+func (d *DB) PaperPeakSpotReturnPct(mint string) (float64, bool, error) {
+	return d.markSpotReturnPct("paper_marks", mint, true)
+}
+func (d *DB) LivePeakSpotReturnPct(mint string) (float64, bool, error) {
+	return d.markSpotReturnPct("live_marks", mint, true)
+}
+func (d *DB) markSpotReturnPct(table, mint string, peak bool) (float64, bool, error) {
+	target := "current_token_price_sol"
+	if peak {
+		target = "peak_token_price_sol"
+	}
+	var entry, current float64
+	var source string
+	err := d.QueryRow(d.bind(`SELECT entry_token_price_sol,`+target+`,price_source FROM `+table+` WHERE mint=?`), mint).
+		Scan(&entry, &current, &source)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if source != VerifiedPositionPriceSource || entry <= 0 || current <= 0 {
+		return 0, false, nil
+	}
+	return (current - entry) / entry * 100, true, nil
 }
 func (d *DB) PaperReturnPct(mint string) (float64, bool, error) {
 	return d.markReturnPct("paper_marks", mint)
@@ -1070,16 +1169,35 @@ func (d *DB) SetTradeExecution(id string, executed, fees, pnl float64) error {
 	return e
 }
 func (d *DB) PaperOpenPnlSOL() (float64, error) {
-	return d.OpenPnlSOL(true)
+	return d.OpenPnlSOLFresh(true, time.Now().UTC().Add(-2*time.Minute))
 }
 func (d *DB) OpenPnlSOL(simulation bool) (float64, error) {
 	marks := "live_marks"
 	if simulation {
 		marks = "paper_marks"
 	}
+	return d.openPnlSOLFromMarks(marks, VerifiedPositionPriceSource, time.Time{})
+}
+
+func (d *DB) OpenPnlSOLFresh(simulation bool, staleBefore time.Time) (float64, error) {
+	marks := "live_marks"
+	if simulation {
+		marks = "paper_marks"
+	}
+	return d.openPnlSOLFromMarks(marks, VerifiedPositionPriceSource, staleBefore)
+}
+
+func (d *DB) openPnlSOLFromMarks(marks, source string, staleBefore time.Time) (float64, error) {
 	var pnl float64
-	query := `SELECT COALESCE(SUM(p.cost_sol * (m.current_market_cap_sol - m.entry_market_cap_sol) / NULLIF(m.entry_market_cap_sol,0)),0) FROM positions p JOIN ` + marks + ` m ON m.mint=p.mint WHERE p.status='open' AND p.cost_sol>0`
-	e := d.QueryRow(query).Scan(&pnl)
+	query := `SELECT COALESCE(SUM(p.cost_sol * (m.current_token_price_sol - m.entry_token_price_sol) / NULLIF(m.entry_token_price_sol,0)),0)
+		FROM positions p JOIN ` + marks + ` m ON m.mint=p.mint
+		WHERE p.status='open' AND p.cost_sol>0 AND m.price_source=?`
+	args := []any{source}
+	if !staleBefore.IsZero() {
+		query += ` AND m.updated_at>=?`
+		args = append(args, staleBefore)
+	}
+	e := d.QueryRow(d.bind(query), args...).Scan(&pnl)
 	return pnl, e
 }
 func (d *DB) UnmarkedOpenPositionCount(simulation bool) (int, error) {
@@ -1089,8 +1207,9 @@ func (d *DB) UnmarkedOpenPositionCount(simulation bool) (int, error) {
 	}
 	var count int
 	query := `SELECT COUNT(*) FROM positions p LEFT JOIN ` + marks + ` m ON m.mint=p.mint
-		WHERE p.status='open' AND (COALESCE(p.cost_sol,0)<=0 OR m.mint IS NULL OR m.entry_market_cap_sol<=0 OR m.current_market_cap_sol<=0)`
-	err := d.QueryRow(query).Scan(&count)
+		WHERE p.status='open' AND (COALESCE(p.cost_sol,0)<=0 OR m.mint IS NULL OR
+		m.entry_token_price_sol<=0 OR m.current_token_price_sol<=0 OR m.price_source<>?)`
+	err := d.QueryRow(d.bind(query), VerifiedPositionPriceSource).Scan(&count)
 	return count, err
 }
 func (d *DB) TradeCostsSOL() (float64, error) {
@@ -1243,6 +1362,7 @@ func (d *DB) ListPositionsForMode(simulation bool) (*sql.Rows, error) {
 	}
 	query := `SELECT p.mint,p.quantity,COALESCE(p.cost_sol,0),p.status,p.opened_at,p.updated_at,
 		COALESCE(m.entry_market_cap_sol,0),COALESCE(m.current_market_cap_sol,0),COALESCE(CAST(m.updated_at AS TEXT),''),
+		COALESCE(m.price_source,'unverified'),COALESCE(m.entry_token_price_sol,0),COALESCE(m.current_token_price_sol,0),
 		COALESCE((SELECT SUM(t.fees_sol) FROM trades t WHERE t.mint=p.mint
 			AND t.state IN ('simulated','confirmed','finalized') AND t.fees_sol IS NOT NULL),0),
 		(SELECT SUM(t.realized_pnl_sol) FROM trades t WHERE t.mint=p.mint AND t.side='sell'
@@ -1276,8 +1396,8 @@ marks = "paper_marks"
 }
 rows, err := d.Query(d.bind(`SELECT p.mint FROM positions p
 LEFT JOIN `+marks+` m ON m.mint=p.mint
-WHERE p.status='open' AND (m.mint IS NULL OR m.updated_at<=?)
-ORDER BY p.updated_at`), staleBefore)
+		WHERE p.status='open' AND (m.mint IS NULL OR m.price_source<>? OR m.updated_at<=?)
+		ORDER BY p.updated_at`), VerifiedPositionPriceSource, staleBefore)
 if err != nil {
 return nil, err
 }

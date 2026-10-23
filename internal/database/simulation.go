@@ -341,7 +341,7 @@ func (d *DB) LiveUnlockSummary() (SimulationSummary, error) {
 	if err != nil {
 		return SimulationSummary{}, err
 	}
-	openPnl, err := d.OpenPnlSOL(true)
+	openPnl, err := d.OpenPnlSOLFresh(true, time.Now().UTC().Add(-2*time.Minute))
 	if err != nil {
 		return SimulationSummary{}, err
 	}

@@ -104,7 +104,7 @@ func (s *Server) simulationReport(w http.ResponseWriter, r *http.Request) {
 		"byHour":          byHour,
 		"paperReadiness":  s.paperReadiness(),
 		"feeModel":        "paper transaction fees = configured priority-fee cap plus SIMULATION_BASE_FEE_SOL; venue/rent/slippage costs are not fully simulated",
-		"openPnlBasis":    "market_cap_ratio_estimate",
+"openPnlBasis":    "bonding_curve_spot_price_ratio_estimate",
 	})
 }
 
@@ -126,7 +126,7 @@ func (s *Server) simulationReportData(run database.SimulationRun, from, to time.
 	if err != nil {
 		return database.SimulationSummary{}, nil, 0, err
 	}
-	openPnl, err := s.db.OpenPnlSOL(true)
+	openPnl, err := s.db.OpenPnlSOLFresh(true, s.positionMarkCutoff(time.Now().UTC()))
 	if err != nil {
 		return database.SimulationSummary{}, nil, 0, err
 	}
