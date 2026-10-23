@@ -1,0 +1,5 @@
+ALTER TABLE trades ADD COLUMN effective_price_sol REAL NOT NULL DEFAULT 0;
+ALTER TABLE trades ADD COLUMN quote_observed_at TEXT;
+ALTER TABLE trades ADD COLUMN quote_age_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE trades ADD COLUMN curve_impact_bps REAL NOT NULL DEFAULT 0;
+ALTER TABLE trades ADD COLUMN minimum_output_sol REAL NOT NULL DEFAULT 0;

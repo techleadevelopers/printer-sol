@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net/http"
 	"sync"
 	"time"
@@ -233,37 +234,36 @@ func (m *Manager) Balance(ctx context.Context, address string) (uint64, error) {
 // already fully sold). RPC/transport errors are returned so callers can decide
 // whether to proceed; a confirmed zero is what triggers orphan-position
 // quarantine in execution.CloseLivePosition.
-func (m *Manager) TokenBalance(ctx context.Context, owner solana.PublicKey, mint string) (uint64, error) {
+func (m *Manager) TokenBalance(ctx context.Context, owner solana.PublicKey, mint string) (uint64, uint8, error) {
 	mintKey, err := solana.PublicKeyFromBase58(mint)
 	if err != nil {
-		return 0, fmt.Errorf("parse mint public key: %w", err)
+		return 0, 0, fmt.Errorf("parse mint public key: %w", err)
 	}
 	ata, _, err := solana.FindAssociatedTokenAddress(owner, mintKey)
 	if err != nil {
-		return 0, fmt.Errorf("derive associated token account: %w", err)
+		return 0, 0, fmt.Errorf("derive associated token account: %w", err)
 	}
 	u, err := m.currentURL()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	var r struct {
 		Value *struct {
-			Amount string `json:"amount"`
+			Amount   string `json:"amount"`
+			Decimals uint8  `json:"decimals"`
 		} `json:"value"`
 	}
 	if err = m.call(ctx, u, "getTokenAccountBalance", []any{ata.String(), map[string]any{"commitment": "confirmed"}}, &r); err != nil {
-		// A missing ATA surfaces as an RPC error ("could not find account").
-		// Treat it as a confirmed zero balance: the wallet holds no tokens.
-		return 0, nil
+		return 0, 0, fmt.Errorf("read confirmed token balance: %w", err)
 	}
 	if r.Value == nil || r.Value.Amount == "" {
-		return 0, nil
+		return 0, 0, fmt.Errorf("RPC returned no confirmed token balance")
 	}
 	var amount uint64
 	if _, err = fmt.Sscanf(r.Value.Amount, "%d", &amount); err != nil {
-		return 0, fmt.Errorf("decode token account balance: %w", err)
+		return 0, 0, fmt.Errorf("decode token account balance: %w", err)
 	}
-	return amount, nil
+	return amount, r.Value.Decimals, nil
 }
 
 const pumpFunProgramID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -277,6 +277,7 @@ type BondingCurveState struct {
 	Complete             bool
 	MarketCapSOL         float64
 	SpotPriceSOL         float64
+	ObservedAt           time.Time
 }
 
 // GetBondingCurveState reads Pump.fun's bonding-curve PDA via getAccountInfo
@@ -371,6 +372,7 @@ func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint stri
 		state.MarketCapSOL <= 0 || math.IsNaN(state.MarketCapSOL) || math.IsInf(state.MarketCapSOL, 0) {
 		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0}, nil
 	}
+	state.ObservedAt = time.Now().UTC()
 	return state, nil
 }
 
@@ -407,19 +409,38 @@ func (m *Manager) BondingCurvePositionMetrics(ctx context.Context, mint string) 
 	return state.MarketCapSOL, state.SpotPriceSOL, nil
 }
 
-// Execution reads the confirmed transaction receipt and returns the SOL delta
-// for the operational wallet plus the network fee. Live P&L must use this
-// ledger data rather than a market-cap estimate.
-func (m *Manager) Execution(ctx context.Context, signature, address string) (float64, float64, error) {
+type ExecutionTokenBalance struct {
+	Mint   string `json:"mint"`
+	Owner  string `json:"owner"`
+	Amount struct {
+		Amount   string `json:"amount"`
+		Decimals uint8  `json:"decimals"`
+	} `json:"uiTokenAmount"`
+}
+
+// ExecutionReceipt contains wallet SOL movement and the token balance delta
+// reported by the confirmed transaction metadata.
+type ExecutionReceipt struct {
+	SOLDelta      float64
+	FeesSOL       float64
+	TokenDeltaRaw string
+	TokenDecimals uint8
+}
+
+// Execution reads confirmed transaction metadata. Callers use the wallet delta
+// and fee independently, and persist the token amount actually settled.
+func (m *Manager) Execution(ctx context.Context, signature, address, mint string) (ExecutionReceipt, error) {
 	u, err := m.currentURL()
 	if err != nil {
-		return 0, 0, err
+		return ExecutionReceipt{}, err
 	}
 	var receipt struct {
 		Meta *struct {
 			Fee          uint64   `json:"fee"`
 			PreBalances  []uint64 `json:"preBalances"`
 			PostBalances []uint64 `json:"postBalances"`
+			PreTokenBalances  []ExecutionTokenBalance `json:"preTokenBalances"`
+			PostTokenBalances []ExecutionTokenBalance `json:"postTokenBalances"`
 		} `json:"meta"`
 		Transaction struct {
 			Message struct {
@@ -431,16 +452,62 @@ func (m *Manager) Execution(ctx context.Context, signature, address string) (flo
 		"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0,
 	}}, &receipt)
 	if err != nil {
-		return 0, 0, err
+		return ExecutionReceipt{}, err
 	}
 	if receipt.Meta == nil || len(receipt.Meta.PreBalances) != len(receipt.Meta.PostBalances) || len(receipt.Meta.PreBalances) != len(receipt.Transaction.Message.AccountKeys) {
-		return 0, 0, fmt.Errorf("incomplete confirmed transaction metadata")
+		return ExecutionReceipt{}, fmt.Errorf("incomplete confirmed transaction metadata")
 	}
+	var solDelta float64
+	foundWallet := false
 	for i, key := range receipt.Transaction.Message.AccountKeys {
 		if key == address {
 			delta := int64(receipt.Meta.PostBalances[i]) - int64(receipt.Meta.PreBalances[i])
-			return float64(delta) / 1e9, float64(receipt.Meta.Fee) / 1e9, nil
+			solDelta = float64(delta) / 1e9
+			foundWallet = true
+			break
 		}
 	}
-	return 0, 0, fmt.Errorf("operational wallet missing from confirmed transaction")
+	if !foundWallet {
+		return ExecutionReceipt{}, fmt.Errorf("operational wallet missing from confirmed transaction")
+	}
+	pre, preDecimals, err := sumTokenBalances(receipt.Meta.PreTokenBalances, address, mint)
+	if err != nil {
+		return ExecutionReceipt{}, err
+	}
+	post, postDecimals, err := sumTokenBalances(receipt.Meta.PostTokenBalances, address, mint)
+	if err != nil {
+		return ExecutionReceipt{}, err
+	}
+	if preDecimals != postDecimals {
+		return ExecutionReceipt{}, fmt.Errorf("token decimals changed within confirmed transaction")
+	}
+	delta := new(big.Int).Sub(post, pre)
+	return ExecutionReceipt{
+		SOLDelta:      solDelta,
+		FeesSOL:       float64(receipt.Meta.Fee) / 1e9,
+		TokenDeltaRaw: delta.String(),
+		TokenDecimals: preDecimals,
+	}, nil
+}
+
+func sumTokenBalances(balances []ExecutionTokenBalance, owner, mint string) (*big.Int, uint8, error) {
+	total := new(big.Int)
+	var decimals uint8
+	found := false
+	for _, balance := range balances {
+		if balance.Owner != owner || balance.Mint != mint {
+			continue
+		}
+		amount, ok := new(big.Int).SetString(balance.Amount.Amount, 10)
+		if !ok || amount.Sign() < 0 {
+			return nil, 0, fmt.Errorf("invalid confirmed token amount in transaction metadata")
+		}
+		if found && decimals != balance.Amount.Decimals {
+			return nil, 0, fmt.Errorf("inconsistent token decimals in transaction metadata")
+		}
+		decimals = balance.Amount.Decimals
+		found = true
+		total.Add(total, amount)
+	}
+	return total, decimals, nil
 }

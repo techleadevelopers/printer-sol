@@ -94,7 +94,9 @@ func main() {
 
 	limits := execution.Limits{
 		MaxTradeSOL: cfg.MaxTradeSOL, MaxExposureSOL: cfg.MaxExposureSOL, MaxDailyLossSOL: cfg.MaxDailyLossSOL,
-		MaxSlippagePct: cfg.MaxSlippagePct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL,
+		MaxSlippagePct: cfg.MaxSlippagePct, MaxSlippageBPS: cfg.MaxSlippageBPS,
+		MaxQuoteAgeMS: cfg.MaxQuoteAgeMS, MaxCurveImpactBPS: cfg.MaxCurveImpactBPS,
+		MaxLossPerTradePct: cfg.StopLossPct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL,
 		SimulationBaseFeeSOL: cfg.SimulationBaseFeeSOL, MaxOpenPositions: cfg.MaxOpenPositions,
 		MaxWaitSeconds: cfg.MaxConfirmationWaitSeconds, MaxAttempts: cfg.MaxSubmissionAttempts,
 		SkipPreflight: cfg.SkipPreflight,
@@ -108,7 +110,7 @@ func main() {
 
 	monitor := tokenmonitor.New(
 		cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine,
-		cfg.TradeUSD, cfg.MaxSlippagePct, cfg.MaxPriorityFeeSOL,
+		cfg.TradeUSD, float64(cfg.MaxSlippageBPS)/100, cfg.MaxPriorityFeeSOL,
 		cfg.TakeProfitGrossPct, cfg.StopLossPct,
 		time.Duration(cfg.MaxHoldSeconds)*time.Second, cfg.Simulation, bus, log,
 		tokenmonitor.Settings{

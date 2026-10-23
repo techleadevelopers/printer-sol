@@ -18,7 +18,7 @@ type Config struct {
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds, StuckExitQuarantineSeconds int
-	SnipeConcurrency, SnipeTimeoutMS, DedupeTTLMS                                                                                                                                                           int
+	SnipeConcurrency, SnipeTimeoutMS, DedupeTTLMS, MaxSlippageBPS, MaxQuoteAgeMS, MaxCurveImpactBPS                                                                                                                                                           int
 	EntryDelaySeconds, PricePollSeconds                                                                                                                                                                      int
 	MinVolumeBeforeBuySOL, MaxVolumeBeforeBuySOL, MinMarketCapSOL, MaxMarketCapSOL                                                             float64
 	TrailingStopArmPct, ExitTriggerBufferPct                                                                                                                                                               float64
@@ -91,6 +91,15 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.MaxSlippagePct, err = floatEnv("MAX_SLIPPAGE_PCT", 15); err != nil {
+		return c, err
+	}
+	if c.MaxSlippageBPS, err = requiredIntEnv("MAX_SLIPPAGE_BPS"); err != nil {
+		return c, err
+	}
+	if c.MaxQuoteAgeMS, err = requiredIntEnv("MAX_QUOTE_AGE_MS"); err != nil {
+		return c, err
+	}
+	if c.MaxCurveImpactBPS, err = requiredIntEnv("MAX_CURVE_IMPACT_BPS"); err != nil {
 		return c, err
 	}
 	if c.MaxPriorityFeeSOL, err = floatEnv("MAX_PRIORITY_FEE_SOL", .001); err != nil {
@@ -234,6 +243,15 @@ func Load() (Config, error) {
 	if c.MaxSlippagePct <= 0 {
 		return c, fmt.Errorf("MAX_SLIPPAGE_PCT must be positive to bound curve execution slippage")
 	}
+	if c.MaxSlippageBPS < 1 || c.MaxSlippageBPS > 10000 {
+		return c, fmt.Errorf("MAX_SLIPPAGE_BPS must be between 1 and 10000")
+	}
+	if c.MaxQuoteAgeMS < 1 || c.MaxQuoteAgeMS > 120000 {
+		return c, fmt.Errorf("MAX_QUOTE_AGE_MS must be between 1 and 120000")
+	}
+	if c.MaxCurveImpactBPS < 1 || c.MaxCurveImpactBPS > 10000 {
+		return c, fmt.Errorf("MAX_CURVE_IMPACT_BPS must be between 1 and 10000")
+	}
 	if !c.Simulation && (!c.EnableLiveTrading || c.PrivateKey == "" || c.KeyProviderRef == "" || c.WalletPublicAddress == "" || c.PumpPortalKey == "") {
 		return c, fmt.Errorf("live trading requires ENABLE_LIVE_TRADING=true, BOT_PRIVATE_KEY via KEY_PROVIDER_REF, WALLET_PUBLIC_ADDRESS and PUMPPORTAL_API_KEY")
 	}
@@ -318,6 +336,18 @@ func intEnv(k string, d int) (int, error) {
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
 		return 0, fmt.Errorf("%s must be an integer (got %q): %w", k, v, err)
+	}
+	return parsed, nil
+}
+
+func requiredIntEnv(k string) (int, error) {
+	v, ok := os.LookupEnv(k)
+	if !ok || strings.TrimSpace(v) == "" {
+		return 0, fmt.Errorf("%s must be explicitly configured from execution data", k)
+	}
+	parsed, err := strconv.Atoi(cleanScalar(v))
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer (got %q): %w", k, cleanScalar(v), err)
 	}
 	return parsed, nil
 }

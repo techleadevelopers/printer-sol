@@ -4,6 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
+	"math/big"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,9 +29,12 @@ type Request struct {
 	Slippage, PriorityFee float64
 	Pool, Reason          string
 	SellAll               bool
+	RequestedValueSOL     float64
 }
 type Limits struct {
 	MaxTradeSOL, MaxExposureSOL, MaxDailyLossSOL, MaxSlippagePct, MaxPriorityFeeSOL, FeeReserveSOL float64
+	MaxLossPerTradePct                                                                            float64
+	MaxSlippageBPS, MaxQuoteAgeMS, MaxCurveImpactBPS                                               int
 	SimulationBaseFeeSOL                                                                         float64
 	MaxOpenPositions, MaxWaitSeconds, MaxAttempts                                                  int
 	SkipPreflight                                                                                 bool
@@ -48,6 +55,17 @@ type Engine struct {
 	mu                sync.RWMutex
 	limits            Limits
 	reserved          map[string]uint64
+}
+
+type livePreparation struct {
+	amount              any
+	denominatedInSOL    bool
+	slippage            float64
+	quotedAt            time.Time
+	quoteAgeLimit       int
+	curveImpactBPS      float64
+	minimumOutputSOL    float64
+	requestedValueSOL   float64
 }
 
 func New(db *database.DB, w *wallet.Wallet, p *pumpportal.Client, r *rpcmanager.Manager, prices pricefeed.Provider, l *zap.Logger, sim bool, simulationBalanceSOL float64, c *bot.Controller, b *events.Bus, limits Limits) *Engine {
@@ -301,7 +319,7 @@ func (e *Engine) reconcileRows(ctx context.Context, rows *sql.Rows) error {
 		}
 		switch status {
 		case "confirmed", "finalized":
-			execution, fee, executionErr := e.rpcs.Execution(ctx, trade.signature, e.wallet.Address())
+			receipt, executionErr := e.rpcs.Execution(ctx, trade.signature, e.wallet.Address(), trade.mint)
 			if executionErr != nil {
 				_ = e.db.UpdateTradeState(trade.id, "unknown", trade.signature, false)
 				e.emit("operational_error", map[string]any{"component": "reconciliation", "tradeId": trade.id, "message": "confirmed transaction execution unavailable"})
@@ -310,16 +328,28 @@ func (e *Engine) reconcileRows(ctx context.Context, rows *sql.Rows) error {
 			var finalizeErr error
 			switch trade.side {
 			case "buy":
-				if execution >= 0 {
+				quantity, quantityValue, quantityErr := confirmedTokenQuantity(receipt.TokenDeltaRaw, receipt.TokenDecimals, 1)
+				if receipt.SOLDelta >= 0 || quantityErr != nil {
 					finalizeErr = fmt.Errorf("confirmed buy did not debit operational wallet")
 				} else {
-					finalizeErr = e.db.FinalizeLiveBuy(trade.id, trade.mint, status, trade.signature, -execution, fee)
+					cost := -receipt.SOLDelta - receipt.FeesSOL
+					if cost <= 0 || quantityValue <= 0 {
+						finalizeErr = fmt.Errorf("confirmed buy has no positive swap cost or token receipt")
+					} else {
+						finalizeErr = e.db.FinalizeLiveBuy(trade.id, trade.mint, status, trade.signature, cost, receipt.FeesSOL, quantity)
+					}
 				}
 			case "sell":
-				if execution < 0 {
+				quantity, quantityValue, quantityErr := confirmedTokenQuantity(receipt.TokenDeltaRaw, receipt.TokenDecimals, -1)
+				if receipt.SOLDelta <= 0 || quantityErr != nil {
 					finalizeErr = fmt.Errorf("confirmed sell did not credit operational wallet")
 				} else {
-					finalizeErr = e.db.FinalizeLiveSell(trade.id, trade.mint, status, trade.signature, execution, fee)
+					value := receipt.SOLDelta + receipt.FeesSOL
+					if value <= 0 || quantityValue <= 0 {
+						finalizeErr = fmt.Errorf("confirmed sell has no positive SOL or token amount")
+					} else {
+						finalizeErr = e.db.FinalizeLiveSell(trade.id, trade.mint, status, trade.signature, value, receipt.FeesSOL, quantity)
+					}
 				}
 			default:
 				finalizeErr = fmt.Errorf("unsupported reconciled trade side %q", trade.side)
@@ -373,6 +403,9 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		}
 		if l.MaxSlippagePct > 0 && r.Slippage > l.MaxSlippagePct {
 			return "", fmt.Errorf("maximum slippage exceeded")
+		}
+		if l.MaxSlippageBPS > 0 && r.Slippage*100 > float64(l.MaxSlippageBPS) {
+			return "", fmt.Errorf("maximum slippage in basis points exceeded")
 		}
 		if l.MaxPriorityFeeSOL > 0 && r.PriorityFee > l.MaxPriorityFeeSOL {
 			return "", fmt.Errorf("maximum priority fee exceeded")
@@ -441,7 +474,11 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		// one base network fee. A round trip contains one buy and one sell.
 		simulationFees = r.PriorityFee + e.Limits().SimulationBaseFeeSOL
 	}
-	t := database.Trade{ID: id, Mint: r.Mint, Side: r.Side, Quantity: fmt.Sprint(r.Amount), Requested: r.Amount, Fees: simulationFees, Slippage: r.Slippage, State: "prepared", EntryReason: r.Reason, ExitReason: r.Reason}
+	requestedValue := r.Amount
+	if r.RequestedValueSOL > 0 {
+		requestedValue = r.RequestedValueSOL
+	}
+	t := database.Trade{ID: id, Mint: r.Mint, Side: r.Side, Quantity: fmt.Sprint(r.Amount), Requested: requestedValue, Fees: simulationFees, Slippage: r.Slippage, State: "prepared", EntryReason: r.Reason, ExitReason: r.Reason}
 	if err := e.db.InsertTrade(t); err != nil {
 		return "", err
 	}
@@ -461,11 +498,16 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		e.emit("position_updated", map[string]any{"mint": r.Mint, "sourceTradeId": id, "action": r.Side, "state": "simulated"})
 		return id, nil
 	}
-	amount := any(r.Amount)
-	if r.SellAll {
-		amount = "100%"
+	prepared, err := e.prepareLiveRequest(ctx, id, r)
+	if err != nil {
+		_ = e.db.MarkTradeFailed(id)
+		return id, err
 	}
-	txBytes, err := e.portal.Prepare(ctx, pumpportal.Request{PublicKey: e.wallet.Address(), Action: r.Side, Mint: r.Mint, Amount: amount, DenominatedInSOL: fmt.Sprint(r.DenominatedInSOL), Slippage: r.Slippage, PriorityFee: r.PriorityFee, Pool: r.Pool})
+	amount := any(prepared.amount)
+	if prepared.denominatedInSOL {
+		amount = r.Amount
+	}
+	txBytes, err := e.portal.Prepare(ctx, pumpportal.Request{PublicKey: e.wallet.Address(), Action: r.Side, Mint: r.Mint, Amount: amount, DenominatedInSOL: fmt.Sprint(prepared.denominatedInSOL), Slippage: prepared.slippage, PriorityFee: r.PriorityFee, Pool: r.Pool})
 	if err != nil {
 		_ = e.db.MarkTradeFailed(id)
 		return id, err
@@ -482,6 +524,17 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	if err = e.validatePreparedTransaction(tx); err != nil {
 		_ = e.db.MarkTradeFailed(id)
 		return id, fmt.Errorf("unsafe prepared transaction: %w", err)
+	}
+	if prepared.quoteAgeLimit > 0 {
+		quoteAge := time.Since(prepared.quotedAt)
+		if quoteAge < 0 || quoteAge > time.Duration(prepared.quoteAgeLimit)*time.Millisecond {
+			_ = e.db.MarkTradeFailed(id)
+			return id, fmt.Errorf("bonding-curve quote exceeded MAX_QUOTE_AGE_MS before submission")
+		}
+		if err = e.db.UpdateTradeQuote(id, prepared.quotedAt, quoteAge.Milliseconds(), prepared.curveImpactBPS, prepared.minimumOutputSOL, prepared.requestedValueSOL); err != nil {
+			_ = e.db.MarkTradeFailed(id)
+			return id, fmt.Errorf("persist execution quote: %w", err)
+		}
 	}
 	if !tx.IsSigner(e.wallet.PublicKey()) {
 		_ = e.db.MarkTradeFailed(id)
@@ -518,6 +571,113 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	e.emit(r.Side+"_sent", map[string]any{"tradeId": id, "mint": r.Mint, "signature": signature})
 	go e.confirm(id, signature, r)
 	return id, nil
+}
+
+func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Request) (livePreparation, error) {
+	limits := e.Limits()
+	if limits.MaxSlippageBPS < 1 || limits.MaxQuoteAgeMS < 1 || limits.MaxCurveImpactBPS < 1 {
+		return livePreparation{}, fmt.Errorf("live execution requires explicit slippage, quote-age, and curve-impact limits")
+	}
+	if request.Slippage*100 > float64(limits.MaxSlippageBPS) {
+		return livePreparation{}, fmt.Errorf("requested slippage exceeds MAX_SLIPPAGE_BPS")
+	}
+	state, err := e.rpcs.GetBondingCurveStateWithContext(ctx, request.Mint)
+	if err != nil {
+		return livePreparation{}, fmt.Errorf("fresh bonding-curve quote required: %w", err)
+	}
+	if state.Complete || state.VirtualSOLReserves == 0 || state.VirtualTokenReserves == 0 || state.ObservedAt.IsZero() {
+		return livePreparation{}, fmt.Errorf("bonding-curve quote is not usable for protected execution")
+	}
+	prepared := livePreparation{
+		denominatedInSOL: request.Side == "buy",
+		slippage:         request.Slippage,
+		quotedAt:         state.ObservedAt,
+		quoteAgeLimit:    limits.MaxQuoteAgeMS,
+		requestedValueSOL: request.Amount,
+	}
+	virtualSOL := float64(state.VirtualSOLReserves) / 1e9
+	virtualTokens := float64(state.VirtualTokenReserves) / 1e6
+	expectedSOL := 0.0
+
+	if request.Side == "buy" {
+		if request.Amount <= 0 || virtualSOL <= 0 {
+			return livePreparation{}, fmt.Errorf("invalid buy quote input")
+		}
+		prepared.amount = request.Amount
+		prepared.curveImpactBPS = request.Amount / (virtualSOL + request.Amount) * 10000
+		expectedTokens := virtualTokens * request.Amount / (virtualSOL + request.Amount)
+		if expectedTokens <= 0 || math.IsNaN(expectedTokens) || math.IsInf(expectedTokens, 0) {
+			return livePreparation{}, fmt.Errorf("bonding-curve buy quote is invalid")
+		}
+	} else {
+		raw, decimals, balanceErr := e.rpcs.TokenBalance(ctx, e.wallet.PublicKey(), request.Mint)
+		if balanceErr != nil {
+			return livePreparation{}, fmt.Errorf("confirmed wallet token balance required before selling: %w", balanceErr)
+		}
+		if raw == 0 {
+			return livePreparation{}, fmt.Errorf("wallet holds no confirmed tokens to sell")
+		}
+		if decimals != 6 {
+			return livePreparation{}, fmt.Errorf("unsupported token decimals for bonding-curve quote: %d", decimals)
+		}
+		tokenAmount := float64(raw) / math.Pow10(int(decimals))
+		if tokenAmount <= 0 || virtualTokens <= 0 {
+			return livePreparation{}, fmt.Errorf("invalid token amount or bonding-curve reserves")
+		}
+		prepared.amount = formatRawTokenAmount(raw, decimals)
+		prepared.curveImpactBPS = tokenAmount / (virtualTokens + tokenAmount) * 10000
+		expectedSOL = virtualSOL * tokenAmount / (virtualTokens + tokenAmount)
+		if expectedSOL <= 0 || math.IsNaN(expectedSOL) || math.IsInf(expectedSOL, 0) {
+			return livePreparation{}, fmt.Errorf("bonding-curve sell quote is invalid")
+		}
+		prepared.requestedValueSOL = expectedSOL
+
+		cost, costErr := e.db.PositionCost(request.Mint)
+		if costErr != nil {
+			return livePreparation{}, fmt.Errorf("confirmed entry cost required to protect the sell: %w", costErr)
+		}
+		if cost <= 0 {
+			return livePreparation{}, fmt.Errorf("confirmed entry cost must be positive to protect the sell")
+		}
+		maxLossFloor := cost * (1 - limits.MaxLossPerTradePct/100)
+		// Network fees are separate from the swap output; reserve the configured
+		// priority cap and base fee when enforcing the per-position loss floor.
+		maxLossFloor += limits.MaxPriorityFeeSOL + 0.000005
+		maxSlipBPS := math.Min(request.Slippage*100, float64(limits.MaxSlippageBPS))
+		minimumOutput := expectedSOL * (1 - maxSlipBPS/10000)
+		if maxLossFloor > minimumOutput {
+			minimumOutput = maxLossFloor
+		}
+		if minimumOutput <= 0 || minimumOutput >= expectedSOL {
+			return livePreparation{}, fmt.Errorf("quoted sale cannot satisfy the per-trade loss floor; position remains open")
+		}
+		prepared.minimumOutputSOL = minimumOutput
+		prepared.slippage = (expectedSOL - minimumOutput) / expectedSOL * 100
+		if prepared.slippage*100 > float64(limits.MaxSlippageBPS)+1e-6 {
+			return livePreparation{}, fmt.Errorf("loss floor would require slippage above MAX_SLIPPAGE_BPS")
+		}
+	}
+
+	if prepared.curveImpactBPS > float64(limits.MaxCurveImpactBPS) {
+		return livePreparation{}, fmt.Errorf("estimated curve impact %.1f bps exceeds MAX_CURVE_IMPACT_BPS", prepared.curveImpactBPS)
+	}
+	return prepared, nil
+}
+
+func formatRawTokenAmount(raw uint64, decimals uint8) string {
+	value := strconv.FormatUint(raw, 10)
+	if decimals == 0 {
+		return value
+	}
+	for len(value) <= int(decimals) {
+		value = "0" + value
+	}
+	point := len(value) - int(decimals)
+	whole, fraction := value[:point], strings.TrimRight(value[point:], "0")
+	if fraction == "" {
+		return whole
+	}
+	return whole + "." + fraction
 }
 
 // resolveSimulationSellFinalizationError classifies the outcome of a failed
@@ -685,6 +845,33 @@ func (e *Engine) resolveSellFinalizationError(
 	return nil
 }
 
+func confirmedTokenQuantity(raw string, decimals uint8, expectedSign int) (string, float64, error) {
+	value, ok := new(big.Int).SetString(raw, 10)
+	if !ok || value.Sign() == 0 || (expectedSign > 0 && value.Sign() < 0) || (expectedSign < 0 && value.Sign() > 0) {
+		return "", 0, fmt.Errorf("confirmed transaction has no expected token balance delta")
+	}
+	value.Abs(value)
+	digits := value.String()
+	if decimals == 0 {
+		amount, err := strconv.ParseFloat(digits, 64)
+		return digits, amount, err
+	}
+	for len(digits) <= int(decimals) {
+		digits = "0" + digits
+	}
+	point := len(digits) - int(decimals)
+	whole, fraction := digits[:point], strings.TrimRight(digits[point:], "0")
+	quantity := whole
+	if fraction != "" {
+		quantity += "." + fraction
+	}
+	amount, err := strconv.ParseFloat(quantity, 64)
+	if err != nil || amount <= 0 {
+		return "", 0, fmt.Errorf("confirmed token quantity cannot be represented")
+	}
+	return quantity, amount, nil
+}
+
 func (e *Engine) confirm(id, sig string, r Request) {
 	defer e.release(r.Mint)
 	wait := e.Limits().MaxWaitSeconds
@@ -706,32 +893,45 @@ func (e *Engine) confirm(id, sig string, r Request) {
 		if err == nil {
 			switch state {
 			case "confirmed", "finalized":
-				execution, fee, executionErr := e.rpcs.Execution(ctx, sig, e.wallet.Address())
+				receipt, executionErr := e.rpcs.Execution(ctx, sig, e.wallet.Address(), r.Mint)
 				if executionErr != nil {
 					_ = e.db.UpdateTradeState(id, "unknown", sig, false)
 					e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed transaction lacks verified execution data"})
 					return
 				}
 				if r.Side == "buy" {
-					if execution >= 0 { // a buy must debit the operational wallet
+					quantity, quantityValue, quantityErr := confirmedTokenQuantity(receipt.TokenDeltaRaw, receipt.TokenDecimals, 1)
+					if receipt.SOLDelta >= 0 || quantityErr != nil { // buy must debit SOL and receive tokens
 						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
-						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "buy confirmation did not debit operational wallet"})
+						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "buy confirmation lacks a verified SOL debit or token receipt"})
 						return
 					}
-					cost := -execution
-					if err = e.db.FinalizeLiveBuy(id, r.Mint, state, sig, cost, fee); err != nil {
+					cost := -receipt.SOLDelta - receipt.FeesSOL
+					if cost <= 0 || quantityValue <= 0 {
+						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
+						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed buy has invalid swap cost or token quantity"})
+						return
+					}
+					if err = e.db.FinalizeLiveBuy(id, r.Mint, state, sig, cost, receipt.FeesSOL, quantity); err != nil {
 						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
 						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed buy could not be committed to the live ledger"})
 						return
 					}
 				} else {
-					if execution < 0 {
+					quantity, quantityValue, quantityErr := confirmedTokenQuantity(receipt.TokenDeltaRaw, receipt.TokenDecimals, -1)
+					if receipt.SOLDelta <= 0 || quantityErr != nil {
 						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
-						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "sell confirmation lacks valid wallet credit"})
+						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "sell confirmation lacks verified SOL proceeds or token debit"})
 						return
 					}
-					if err = e.db.FinalizeLiveSell(id, r.Mint, state, sig, execution, fee); err != nil {
-						if resolutionErr := e.resolveLiveSellFinalizationError(id, r, fee, err); resolutionErr != nil {
+					value := receipt.SOLDelta + receipt.FeesSOL
+					if value <= 0 || quantityValue <= 0 {
+						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
+						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed sell has invalid SOL proceeds or token quantity"})
+						return
+					}
+					if err = e.db.FinalizeLiveSell(id, r.Mint, state, sig, value, receipt.FeesSOL, quantity); err != nil {
+						if resolutionErr := e.resolveLiveSellFinalizationError(id, r, receipt.FeesSOL, err); resolutionErr != nil {
 							e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "confirmed sell could not be committed to the live ledger"})
 						}
 						return
