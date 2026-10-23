@@ -1,8 +1,8 @@
 import { apiBaseUrl } from '@/services/api';
 
 export type BotEvent =
-  | { type: 'health' | 'bot.status' | 'bot.mode' | 'token.detected' | 'position.updated' | 'trade.updated' | 'rpc.updated' | 'log.created'; timestamp?: string; at?: string; [key: string]: unknown }
-  | { type: string; timestamp?: string; at?: string; [key: string]: unknown };
+  | { type: 'connection_ready' | 'health' | 'bot_state_changed' | 'bot_paused' | 'token_detected' | 'token_approved' | 'token_rejected' | 'entry_submitted' | 'entry_rejected' | 'position_updated' | 'position_mark_updated' | 'buy_sent' | 'buy_confirmed' | 'buy_failed' | 'sell_sent' | 'sell_confirmed' | 'sell_failed' | 'exit_triggered' | 'exit_retry_scheduled' | 'rpc_changed' | 'risk_alert' | 'risk.alert' | 'operational_error'; data?: unknown; timestamp?: string; at?: string; [key: string]: unknown }
+  | { type: string; data?: unknown; timestamp?: string; at?: string; [key: string]: unknown };
 
 export type EventState = 'connecting' | 'connected' | 'disconnected';
 
@@ -38,6 +38,8 @@ export function createEventSocket(handlers: EventHandlers) {
           handlers.onState('connected');
           return;
         }
+        authPending = true;
+        authTimer = setTimeout(() => current.close(), 4500);
         try {
           const token = await handlers.getAccessToken();
           if (closed || socket !== current || current.readyState !== WebSocket.OPEN) return;
@@ -45,9 +47,7 @@ export function createEventSocket(handlers: EventHandlers) {
             current.close();
             return;
           }
-          authPending = true;
           current.send(JSON.stringify({ type: 'auth', token }));
-          authTimer = setTimeout(() => current.close(), 10000);
         } catch {
           current.close();
         }
@@ -58,12 +58,14 @@ export function createEventSocket(handlers: EventHandlers) {
           if (!parsed || typeof parsed !== 'object' || !('type' in parsed)) return;
           const type = String(parsed.type);
           if (authPending) {
-            if (type === 'auth.accepted') {
+            if (type === 'auth.accepted' || type === 'connection_ready') {
               authPending = false;
               authenticated = true;
               if (authTimer) clearTimeout(authTimer);
               authTimer = undefined;
+              delay = 800;
               handlers.onState('connected');
+              if (type === 'connection_ready') handlers.onEvent(parsed as BotEvent);
             } else if (type === 'auth.rejected') {
               current.close();
             }

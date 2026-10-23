@@ -40,15 +40,9 @@ Generated mutation success is surfaced only when the backend returns `accepted: 
 
 ## WebSocket event contract
 
-`src/services/websocket.ts` expects JSON text frames with a string `type` and optional ISO `timestamp` at `/ws/events`. It reconnects with bounded backoff and ignores malformed frames. Supported event names that trigger generated-query refreshes:
+The Go API requires the client to send `{ "type": "auth", "token": "<session-token>" }` immediately after opening `/ws/events`. The server confirms the authenticated session with a `connection_ready` event; it does not send `auth.accepted`. Event frames use the envelope `{ "type": string, "data": object, "at": "<RFC3339>" }`.
 
-- `health`
-- `bot.status`, `bot.mode`
-- `token.detected`
-- `position.updated`
-- `trade.updated`
-- `rpc.updated`
-- `log.created`
+`src/services/websocket.ts` recognizes `connection_ready` as the authentication acknowledgement, reconnects with bounded backoff, and ignores malformed frames. Events use the backend's names (including underscores), such as `bot_state_changed`, `token_detected`, `token_approved`, `token_rejected`, `entry_submitted`, `entry_rejected`, `buy_sent`, `buy_confirmed`, `buy_failed`, `sell_sent`, `sell_confirmed`, `sell_failed`, `position_updated`, `position_mark_updated`, `exit_triggered`, `exit_retry_scheduled`, `rpc_changed`, `risk_alert`, `risk.alert`, and `operational_error`. These events invalidate the matching dashboard, token, position, trade, RPC, health, wallet, performance-report, and log queries. HTTP polling remains enabled as a fallback while the event stream is disconnected.
 
 The UI does not treat a WebSocket event as a transaction or action confirmation; the HTTP API response remains authoritative. Set `VITE_WS_URL` to the full `ws://` or `wss://` event URL if it differs from the API host's `/ws/events`.
 

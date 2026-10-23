@@ -153,7 +153,6 @@ function useEventMonitor() {
     onState: next => {
       setState(next);
       if (next === 'connected') {
-        qc.removeQueries();
         void qc.invalidateQueries();
       }
     },
@@ -163,21 +162,27 @@ function useEventMonitor() {
       const invalidate = (queryKey: readonly unknown[]) => {
         void qc.invalidateQueries({ queryKey });
       };
+      if (type === 'connection.ready') {
+        void qc.invalidateQueries();
+        return;
+      }
       if (type.startsWith('bot.') || type === 'health') {
         invalidate(getGetDashboardQueryKey());
         invalidate(getGetHealthQueryKey());
       }
-      if (type.startsWith('token.')) {
+      if (type.startsWith('token.') || type.startsWith('entry.')) {
         invalidate(getGetTokensQueryKey());
         invalidate(getGetDashboardQueryKey());
       }
       if (type.startsWith('position.')) {
         invalidate(getGetPositionsQueryKey());
+        invalidate(getGetTokensQueryKey());
         invalidate(getGetDashboardQueryKey());
         invalidate(['performance-report']);
       }
       if (['trade.', 'buy.', 'sell.', 'entry.', 'exit.'].some(prefix => type.startsWith(prefix))) {
         invalidate(getGetTradesQueryKey());
+        invalidate(getGetTokensQueryKey());
         invalidate(getGetPositionsQueryKey());
         invalidate(getGetDashboardQueryKey());
         invalidate(getGetWalletQueryKey());
@@ -204,7 +209,6 @@ function AppShell({ children }: { children: ReactNode }) {
   const user: { primaryEmailAddress?: { emailAddress?: string } } | null = null;
   const health = useGetHealth({ query: { queryKey: getGetHealthQueryKey(), refetchInterval: 15000 } });
   const liveDashboard = useGetDashboard({ query: { queryKey: getGetDashboardQueryKey(), refetchInterval: LIVE_DATA_REFRESH_MS } });
-  const stream = health.data?.eventMonitorStatus;
   const [mobileMenu, setMobileMenu] = useState(false);
   const current = titleMap[path] || 'Centro de operações';
   return <EventMonitorContext.Provider value={eventMonitor}><div className="shell flex">
@@ -216,14 +220,14 @@ function AppShell({ children }: { children: ReactNode }) {
       <div className="eyebrow mb-2 px-3">WORKSPACE</div>
       <nav className="flex flex-1 flex-col gap-1" aria-label="Navegação principal">{navItems.map(({ href, label, icon: Icon }) => <Link href={href} key={href} className={`nav-link ${path === href ? 'active' : ''}`} aria-current={path === href ? 'page' : undefined} data-testid={`link-nav-${href.split('/').at(-1) || 'dashboard'}`}><Icon size={17} /><span className="nav-label">{label}</span></Link>)}</nav>
       <div className="side-foot mt-6 border-t border-[hsl(var(--border))] px-3 pt-4">
-        <div className="flex items-center gap-2 text-xs"><span className={`status-dot ${stream === 'connected' ? 'positive' : stream === 'disconnected' ? 'warning' : 'technical'}`} /> Monitor de eventos <span className="ml-auto muted">{stream === 'connected' ? 'Ligado' : stream === 'disconnected' ? 'Desligado' : 'Indisponível'}</span></div>
+        <div className="flex items-center gap-2 text-xs"><span className={`status-dot ${eventMonitor.state === 'connected' ? 'positive' : eventMonitor.state === 'disconnected' ? 'warning' : 'technical'}`} /> Socket do painel <span className="ml-auto muted">{eventMonitor.state === 'connected' ? 'Ligado' : eventMonitor.state === 'disconnected' ? 'Desligado' : 'A ligar'}</span></div>
         <div className="mt-2 text-[10px] muted">{apiConnectionLabel}</div>
       </div>
     </aside>
     <main className="main-area">
       <header className="topbar flex items-center justify-between px-4 sm:px-6">
-         <div className="flex items-center gap-3"><button className="button button-small md:hidden" aria-label="Abrir navegação" onClick={() => setMobileMenu(!mobileMenu)}><Menu size={16} /></button><span className="text-sm font-medium">{current}</span><span className="flex items-center gap-2 rounded border border-[hsl(var(--border))] px-2 py-1 text-[10px] mono sm:inline-flex"><span className="eyebrow">MODO</span><span className={liveDashboard.data?.mode === 'simulation' ? 'positive' : liveDashboard.data?.mode === 'real' ? 'warning' : 'muted'}>{liveDashboard.data?.mode === 'simulation' ? 'SIMULAÇÃO PAPER' : liveDashboard.data?.mode === 'real' ? 'SNIPER REAL' : 'INDISPONÍVEL'}</span></span></div>
-        <div className="flex items-center gap-3"><div className="hidden items-center gap-2 text-xs muted sm:flex"><span className={`status-dot ${stream === 'connected' ? 'positive' : stream === 'disconnected' ? 'warning' : 'technical'}`} />{stream === 'connected' ? 'Fluxo ligado' : stream === 'disconnected' ? 'Fluxo desligado' : 'Fluxo indisponível'}</div><button className="button button-small" title="Notificações indisponíveis" aria-label="Notificações indisponíveis" disabled><Bell size={15} /></button><div className="h-7 w-px bg-[hsl(var(--border))]" /><span className="hidden max-w-36 truncate text-xs muted sm:inline">{user?.primaryEmailAddress?.emailAddress || 'Sessão autenticada'}</span><button className="button button-small" onClick={() => signOut({ redirectUrl: basePath || '/' })} aria-label="Terminar sessão"><LogOut size={14} /><span className="hide-mobile">Sair</span></button></div>
+        <div className="flex items-center gap-3"><button className="button button-small md:hidden" aria-label="Abrir navegação" onClick={() => setMobileMenu(!mobileMenu)}><Menu size={16} /></button><span className="text-sm font-medium">{current}</span><span className="flex items-center gap-2 rounded border border-[hsl(var(--border))] px-2 py-1 text-[10px] mono sm:inline-flex"><span className="eyebrow">MODO</span><span className={liveDashboard.data?.mode === 'simulation' ? 'positive' : liveDashboard.data?.mode === 'real' ? 'warning' : 'muted'}>{liveDashboard.data?.mode === 'simulation' ? 'SIMULAÇÃO PAPER' : liveDashboard.data?.mode === 'real' ? 'SNIPER REAL' : 'INDISPONÍVEL'}</span></span></div>
+        <div className="flex items-center gap-3"><div className="hidden items-center gap-2 text-xs muted sm:flex"><span className={`status-dot ${eventMonitor.state === 'connected' ? 'positive' : eventMonitor.state === 'disconnected' ? 'warning' : 'technical'}`} />{eventMonitor.state === 'connected' ? 'Eventos ligados' : eventMonitor.state === 'disconnected' ? 'Eventos desligados' : 'Eventos a ligar'}</div><button className="button button-small" title="Notificações indisponíveis" aria-label="Notificações indisponíveis" disabled><Bell size={15} /></button><div className="h-7 w-px bg-[hsl(var(--border))]" /><span className="hidden max-w-36 truncate text-xs muted sm:inline">{user?.primaryEmailAddress?.emailAddress || 'Sessão autenticada'}</span><button className="button button-small" onClick={() => signOut({ redirectUrl: basePath || '/' })} aria-label="Terminar sessão"><LogOut size={14} /><span className="hide-mobile">Sair</span></button></div>
       </header>
       {mobileMenu && <nav className="grid grid-cols-2 gap-1 border-b border-[hsl(var(--border))] bg-[hsl(var(--sidebar))] p-2 md:hidden">{navItems.map(({ href, label, icon: Icon }) => <Link href={href} key={href} className={`nav-link ${path === href ? 'active' : ''}`} onClick={() => setMobileMenu(false)}><Icon size={16} />{label}</Link>)}</nav>}
       {children}
@@ -356,7 +360,7 @@ function DashboardPage() {
         <section className="panel"><PanelTitle title="Histórico do saldo" aside={<span className="eyebrow">SOL · API</span>} />{balancePoints.length ? <div className="p-4"><ResponsiveContainer width="100%" height={210}><AreaChart data={balancePoints}><CartesianGrid strokeDasharray="3 3" stroke="hsl(210 12% 24%)" /><XAxis dataKey="timestamp" tickFormatter={value => new Date(String(value)).toLocaleDateString('pt-BR')} tick={{ fill: '#8997a1', fontSize: 10 }} /><YAxis tick={{ fill: '#8997a1', fontSize: 10 }} /><ChartTooltip formatter={value => [fmtSol(Number(value)), 'SOL']} labelFormatter={value => fmtDate(String(value))} /><Area type="monotone" dataKey="value" name="Saldo" stroke="#66b2ff" fill="#66b2ff" fillOpacity={0.14} dot={{ r: 3, fill: '#66b2ff' }} /></AreaChart></ResponsiveContainer></div> : <EmptyRows>Histórico de saldo indisponível ou sem pontos válidos.</EmptyRows>}</section>
       </div>
       <div className="grid gap-3 lg:grid-cols-2">
-        <section className="panel"><PanelTitle title="Saúde dos serviços" /><div className="space-y-3 p-4 text-sm"><div className="flex justify-between"><span className="muted">API</span><StatusTag value={health.data?.status || (health.isError ? 'unavailable' : undefined)} positive={['ok']} warning={['degraded']} negative={['unavailable']} /></div><div className="flex justify-between"><span className="muted">Monitor de eventos</span><StatusTag value={health.data?.eventMonitorStatus || eventState} positive={['connected']} warning={['unknown', 'connecting']} negative={['disconnected', 'unavailable']} /></div><div className="flex justify-between text-xs"><span className="muted">Verificado</span><span className="mono">{fmtDate(health.data?.checkedAt)}</span></div></div></section>
+        <section className="panel"><PanelTitle title="Saúde dos serviços" /><div className="space-y-3 p-4 text-sm"><div className="flex justify-between"><span className="muted">API</span><StatusTag value={health.data?.status || (health.isError ? 'unavailable' : undefined)} positive={['ok']} warning={['degraded']} negative={['unavailable']} /></div><div className="flex justify-between"><span className="muted">Feed de mercado (API)</span><StatusTag value={health.data?.eventMonitorStatus} positive={['connected']} warning={['unknown', 'connecting']} negative={['disconnected', 'unavailable']} /></div><div className="flex justify-between"><span className="muted">Socket do painel</span><StatusTag value={eventState} positive={['connected']} warning={['connecting']} negative={['disconnected']} /></div><div className="flex justify-between text-xs"><span className="muted">Verificado</span><span className="mono">{fmtDate(health.data?.checkedAt)}</span></div></div></section>
         <section className="panel"><PanelTitle title="Monitor de eventos" aside={<span className="text-xs muted">{eventState === 'connected' ? 'Ligado' : eventState === 'connecting' ? 'A ligar' : 'Desligado'}</span>} /><div className="p-4">{latest ? <div className="flex items-start gap-3"><Radio className="technical mt-0.5" size={16} /><div><div className="mono text-xs">{latest.type}</div><div className="mt-1 text-xs muted">{fmtDate(latest.at ?? latest.timestamp)}</div></div></div> : <p className="m-0 text-xs muted">Aguardando conexão com o back-end</p>}</div></section>
       </div>
       <section className="panel mt-4"><PanelTitle title="Operações recentes" aside={<Link href="/user-portal/trades" className="text-xs technical no-underline">Ver histórico <ArrowRight size={13} className="inline" /></Link>} />{recentTrades.length ? <TradesTable items={recentTrades} /> : <EmptyRows />}</section>
