@@ -634,6 +634,50 @@ func TestSimulationMaxHoldReleasesFlatPosition(t *testing.T) {
 	}
 }
 
+func TestSimulationMaxHoldClosesOnlyNonPositivePositions(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		marketCap    float64
+		wantOpenCount int
+	}{
+		{name: "positive 30 percent remains open", marketCap: 130, wantOpenCount: 1},
+		{name: "negative 10 percent exits", marketCap: 90, wantOpenCount: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := database.Open(filepath.Join(t.TempDir(), "paper-max-hold-position.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err = db.Migrate(); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.OpenSimulationPosition("paper-mint", 0.05); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.RecordPaperMark("paper-mint", 100); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = db.Exec(`UPDATE positions SET opened_at=? WHERE mint=?`, time.Now().UTC().Add(-2*time.Minute), "paper-mint"); err != nil {
+				t.Fatal(err)
+			}
+
+			bus := events.New()
+			engine := execution.New(db, nil, nil, nil, nil, zap.NewNop(), true, 1, nil, bus, execution.Limits{})
+			monitor := New("", "", 8, db, nil, engine, 0, 0, 0, 70, 30, time.Minute, true, bus, zap.NewNop())
+			monitor.markTrade(context.Background(), "paper-mint", test.marketCap)
+
+			open, err := db.OpenPositionCount()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if open != test.wantOpenCount {
+				t.Fatalf("open position count = %d; want %d", open, test.wantOpenCount)
+			}
+		})
+	}
+}
+
 func TestSimulationMaxHoldDoesNotForceExitWithoutPriceUpdates(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "paper-max-hold-no-feed.db"))
 	if err != nil {
