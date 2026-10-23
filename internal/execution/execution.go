@@ -1,8 +1,11 @@
 package execution
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/big"
@@ -59,6 +62,8 @@ type Engine struct {
 
 type livePreparation struct {
 	amount              any
+	tokenQuantity       string
+	tokenQuantityRaw    string
 	denominatedInSOL    bool
 	slippage            float64
 	quotedAt            time.Time
@@ -341,8 +346,8 @@ func (e *Engine) reconcileRows(ctx context.Context, rows *sql.Rows) error {
 				}
 			case "sell":
 				quantity, quantityValue, quantityErr := confirmedTokenQuantity(receipt.TokenDeltaRaw, receipt.TokenDecimals, -1)
-				if receipt.SOLDelta <= 0 || quantityErr != nil {
-					finalizeErr = fmt.Errorf("confirmed sell did not credit operational wallet")
+				if receipt.SOLDelta <= 0 || quantityErr != nil || receipt.TokenBalanceAfterRaw != "0" {
+					finalizeErr = fmt.Errorf("confirmed sell did not credit SOL or fully debit the quoted token balance")
 				} else {
 					value := receipt.SOLDelta + receipt.FeesSOL
 					if value <= 0 || quantityValue <= 0 {
@@ -400,9 +405,6 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		l := e.Limits()
 		if l.MaxTradeSOL > 0 && r.Amount > l.MaxTradeSOL {
 			return "", fmt.Errorf("maximum capital per trade exceeded")
-		}
-		if l.MaxSlippagePct > 0 && r.Slippage > l.MaxSlippagePct {
-			return "", fmt.Errorf("maximum slippage exceeded")
 		}
 		if l.MaxSlippageBPS > 0 && r.Slippage*100 > float64(l.MaxSlippageBPS) {
 			return "", fmt.Errorf("maximum slippage in basis points exceeded")
@@ -521,7 +523,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		_ = e.db.MarkTradeFailed(id)
 		return id, fmt.Errorf("unsafe transaction: %w", err)
 	}
-	if err = e.validatePreparedTransaction(tx); err != nil {
+	if err = e.validatePreparedTransaction(tx, r, prepared); err != nil {
 		_ = e.db.MarkTradeFailed(id)
 		return id, fmt.Errorf("unsafe prepared transaction: %w", err)
 	}
@@ -531,7 +533,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 			_ = e.db.MarkTradeFailed(id)
 			return id, fmt.Errorf("bonding-curve quote exceeded MAX_QUOTE_AGE_MS before submission")
 		}
-		if err = e.db.UpdateTradeQuote(id, prepared.quotedAt, quoteAge.Milliseconds(), prepared.curveImpactBPS, prepared.minimumOutputSOL, prepared.requestedValueSOL); err != nil {
+		if err = e.db.UpdateTradeQuote(id, prepared.quotedAt, quoteAge.Milliseconds(), prepared.curveImpactBPS, prepared.minimumOutputSOL, prepared.requestedValueSOL, prepared.tokenQuantity); err != nil {
 			_ = e.db.MarkTradeFailed(id)
 			return id, fmt.Errorf("persist execution quote: %w", err)
 		}
@@ -625,6 +627,8 @@ func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Requ
 			return livePreparation{}, fmt.Errorf("invalid token amount or bonding-curve reserves")
 		}
 		prepared.amount = formatRawTokenAmount(raw, decimals)
+		prepared.tokenQuantity = fmt.Sprint(prepared.amount)
+		prepared.tokenQuantityRaw = strconv.FormatUint(raw, 10)
 		prepared.curveImpactBPS = tokenAmount / (virtualTokens + tokenAmount) * 10000
 		expectedSOL = virtualSOL * tokenAmount / (virtualTokens + tokenAmount)
 		if expectedSOL <= 0 || math.IsNaN(expectedSOL) || math.IsInf(expectedSOL, 0) {
@@ -642,7 +646,11 @@ func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Requ
 		maxLossFloor := cost * (1 - limits.MaxLossPerTradePct/100)
 		// Network fees are separate from the swap output; reserve the configured
 		// priority cap and base fee when enforcing the per-position loss floor.
-		maxLossFloor += limits.MaxPriorityFeeSOL + 0.000005
+		entryFees, feesErr := e.db.PositionFeesSOL(request.Mint)
+		if feesErr != nil {
+			return livePreparation{}, fmt.Errorf("confirmed entry fees required to protect the sell: %w", feesErr)
+		}
+		maxLossFloor += entryFees + limits.MaxPriorityFeeSOL + 0.000005
 		maxSlipBPS := math.Min(request.Slippage*100, float64(limits.MaxSlippageBPS))
 		minimumOutput := expectedSOL * (1 - maxSlipBPS/10000)
 		if maxLossFloor > minimumOutput {
@@ -919,9 +927,9 @@ func (e *Engine) confirm(id, sig string, r Request) {
 					}
 				} else {
 					quantity, quantityValue, quantityErr := confirmedTokenQuantity(receipt.TokenDeltaRaw, receipt.TokenDecimals, -1)
-					if receipt.SOLDelta <= 0 || quantityErr != nil {
+					if receipt.SOLDelta <= 0 || quantityErr != nil || receipt.TokenBalanceAfterRaw != "0" {
 						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
-						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "sell confirmation lacks verified SOL proceeds or token debit"})
+						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "sell confirmation lacks verified SOL proceeds or did not fully debit the quoted token balance"})
 						return
 					}
 					value := receipt.SOLDelta + receipt.FeesSOL
@@ -964,7 +972,7 @@ func (e *Engine) confirm(id, sig string, r Request) {
 // construct the transaction, but only the configured wallet may authorize it
 // and that wallet must be the fee payer. Address-table transactions are
 // rejected until their tables are resolved and inspected locally.
-func (e *Engine) validatePreparedTransaction(tx *solana.Transaction) error {
+func (e *Engine) validatePreparedTransaction(tx *solana.Transaction, request Request, prepared livePreparation) error {
 	if len(tx.Message.AccountKeys) == 0 || tx.Message.AccountKeys[0] != e.wallet.PublicKey() {
 		return fmt.Errorf("operational wallet is not the fee payer")
 	}
@@ -987,5 +995,61 @@ func (e *Engine) validatePreparedTransaction(tx *solana.Transaction) error {
 			}
 		}
 	}
+	if request.Side == "sell" {
+		return validateProtectedPumpSell(tx, prepared)
+	}
 	return nil
+}
+
+const pumpFunProgramIDForExecution = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+func validateProtectedPumpSell(tx *solana.Transaction, prepared livePreparation) error {
+	pumpProgram, err := solana.PublicKeyFromBase58(pumpFunProgramIDForExecution)
+	if err != nil {
+		return fmt.Errorf("invalid Pump.fun program identifier: %w", err)
+	}
+	discriminator := anchorInstructionDiscriminator("sell")
+	expectedAmount, err := strconv.ParseUint(prepared.tokenQuantityRaw, 10, 64)
+	if err != nil || expectedAmount == 0 {
+		return fmt.Errorf("protected sell has no valid confirmed token quantity")
+	}
+	minimumOutputLamports := math.Ceil(prepared.minimumOutputSOL * 1e9)
+	if prepared.minimumOutputSOL <= 0 || math.IsNaN(minimumOutputLamports) ||
+		math.IsInf(minimumOutputLamports, 0) || minimumOutputLamports > float64(^uint64(0)) {
+		return fmt.Errorf("protected sell has no valid minimum SOL output")
+	}
+	requiredOutput := uint64(minimumOutputLamports)
+	found := false
+	for _, ix := range tx.Message.Instructions {
+		if int(ix.ProgramIDIndex) >= len(tx.Message.AccountKeys) ||
+			tx.Message.AccountKeys[ix.ProgramIDIndex] != pumpProgram {
+			continue
+		}
+		if len(ix.Data) < 24 || !bytes.Equal(ix.Data[:8], discriminator[:]) {
+			continue
+		}
+		if found {
+			return fmt.Errorf("prepared transaction contains multiple Pump.fun sell instructions")
+		}
+		found = true
+		amount := binary.LittleEndian.Uint64(ix.Data[8:16])
+		minimumOutput := binary.LittleEndian.Uint64(ix.Data[16:24])
+		if amount != expectedAmount {
+			return fmt.Errorf("prepared sell quantity does not match the confirmed wallet balance")
+		}
+		if minimumOutput < requiredOutput {
+			return fmt.Errorf("prepared Pump.fun sell does not enforce the calculated minimum SOL output")
+		}
+	}
+	if !found {
+		return fmt.Errorf("prepared transaction has no verifiable Pump.fun sell minimum-output guarantee")
+	}
+	return nil
+}
+
+func anchorInstructionDiscriminator(name string) [8]byte {
+	hash := sha256.Sum256([]byte("global:" + name))
+	var discriminator [8]byte
+	copy(discriminator[:], hash[:8])
+	return discriminator
 }

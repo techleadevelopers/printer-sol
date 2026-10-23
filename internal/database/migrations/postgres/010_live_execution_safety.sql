@@ -1,0 +1,9 @@
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS effective_price_sol DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS quote_observed_at TIMESTAMPTZ;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS quote_age_ms BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS curve_impact_bps DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS minimum_output_sol DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_one_active_per_mint
+  ON trades(mint)
+  WHERE state IN ('prepared','signed','submitted','pending','unknown');

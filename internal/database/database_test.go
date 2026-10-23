@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestPaperMarkStatsCountsFlatMarks(t *testing.T) {
@@ -526,7 +527,7 @@ func TestLiveTradeFinalizationCommitsExecutionAndPositionAtomically(t *testing.T
 	if err = db.InsertTrade(Trade{ID: "live-buy", Mint: "live-mint", Side: "buy", Quantity: "0.05", Requested: 0.05, State: "submitted"}); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.FinalizeLiveBuy("live-buy", "live-mint", "confirmed", "buy-signature", 0.05, 0.001); err != nil {
+	if err = db.FinalizeLiveBuy("live-buy", "live-mint", "confirmed", "buy-signature", 0.05, 0.001, "12.5"); err != nil {
 		t.Fatal(err)
 	}
 	open, err := db.OpenPositionCount()
@@ -537,7 +538,7 @@ func TestLiveTradeFinalizationCommitsExecutionAndPositionAtomically(t *testing.T
 	if err = db.InsertTrade(Trade{ID: "live-sell", Mint: "live-mint", Side: "sell", Quantity: "100", Requested: 100, State: "submitted"}); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.FinalizeLiveSell("live-sell", "live-mint", "finalized", "sell-signature", 0.075, 0.002); err != nil {
+	if err = db.FinalizeLiveSell("live-sell", "live-mint", "finalized", "sell-signature", 0.075, 0.002, "12.5"); err != nil {
 		t.Fatal(err)
 	}
 	open, err = db.OpenPositionCount()
@@ -550,10 +551,57 @@ func TestLiveTradeFinalizationCommitsExecutionAndPositionAtomically(t *testing.T
 	if err = db.QueryRow(`SELECT state,signature,executed_value_sol,fees_sol,realized_pnl_sol FROM trades WHERE id='live-sell'`).Scan(&state, &signature, &executed, &fees, &pnl); err != nil {
 		t.Fatal(err)
 	}
-	if state != "finalized" || signature != "sell-signature" || executed != 0.075 || fees != 0.002 || pnl < 0.024999999 || pnl > 0.025000001 {
+	if state != "finalized" || signature != "sell-signature" || executed != 0.075 || fees != 0.002 || pnl < 0.021999999 || pnl > 0.022000001 {
 		t.Fatalf("live sell ledger is inconsistent: state=%q signature=%q executed=%.9f fees=%.9f pnl=%.9f", state, signature, executed, fees, pnl)
+	}
+	var quantity string
+	var effectivePrice float64
+	if err = db.QueryRow(`SELECT quantity,effective_price_sol FROM trades WHERE id='live-sell'`).Scan(&quantity, &effectivePrice); err != nil {
+		t.Fatal(err)
+	}
+	if quantity != "12.5" || effectivePrice < 0.005999999 || effectivePrice > 0.006000001 {
+		t.Fatalf("confirmed sell receipt not persisted: quantity=%q effective price=%.9f", quantity, effectivePrice)
 	}
 	if needed, err := db.ReconciliationRequired(); err != nil || needed {
 		t.Fatalf("finalized live trades should not remain unreconciled: needed=%v err=%v", needed, err)
+	}
+}
+
+func TestPreparedLiveSellPersistsQuoteAndBlocksDuplicateActiveTrade(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "live-quote-and-dedupe.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = db.InsertTrade(Trade{
+		ID: "live-sell-first", Mint: "quoted-mint", Side: "sell",
+		Quantity: "100", Requested: 0.12, State: "prepared",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	quotedAt := time.Now().UTC().Add(-25 * time.Millisecond)
+	if err = db.UpdateTradeQuote("live-sell-first", quotedAt, 25, 80, 0.10, 0.12, "12.5"); err != nil {
+		t.Fatal(err)
+	}
+	var quantity string
+	var quoteAge int64
+	var impact, minimumOutput float64
+	if err = db.QueryRow(`SELECT quantity,quote_age_ms,curve_impact_bps,minimum_output_sol
+		FROM trades WHERE id='live-sell-first'`).Scan(&quantity, &quoteAge, &impact, &minimumOutput); err != nil {
+		t.Fatal(err)
+	}
+	if quantity != "12.5" || quoteAge != 25 || impact != 80 || minimumOutput != 0.10 {
+		t.Fatalf("persisted quote = quantity %q, age %dms, impact %.1fbps, min %.4f SOL", quantity, quoteAge, impact, minimumOutput)
+	}
+
+	if err = db.InsertTrade(Trade{
+		ID: "live-sell-second", Mint: "quoted-mint", Side: "sell",
+		Quantity: "100", Requested: 0.12, State: "prepared",
+	}); err == nil {
+		t.Fatal("database accepted a duplicate active trade for the same mint")
 	}
 }

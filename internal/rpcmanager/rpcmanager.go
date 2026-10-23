@@ -421,10 +421,11 @@ type ExecutionTokenBalance struct {
 // ExecutionReceipt contains wallet SOL movement and the token balance delta
 // reported by the confirmed transaction metadata.
 type ExecutionReceipt struct {
-	SOLDelta      float64
-	FeesSOL       float64
-	TokenDeltaRaw string
-	TokenDecimals uint8
+	SOLDelta             float64
+	FeesSOL              float64
+	TokenDeltaRaw        string
+	TokenBalanceAfterRaw string
+	TokenDecimals        uint8
 }
 
 // Execution reads confirmed transaction metadata. Callers use the wallet delta
@@ -470,27 +471,35 @@ func (m *Manager) Execution(ctx context.Context, signature, address, mint string
 	if !foundWallet {
 		return ExecutionReceipt{}, fmt.Errorf("operational wallet missing from confirmed transaction")
 	}
-	pre, preDecimals, err := sumTokenBalances(receipt.Meta.PreTokenBalances, address, mint)
+	pre, preDecimals, preFound, err := sumTokenBalances(receipt.Meta.PreTokenBalances, address, mint)
 	if err != nil {
 		return ExecutionReceipt{}, err
 	}
-	post, postDecimals, err := sumTokenBalances(receipt.Meta.PostTokenBalances, address, mint)
+	post, postDecimals, postFound, err := sumTokenBalances(receipt.Meta.PostTokenBalances, address, mint)
 	if err != nil {
 		return ExecutionReceipt{}, err
 	}
-	if preDecimals != postDecimals {
+	if preFound && postFound && preDecimals != postDecimals {
 		return ExecutionReceipt{}, fmt.Errorf("token decimals changed within confirmed transaction")
+	}
+	decimals := postDecimals
+	if !postFound {
+		decimals = preDecimals
+	}
+	if !preFound && !postFound {
+		return ExecutionReceipt{}, fmt.Errorf("confirmed transaction metadata contains no token account for the mint")
 	}
 	delta := new(big.Int).Sub(post, pre)
 	return ExecutionReceipt{
-		SOLDelta:      solDelta,
-		FeesSOL:       float64(receipt.Meta.Fee) / 1e9,
-		TokenDeltaRaw: delta.String(),
-		TokenDecimals: preDecimals,
+		SOLDelta:             solDelta,
+		FeesSOL:              float64(receipt.Meta.Fee) / 1e9,
+		TokenDeltaRaw:        delta.String(),
+		TokenBalanceAfterRaw: post.String(),
+		TokenDecimals:        decimals,
 	}, nil
 }
 
-func sumTokenBalances(balances []ExecutionTokenBalance, owner, mint string) (*big.Int, uint8, error) {
+func sumTokenBalances(balances []ExecutionTokenBalance, owner, mint string) (*big.Int, uint8, bool, error) {
 	total := new(big.Int)
 	var decimals uint8
 	found := false
@@ -500,14 +509,14 @@ func sumTokenBalances(balances []ExecutionTokenBalance, owner, mint string) (*bi
 		}
 		amount, ok := new(big.Int).SetString(balance.Amount.Amount, 10)
 		if !ok || amount.Sign() < 0 {
-			return nil, 0, fmt.Errorf("invalid confirmed token amount in transaction metadata")
+			return nil, 0, false, fmt.Errorf("invalid confirmed token amount in transaction metadata")
 		}
 		if found && decimals != balance.Amount.Decimals {
-			return nil, 0, fmt.Errorf("inconsistent token decimals in transaction metadata")
+			return nil, 0, false, fmt.Errorf("inconsistent token decimals in transaction metadata")
 		}
 		decimals = balance.Amount.Decimals
 		found = true
 		total.Add(total, amount)
 	}
-	return total, decimals, nil
+	return total, decimals, found, nil
 }

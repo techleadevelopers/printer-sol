@@ -446,9 +446,9 @@ func (s *Server) tradeItems(simulation bool) ([]map[string]any, error) {
 	}
 	for rows.Next() {
 		var id, mint, side, quantityText, signature, state, createdAt, exitReason string
-		var requested, executed, fees, slippage float64
+		var requested, executed, effectivePrice, fees, slippage float64
 		var realized sql.NullFloat64
-		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &fees, &slippage, &signature, &state, &createdAt, &realized, &exitReason); err != nil {
+		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &effectivePrice, &fees, &slippage, &signature, &state, &createdAt, &realized, &exitReason); err != nil {
 			return nil, err
 		}
 		quantity, _ := strconv.ParseFloat(quantityText, 64)
@@ -463,6 +463,7 @@ func (s *Server) tradeItems(simulation bool) ([]map[string]any, error) {
 			"id": id, "timestamp": createdAt, "tokenName": nil, "symbol": nil, "mint": mint,
 			"side": side, "quantity": quantity, "requestedValueSol": requested,
 			"buyValueSol": nil, "sellValueSol": nil, "executedValueSol": nil, "feesSol": fees,
+			"effectivePriceSol": nil,
 			"slippage": slippage, "grossPnlSol": nil, "netPnlSol": nil, "realizedPnlSol": nil,
 			"exitReason": exitReason, "transactionId": nil, "signature": nil, "status": status,
 		}
@@ -471,6 +472,9 @@ func (s *Server) tradeItems(simulation bool) ([]map[string]any, error) {
 		}
 		if executed > 0 && isCompletedTradeState(state) {
 			item["executedValueSol"] = executed
+		}
+		if effectivePrice > 0 && isCompletedTradeState(state) {
+			item["effectivePriceSol"] = effectivePrice
 		}
 		value := requested
 		if executed > 0 && isCompletedTradeState(state) {

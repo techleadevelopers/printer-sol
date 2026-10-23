@@ -300,7 +300,7 @@ func TestValidateURLRejectsWrongSchemeAndRelativeURL(t *testing.T) {
 	}
 }
 
-func TestLiveRequiresTakeProfitAndPositiveCurveSlippageLimit(t *testing.T) {
+func TestLiveRequiresTakeProfitAndUsesBasisPointSlippageLimit(t *testing.T) {
 	for key, value := range map[string]string{
 		"SIMULATION":                  "false",
 		"ENABLE_LIVE_TRADING":         "true",
@@ -319,6 +319,9 @@ func TestLiveRequiresTakeProfitAndPositiveCurveSlippageLimit(t *testing.T) {
 		"TRAILING_STOP_PCT":           "12",
 		"MAX_HOLD_SECONDS":            "300",
 		"MAX_SLIPPAGE_PCT":            "15",
+		"MAX_SLIPPAGE_BPS":            "1500",
+		"MAX_QUOTE_AGE_MS":            "1000",
+		"MAX_CURVE_IMPACT_BPS":        "1000",
 	} {
 		t.Setenv(key, value)
 	}
@@ -329,7 +332,9 @@ func TestLiveRequiresTakeProfitAndPositiveCurveSlippageLimit(t *testing.T) {
 
 	t.Setenv("TAKE_PROFIT_GROSS_PCT", "50")
 	t.Setenv("MAX_SLIPPAGE_PCT", "0")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "MAX_SLIPPAGE_PCT") {
-		t.Fatalf("live mode without a positive slippage cap should fail clearly, got %v", err)
+	if cfg, err := Load(); err != nil {
+		t.Fatalf("legacy percentage setting must not override the explicit basis-point limit: %v", err)
+	} else if cfg.MaxSlippagePct != 0 || cfg.MaxSlippageBPS != 1500 {
+		t.Fatalf("unexpected independent slippage limits: legacy=%v bps=%d", cfg.MaxSlippagePct, cfg.MaxSlippageBPS)
 	}
 }

@@ -25,7 +25,7 @@ func TestClosedStopLossBlacklistsCreatorFor24Hours(t *testing.T) {
 			name:   "live stop-loss",
 			reason: "stop-loss",
 			finalize: func(db *DB, id string) error {
-				return db.FinalizeLiveSell(id, "live-stop-mint", "confirmed", "signature", 0.075, 0.001)
+	return db.FinalizeLiveSell(id, "live-stop-mint", "confirmed", "signature", 0.075, 0.001, "100")
 			},
 			wantBlocked: true,
 		},

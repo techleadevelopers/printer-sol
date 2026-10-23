@@ -447,7 +447,7 @@ func TestLiveMonitorRestoresOpenPositionsAndWaitsForConfirmedExit(t *testing.T) 
 		t.Fatalf("pending sell caused a duplicate submission: %d exits", entry.liveExitCalls)
 	}
 
-	if err = db.FinalizeLiveSell("live-sell", "live-mint", "confirmed", "signature", 0.075, 0.001); err != nil {
+	if err = db.FinalizeLiveSell("live-sell", "live-mint", "confirmed", "signature", 0.075, 0.001, "100"); err != nil {
 		t.Fatal(err)
 	}
 	monitor.markTrade(context.Background(), "live-mint", 175)
@@ -484,7 +484,7 @@ func TestLivePendingBuyKeepsMarkTrackingUntilConfirmation(t *testing.T) {
 		t.Fatalf("pending buy triggered a sell before confirmation: %d exits", entry.liveExitCalls)
 	}
 
-	if err = db.FinalizeLiveBuy("pending-buy", "pending-mint", "confirmed", "buy-signature", 0.05, 0); err != nil {
+	if err = db.FinalizeLiveBuy("pending-buy", "pending-mint", "confirmed", "buy-signature", 0.05, 0, "100"); err != nil {
 		t.Fatal(err)
 	}
 	monitor.markTrade(context.Background(), "pending-mint", 150)

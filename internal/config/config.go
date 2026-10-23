@@ -240,9 +240,6 @@ func Load() (Config, error) {
 	if c.TakeProfitGrossPct <= 0 {
 		return c, fmt.Errorf("TAKE_PROFIT_GROSS_PCT must be positive in simulation and live modes")
 	}
-	if c.MaxSlippagePct <= 0 {
-		return c, fmt.Errorf("MAX_SLIPPAGE_PCT must be positive to bound curve execution slippage")
-	}
 	if c.MaxSlippageBPS < 1 || c.MaxSlippageBPS > 10000 {
 		return c, fmt.Errorf("MAX_SLIPPAGE_BPS must be between 1 and 10000")
 	}

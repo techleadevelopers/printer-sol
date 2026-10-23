@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"math"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"io/fs"
 	_ "modernc.org/sqlite"
@@ -228,6 +229,27 @@ func (d *DB) ActiveForMint(mint string) (bool, error) {
 	e := d.QueryRow(d.bind(`SELECT COUNT(*) FROM trades WHERE mint=? AND state IN ('prepared','signed','submitted','pending','unknown')`), mint).Scan(&n)
 	return n > 0, e
 }
+
+// UpdateTradeQuote persists the quote and exact sell quantity before a live
+// transaction is signed or submitted.
+func (d *DB) UpdateTradeQuote(id string, quotedAt time.Time, quoteAgeMS int64, curveImpactBPS, minimumOutputSOL, requestedValueSOL float64, quantity string) error {
+	now := time.Now().UTC()
+	result, err := d.Exec(d.bind(`UPDATE trades
+		SET quote_observed_at=?,quote_age_ms=?,curve_impact_bps=?,minimum_output_sol=?,
+		requested_value_sol=?,quantity=CASE WHEN ?<>'' THEN ? ELSE quantity END,updated_at=?
+		WHERE id=? AND state='prepared'`),
+		quotedAt.UTC(), quoteAgeMS, curveImpactBPS, minimumOutputSOL,
+		requestedValueSOL, quantity, quantity, now, id)
+	if err != nil {
+		return fmt.Errorf("persist live execution quote for %q: %w", id, err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if affected != 1 {
+		return fmt.Errorf("prepared live trade %q not found while persisting quote", id)
+	}
+	return nil
+}
 func (d *DB) HasPurchaseForMint(mint string) (bool, error) {
 	var n int
 	// A mint receives at most one buy attempt. This remains true even if the
@@ -235,6 +257,13 @@ func (d *DB) HasPurchaseForMint(mint string) (bool, error) {
 	// and a second entry after an RPC/PumpPortal failure.
 	e := d.QueryRow(d.bind(`SELECT COUNT(*) FROM trades WHERE mint=? AND side='buy'`), mint).Scan(&n)
 	return n > 0, e
+}
+
+func (d *DB) PositionFeesSOL(mint string) (float64, error) {
+	var fees float64
+	err := d.QueryRow(d.bind(`SELECT COALESCE(SUM(fees_sol),0) FROM trades
+		WHERE mint=? AND side='buy' AND state IN ('confirmed','finalized')`), mint).Scan(&fees)
+	return fees, err
 }
 func (d *DB) HasFailedSellForMint(mint string) (bool, error) {
 	var n int
@@ -679,6 +708,7 @@ func (d *DB) RecordAssessment(mint string, approved bool, reason string) error {
 }
 func (d *DB) ListTrades() (rows *sql.Rows, err error) {
 	return d.Query(`SELECT id,mint,side,quantity,requested_value_sol,COALESCE(executed_value_sol,0),
+		COALESCE(effective_price_sol,0),
 		COALESCE(fees_sol,0),slippage_pct,COALESCE(signature,''),state,created_at,realized_pnl_sol,
 		COALESCE(exit_reason,'') FROM trades ORDER BY created_at DESC LIMIT 200`)
 }
@@ -791,9 +821,13 @@ func (d *DB) FinalizeSimulationSell(id, mint string, value float64, feesOpt ...f
 	return nil
 }
 
-func (d *DB) FinalizeLiveBuy(id, mint, state, signature string, cost, fees float64) error {
-	if cost <= 0 {
-		return fmt.Errorf("invalid confirmed live buy cost")
+func (d *DB) FinalizeLiveBuy(id, mint, state, signature string, cost, fees float64, quantity string) error {
+	effectivePrice, err := executionPrice(cost, quantity)
+	if err != nil {
+		return fmt.Errorf("invalid confirmed live buy execution: %w", err)
+	}
+	if cost <= 0 || fees < 0 || math.IsNaN(fees) || math.IsInf(fees, 0) {
+		return fmt.Errorf("invalid confirmed live buy cost or fees")
 	}
 	tx, err := d.Begin()
 	if err != nil {
@@ -804,18 +838,22 @@ func (d *DB) FinalizeLiveBuy(id, mint, state, signature string, cost, fees float
 	now := time.Now().UTC()
 	if _, err = tx.Exec(d.bind(`INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,updated_at=excluded.updated_at`),
-		mint, fmt.Sprint(cost), cost, "open", now, now); err != nil {
+		mint, quantity, cost, "open", now, now); err != nil {
 		return err
 	}
-	if err = updateExecutedTrade(tx, d, id, state, signature, cost, fees, nil, now); err != nil {
+	if err = updateExecutedTrade(tx, d, id, state, signature, quantity, cost, fees, effectivePrice, nil, now); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func (d *DB) FinalizeLiveSell(id, mint, state, signature string, value, fees float64) error {
-	if value < 0 {
-		return fmt.Errorf("invalid confirmed live sell value")
+func (d *DB) FinalizeLiveSell(id, mint, state, signature string, value, fees float64, quantity string) error {
+	effectivePrice, err := executionPrice(value, quantity)
+	if err != nil {
+		return fmt.Errorf("invalid confirmed live sell execution: %w", err)
+	}
+	if value <= 0 || fees < 0 || math.IsNaN(fees) || math.IsInf(fees, 0) {
+		return fmt.Errorf("invalid confirmed live sell value or fees")
 	}
 	tx, err := d.Begin()
 	if err != nil {
@@ -830,9 +868,19 @@ func (d *DB) FinalizeLiveSell(id, mint, state, signature string, value, fees flo
 	if cost <= 0 {
 		return fmt.Errorf("invalid confirmed live position cost")
 	}
-	var exitReason string
-	if err = tx.QueryRow(d.bind(`SELECT COALESCE(exit_reason,'') FROM trades WHERE id=? AND side='sell'`), id).Scan(&exitReason); err != nil {
+	var entryFees float64
+	if err = tx.QueryRow(d.bind(`SELECT COALESCE(SUM(fees_sol),0) FROM trades
+		WHERE mint=? AND side='buy' AND state IN ('confirmed','finalized')`), mint).Scan(&entryFees); err != nil {
 		return err
+	}
+	var expectedQuantity, exitReason string
+	var minimumOutputSOL float64
+	if err = tx.QueryRow(d.bind(`SELECT quantity,COALESCE(minimum_output_sol,0),COALESCE(exit_reason,'')
+		FROM trades WHERE id=? AND side='sell'`), id).Scan(&expectedQuantity, &minimumOutputSOL, &exitReason); err != nil {
+		return err
+	}
+	if minimumOutputSOL > 0 && strings.TrimSpace(expectedQuantity) != strings.TrimSpace(quantity) {
+		return fmt.Errorf("confirmed sell token amount differs from the quoted wallet balance")
 	}
 	now := time.Now().UTC()
 	result, err := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=? WHERE mint=? AND status='open'`), now, mint)
@@ -844,7 +892,10 @@ func (d *DB) FinalizeLiveSell(id, mint, state, signature string, value, fees flo
 	} else if affected != 1 {
 		return fmt.Errorf("live position %q is no longer open", mint)
 	}
-	if err = updateExecutedTrade(tx, d, id, state, signature, value, fees, value-cost, now); err != nil {
+	// Persist net realized P&L, matching paper-trade reporting: confirmed sale
+	// proceeds less swap cost and both confirmed network fees.
+	netPnl := value - cost - entryFees - fees
+	if err = updateExecutedTrade(tx, d, id, state, signature, quantity, value, fees, effectivePrice, netPnl, now); err != nil {
 		return err
 	}
 	if err = blacklistCreatorAfterStopLoss(tx, d, mint, exitReason, now); err != nil {
@@ -892,9 +943,11 @@ func (d *DB) IsCreatorBlacklisted(creator string) (bool, error) {
 	return count > 0, err
 }
 
-func updateExecutedTrade(tx *sql.Tx, d *DB, id, state, signature string, executed, fees float64, realized any, now time.Time) error {
-	result, err := tx.Exec(d.bind(`UPDATE trades SET state=?,signature=COALESCE(NULLIF(?,''),signature),executed_value_sol=?,fees_sol=?,realized_pnl_sol=?,confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=?`),
-		state, signature, executed, fees, realized, now, false, now, id)
+func updateExecutedTrade(tx *sql.Tx, d *DB, id, state, signature, quantity string, executed, fees, effectivePrice float64, realized any, now time.Time) error {
+	result, err := tx.Exec(d.bind(`UPDATE trades SET state=?,signature=COALESCE(NULLIF(?,''),signature),
+		quantity=?,executed_value_sol=?,fees_sol=?,effective_price_sol=?,realized_pnl_sol=?,
+		confirmed_at=?,reconciliation_needed=?,updated_at=? WHERE id=?`),
+		state, signature, quantity, executed, fees, effectivePrice, realized, now, false, now, id)
 	if err != nil {
 		return err
 	}
@@ -913,6 +966,21 @@ func updateExecutedTrade(tx *sql.Tx, d *DB, id, state, signature string, execute
 		return fmt.Errorf("transaction for live trade %q not found", id)
 	}
 	return nil
+}
+
+func executionPrice(valueSOL float64, quantity string) (float64, error) {
+	if valueSOL <= 0 || math.IsNaN(valueSOL) || math.IsInf(valueSOL, 0) {
+		return 0, fmt.Errorf("executed SOL value must be finite and positive")
+	}
+	amount, err := strconv.ParseFloat(strings.TrimSpace(quantity), 64)
+	if err != nil || amount <= 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
+		return 0, fmt.Errorf("confirmed token quantity must be finite and positive")
+	}
+	price := valueSOL / amount
+	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return 0, fmt.Errorf("effective execution price is invalid")
+	}
+	return price, nil
 }
 
 func setSimulationTradeState(tx *sql.Tx, d *DB, id string, amount, fees float64, now time.Time) error {
