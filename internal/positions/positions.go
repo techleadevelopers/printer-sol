@@ -3,16 +3,10 @@ package positions
 
 import "time"
 
-const (
-	// trailingArmProfitPct is the profit level at which the trailing stop
-	// becomes armed. Kept as a constant (not a Limits field) so the exit
-	// behaviour is deterministic across restarts.
-	trailingArmProfitPct = 10.0
-)
-
 type Limits struct {
-	TakeProfitPct, StopLossPct, TrailingStopPct, MaxSlippagePct, MaxExposureSOL, MaxDailyLossSOL float64
-	MaxHold                                                                                      time.Duration
+TakeProfitPct, StopLossPct, TrailingStopPct, TrailingStopArmPct, ExitTriggerBufferPct float64
+MaxSlippagePct, MaxExposureSOL, MaxDailyLossSOL                                        float64
+MaxHold                                                                               time.Duration
 }
 type Position struct {
 	Mint                       string
@@ -43,25 +37,21 @@ func ExitReason(p Position, currentSOL float64, liquid bool, l Limits, now time.
 
 	// Stop loss takes precedence over every other trigger so the persisted
 	// exit reason is what the stop-loss creator blacklist expects to match.
-	// TOLERÂNCIA DE 0.5%: vende quando o preço chega a 0.5% antes do gatilho,
-	// compensando o atraso da última marca do RPC.
-	if l.StopLossPct > 0 && change <= -l.StopLossPct+0.5 {
+if l.StopLossPct > 0 && change <= -l.StopLossPct+l.ExitTriggerBufferPct {
 		return "stop loss"
 	}
 
 	if l.TrailingStopPct > 0 && p.PeakSOL > p.CostSOL && currentSOL > 0 {
 		peakProfitPct := (p.PeakSOL - p.CostSOL) / p.CostSOL * 100
-		if peakProfitPct >= trailingArmProfitPct {
+if peakProfitPct >= l.TrailingStopArmPct {
 			drawdownFromPeak := (p.PeakSOL - currentSOL) / p.PeakSOL * 100
-			// TOLERÂNCIA DE 0.5%: vende quando a queda do pico chega a 0.5% antes do gatilho.
-			if drawdownFromPeak >= l.TrailingStopPct-0.5 {
+if drawdownFromPeak >= l.TrailingStopPct-l.ExitTriggerBufferPct {
 				return "trailing stop"
 			}
 		}
 	}
 
-	// TOLERÂNCIA DE 0.5%: vende quando o lucro chega a 0.5% antes do gatilho do Take Profit.
-	if l.TakeProfitPct > 0 && change >= l.TakeProfitPct-0.5 {
+if l.TakeProfitPct > 0 && change >= l.TakeProfitPct-l.ExitTriggerBufferPct {
 		return "take profit"
 	}
 

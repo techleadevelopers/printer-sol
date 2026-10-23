@@ -17,10 +17,11 @@ type Config struct {
 	UseWSMarketCap                                                                                                                                                                                        bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
-	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
+TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds, StuckExitQuarantineSeconds int
 	SnipeConcurrency, SnipeTimeoutMS, DedupeTTLMS                                                                                                                                                           int
 	EntryDelaySeconds, PricePollSeconds                                                                                                                                                                      int
-	MinVolumeBeforeBuySOL, MaxVolumeBeforeBuySOL, MinMarketCapSOL, MaxMarketCapSOL                                                                                                                         float64
+MinVolumeBeforeBuySOL, MaxVolumeBeforeBuySOL, MinMarketCapSOL, MaxMarketCapSOL, MarketCapTolerancePct, TokenMaxAgeTolerancePct               float64
+TrailingStopArmPct, ExitTriggerBufferPct                                                                                                                                                               float64
 	RPCEndpoints                                                                                                                                                                                            []string
 }
 
@@ -125,6 +126,12 @@ func Load() (Config, error) {
 	if c.MaxMarketCapSOL, err = floatEnv("MAX_MARKET_CAP_SOL", 0); err != nil {
 		return c, err
 	}
+if c.MarketCapTolerancePct, err = floatEnv("MARKET_CAP_TOLERANCE_PCT", 15); err != nil {
+return c, err
+}
+if c.TokenMaxAgeTolerancePct, err = floatEnv("TOKEN_MAX_AGE_TOLERANCE_PCT", 15); err != nil {
+return c, err
+}
 	if c.PricePollSeconds, err = intEnv("PRICE_POLL_SECONDS", 20); err != nil {
 		return c, err
 	}
@@ -166,9 +173,18 @@ func Load() (Config, error) {
 	if c.MaxHoldSeconds, err = intEnv("MAX_HOLD_SECONDS", 300); err != nil {
 		return c, err
 	}
+if c.StuckExitQuarantineSeconds, err = intEnv("STUCK_EXIT_QUARANTINE_SECONDS", 120); err != nil {
+return c, err
+}
 	if c.TrailingStopPct, err = floatEnv("TRAILING_STOP_PCT", 12); err != nil {
 		return c, err
 	}
+if c.TrailingStopArmPct, err = floatEnv("TRAILING_STOP_ARM_PCT", 10); err != nil {
+return c, err
+}
+if c.ExitTriggerBufferPct, err = floatEnv("EXIT_TRIGGER_BUFFER_PCT", .5); err != nil {
+return c, err
+}
 	if strings.TrimSpace(c.HTTPAddr) == "" || (c.DatabaseURL == "" && strings.TrimSpace(c.DatabasePath) == "") || strings.TrimSpace(c.PumpPortalURL) == "" || strings.TrimSpace(c.PumpPortalWS) == "" || len(c.RPCEndpoints) == 0 {
 		return c, fmt.Errorf("HTTP_ADDR, DATABASE_URL (or DATABASE_PATH locally), PumpPortal URLs and at least one RPC endpoint are required")
 	}
@@ -192,16 +208,25 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("RPC_ENDPOINTS: %w", err)
 		}
 	}
-	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.PricePollSeconds < 1 {
+if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 1 || c.MaxHoldSeconds < 0 || c.StuckExitQuarantineSeconds < 1 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.PricePollSeconds < 1 {
 		return c, fmt.Errorf("queue, position, and timing values must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
 	}
 	// ALTERADO: aceita 0 no MinVolumeBeforeBuySOL e MinMarketCapSOL (antes era <= 0)
 	if c.MinVolumeBeforeBuySOL < 0 || c.MaxVolumeBeforeBuySOL <= 0 || c.MinMarketCapSOL < 0 {
 		return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY and MIN_MARKET_CAP_SOL must be non-negative; MAX_VOLUME_BEFORE_BUY must be positive")
 	}
-	if c.MaxVolumeBeforeBuySOL < c.MinVolumeBeforeBuySOL {
+if c.MaxVolumeBeforeBuySOL < c.MinVolumeBeforeBuySOL {
 		return c, fmt.Errorf("MAX_VOLUME_BEFORE_BUY must be greater than or equal to MIN_VOLUME_BEFORE_BUY")
 	}
+for name, value := range map[string]float64{
+"MARKET_CAP_TOLERANCE_PCT": c.MarketCapTolerancePct,
+"TOKEN_MAX_AGE_TOLERANCE_PCT": c.TokenMaxAgeTolerancePct,
+"TRAILING_STOP_ARM_PCT": c.TrailingStopArmPct,
+"EXIT_TRIGGER_BUFFER_PCT": c.ExitTriggerBufferPct,
+} {
+if value > 100 {
+return c, fmt.Errorf("%s must be between 0 and 100", name)
+}
 	if c.SnipeConcurrency < 1 || c.SnipeConcurrency > 10 || c.SnipeTimeoutMS < 1 || c.SnipeTimeoutMS > 120000 || c.DedupeTTLMS < 1 || c.DedupeTTLMS > 3600000 {
 		return c, fmt.Errorf("SNIPE_CONCURRENCY must be 1-10, SNIPE_TIMEOUT_MS must be 1-120000, and DEDUPE_TTL_MS must be 1-3600000")
 	}
@@ -211,7 +236,7 @@ func Load() (Config, error) {
 	if !c.Simulation && c.TokenMaxAgeSeconds == 0 {
 		return c, fmt.Errorf("live trading requires TOKEN_MAX_AGE_SECONDS > 0")
 	}
-	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuySOL, c.MaxVolumeBeforeBuySOL, c.MinMarketCapSOL, c.MaxMarketCapSOL} {
+for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuySOL, c.MaxVolumeBeforeBuySOL, c.MinMarketCapSOL, c.MaxMarketCapSOL, c.MarketCapTolerancePct, c.TokenMaxAgeTolerancePct, c.TrailingStopArmPct, c.ExitTriggerBufferPct} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}

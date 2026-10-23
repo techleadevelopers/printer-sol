@@ -21,10 +21,6 @@ func (s *Strategy) SetScreen(screen func(context.Context, string) (string, error
 func (s *Strategy) HasScreen() bool { return s != nil && s.screen != nil }
 
 func New(db *database.DB, maxAge time.Duration) *Strategy {
-	const maximumEntryAge = 5 * time.Minute
-	if maxAge <= 0 || maxAge > maximumEntryAge {
-		maxAge = maximumEntryAge
-	}
 	return &Strategy{db: db, maxAge: maxAge}
 }
 func (s *Strategy) EvaluateFast(mint string, createdAt time.Time) (bool, string) {

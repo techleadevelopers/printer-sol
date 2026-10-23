@@ -204,13 +204,16 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 	}
 	event.MarketCapSOL = marketCapToCheck
 
-	if m.maxMarketCapSOL > 0 && marketCapToCheck > m.maxMarketCapSOL {
-		m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL exceeds configured maximum %.6f SOL", marketCapSource, marketCapToCheck, m.maxMarketCapSOL))
+maxMarketCapWithTolerance := m.maxMarketCapSOL * (1 + m.marketCapTolerancePct/100)
+minMarketCapWithTolerance := m.minMarketCapSOL * (1 - m.marketCapTolerancePct/100)
+
+if m.maxMarketCapSOL > 0 && marketCapToCheck > maxMarketCapWithTolerance {
+m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL exceeds maximum %.6f SOL with %.2f%% tolerance", marketCapSource, marketCapToCheck, m.maxMarketCapSOL, m.marketCapTolerancePct))
 		return
 	}
 
-	if marketCapToCheck < m.minMarketCapSOL {
-		m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL is below configured minimum %.6f SOL", marketCapSource, marketCapToCheck, m.minMarketCapSOL))
+if marketCapToCheck < minMarketCapWithTolerance {
+m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL is below minimum %.6f SOL with %.2f%% tolerance", marketCapSource, marketCapToCheck, m.minMarketCapSOL, m.marketCapTolerancePct))
 		return
 	}
 

@@ -51,6 +51,11 @@ type Settings struct {
 	MaxVolumeBeforeBuySOL float64
 	MinMarketCapSOL       float64
 	MaxMarketCapSOL       float64
+MarketCapTolerancePct float64
+TokenMaxAgeTolerancePct float64
+StuckExitQuarantine   time.Duration
+TrailingStopArmPct    float64
+ExitTriggerBufferPct  float64
 	UseWSMarketCap        bool
 	MaxTokenAge           time.Duration
 	PricePollInterval     time.Duration
@@ -85,6 +90,9 @@ type Monitor struct {
 	trailingStop                    float64
 	maxHold                         time.Duration
 	maxTokenAge                     time.Duration
+tokenMaxAgeTolerancePct          float64
+trailingStopArmPct               float64
+exitTriggerBufferPct              float64
 	simulation                      bool
 	subscriptions                   chan string
 	tracked                         sync.Map
@@ -114,6 +122,8 @@ type Monitor struct {
 	maxVolumeBeforeBuySOL           float64
 	minMarketCapSOL                 float64
 	maxMarketCapSOL                 float64
+marketCapTolerancePct           float64
+stuckExitQuarantineAge          time.Duration
 	useWSMarketCap                  bool
 	pricePollInterval               time.Duration
 	snipeConcurrency                int
@@ -130,7 +140,7 @@ const maxAutomaticSimulationExitAttempts = 3
 const maxAutomaticLiveExitAttempts = 3
 const staleSimulationSellRecoveryAge = time.Minute
 const staleLiveSellRecoveryAge = time.Minute
-const stuckExitQuarantineAge = 2 * time.Minute
+const defaultStuckExitQuarantineAge = 2 * time.Minute
 
 func (m *Monitor) runOperation(fn func()) bool {
 	return m.runOperationAt(m.resetGeneration.Load(), fn)
@@ -243,6 +253,11 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		MaxVolumeBeforeBuySOL: 1.5,
 		MinMarketCapSOL:       20,
 		MaxMarketCapSOL:       0,
+MarketCapTolerancePct: 15,
+TokenMaxAgeTolerancePct: 15,
+StuckExitQuarantine:   defaultStuckExitQuarantineAge,
+TrailingStopArmPct:    10,
+ExitTriggerBufferPct:  0.5,
 		MaxTokenAge:           0,
 		PricePollInterval:     20 * time.Second,
 		SnipeConcurrency:      4,
@@ -264,6 +279,13 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		if option.MaxMarketCapSOL > 0 {
 			settings.MaxMarketCapSOL = option.MaxMarketCapSOL
 		}
+settings.MarketCapTolerancePct = option.MarketCapTolerancePct
+settings.TokenMaxAgeTolerancePct = option.TokenMaxAgeTolerancePct
+settings.TrailingStopArmPct = option.TrailingStopArmPct
+settings.ExitTriggerBufferPct = option.ExitTriggerBufferPct
+if option.StuckExitQuarantine > 0 {
+settings.StuckExitQuarantine = option.StuckExitQuarantine
+}
 		settings.UseWSMarketCap = option.UseWSMarketCap
 		if option.MaxTokenAge > 0 {
 			settings.MaxTokenAge = option.MaxTokenAge
@@ -290,6 +312,9 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee,
 		takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15,
 		maxHold: maxHold, maxTokenAge: settings.MaxTokenAge,
+tokenMaxAgeTolerancePct: settings.TokenMaxAgeTolerancePct,
+trailingStopArmPct: settings.TrailingStopArmPct,
+exitTriggerBufferPct: settings.ExitTriggerBufferPct,
 		simulation: simulation, subscriptions: make(chan string, size),
 		candidates:      make(map[string]*candidate),
 		pendingMarks:    make(map[string]pendingMark),
@@ -301,6 +326,8 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		maxVolumeBeforeBuySOL: settings.MaxVolumeBeforeBuySOL,
 		minMarketCapSOL:       settings.MinMarketCapSOL,
 		maxMarketCapSOL:       settings.MaxMarketCapSOL,
+marketCapTolerancePct: settings.MarketCapTolerancePct,
+stuckExitQuarantineAge: settings.StuckExitQuarantine,
 		useWSMarketCap:        settings.UseWSMarketCap,
 		pricePollInterval:     settings.PricePollInterval,
 		snipeConcurrency:      settings.SnipeConcurrency,
@@ -512,13 +539,13 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 					zap.Int("attempts", reconciled))
 			}
 
-			stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-stuckExitQuarantineAge))
+stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-m.stuckExitQuarantineAge))
 			if stuckErr != nil {
 				m.log.Warn("check stuck exit mint", zap.String("mint", mint), zap.Error(stuckErr))
 				continue
 			}
 			if stuck {
-				cleaned, quarantineErr := m.db.QuarantineStuckSimulationMint(mint, now.Add(-stuckExitQuarantineAge))
+cleaned, quarantineErr := m.db.QuarantineStuckSimulationMint(mint, now.Add(-m.stuckExitQuarantineAge))
 				if quarantineErr != nil {
 					m.log.Warn("quarantine stuck simulated mint",
 						zap.String("mint", mint),
@@ -564,13 +591,13 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 					zap.Int("attempts", reconciled))
 			}
 
-			stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-stuckExitQuarantineAge))
+stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-m.stuckExitQuarantineAge))
 			if stuckErr != nil {
 				m.log.Warn("check stuck live exit mint", zap.String("mint", mint), zap.Error(stuckErr))
 				continue
 			}
 			if stuck {
-				cleaned, quarantineErr := m.db.QuarantineStuckLiveMint(mint, now.Add(-stuckExitQuarantineAge))
+cleaned, quarantineErr := m.db.QuarantineStuckLiveMint(mint, now.Add(-m.stuckExitQuarantineAge))
 				if quarantineErr != nil {
 					m.log.Warn("quarantine stuck live mint",
 						zap.String("mint", mint),
@@ -858,11 +885,14 @@ func (m *Monitor) connect(ctx context.Context) error {
 			created = received
 		}
 
-if m.useWSMarketCap && m.maxMarketCapSOL > 0 && d.MarketCapSol > m.maxMarketCapSOL {
-m.log.Info("token rejected instantly by websocket max market cap",
+maxMarketCapWithTolerance := m.maxMarketCapSOL * (1 + m.marketCapTolerancePct/100)
+if m.useWSMarketCap && m.maxMarketCapSOL > 0 && d.MarketCapSol > maxMarketCapWithTolerance {
+m.log.Info("token rejected instantly by websocket max market cap tolerance",
 				zap.String("mint", d.Mint),
 				zap.Float64("ws_mcap_sol", d.MarketCapSol),
-zap.Float64("max_allowed", m.maxMarketCapSOL))
+zap.Float64("configured_max", m.maxMarketCapSOL),
+zap.Float64("max_allowed", maxMarketCapWithTolerance),
+zap.Float64("tolerance_pct", m.marketCapTolerancePct))
 			continue
 		}
 
@@ -982,7 +1012,7 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 
 	if m.maxTokenAge > 0 && !e.Created.IsZero() {
 		age := time.Since(e.Created)
-		maxToleranceAge := time.Duration(float64(m.maxTokenAge) * 1.15)
+maxToleranceAge := time.Duration(float64(m.maxTokenAge) * (1 + m.tokenMaxAgeTolerancePct/100))
 		if age > maxToleranceAge {
 			reason := fmt.Sprintf("token age %s exceeds max tolerance %s",
 				age.Truncate(time.Second), maxToleranceAge)
@@ -1006,8 +1036,9 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 		return
 	}
 
-if m.maxMarketCapSOL > 0 && e.MarketCapSOL > m.maxMarketCapSOL {
-reason := fmt.Sprintf("market cap %.6f SOL exceeds configured maximum %.6f SOL", e.MarketCapSOL, m.maxMarketCapSOL)
+maxMarketCapWithTolerance := m.maxMarketCapSOL * (1 + m.marketCapTolerancePct/100)
+if m.maxMarketCapSOL > 0 && e.MarketCapSOL > maxMarketCapWithTolerance {
+reason := fmt.Sprintf("market cap %.6f SOL exceeds maximum %.6f SOL with %.2f%% tolerance", e.MarketCapSOL, m.maxMarketCapSOL, m.marketCapTolerancePct)
 		_ = m.db.RecordAssessment(e.Mint, false, reason)
 		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 		m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.String("reason", reason))
@@ -1245,7 +1276,11 @@ func (m *Monitor) positionExitReason(mint string, returnPct float64, openedAt, n
 		positions.Position{Mint: mint, CostSOL: cost, PeakSOL: peakValue, OpenedAt: openedAt},
 		currentValue,
 		true,
-		positions.Limits{TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, TrailingStopPct: m.trailingStop, MaxHold: m.maxHold},
+positions.Limits{
+TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, TrailingStopPct: m.trailingStop,
+TrailingStopArmPct: m.trailingStopArmPct, ExitTriggerBufferPct: m.exitTriggerBufferPct,
+MaxHold: m.maxHold,
+},
 		now,
 	)
 }
