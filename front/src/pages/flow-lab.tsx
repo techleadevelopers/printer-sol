@@ -8,6 +8,9 @@ type LabInputs = {
   executionMode: 'paper' | 'live';
   websocketMarketCap: boolean;
   rpcAvailable: boolean;
+  rpcLatencyMs: number;
+  legacyEntryRpcTimeoutMs: number;
+  liveSnipeTimeoutMs: number;
   activePositionExists: boolean;
   previousBuyExists: boolean;
   creatorBlocked: boolean;
@@ -17,7 +20,9 @@ type LabInputs = {
   realSolReserves: number;
   minReserves: number;
   maxReserves: number;
-  marketCapSol: number;
+  websocketMarketCapSol: number;
+  rpcMarketCapSol: number;
+  marketCapDifferenceAlertPct: number;
   minMarketCap: number;
   maxMarketCap: number;
   ageAtDetection: number;
@@ -49,6 +54,9 @@ const DEFAULTS: LabInputs = {
   executionMode: 'live',
   websocketMarketCap: true,
   rpcAvailable: true,
+  rpcLatencyMs: 350,
+  legacyEntryRpcTimeoutMs: 2000,
+  liveSnipeTimeoutMs: 15000,
   activePositionExists: false,
   previousBuyExists: false,
   creatorBlocked: false,
@@ -58,7 +66,9 @@ const DEFAULTS: LabInputs = {
   realSolReserves: 0.7,
   minReserves: 0,
   maxReserves: 1.5,
-  marketCapSol: 35,
+  websocketMarketCapSol: 35,
+  rpcMarketCapSol: 33,
+  marketCapDifferenceAlertPct: 5,
   minMarketCap: 20,
   maxMarketCap: 0,
   ageAtDetection: 1,
@@ -87,13 +97,15 @@ const DEFAULTS: LabInputs = {
 };
 
 type Check = { label: string; status: 'pass' | 'fail' | 'warn'; detail: string };
-type Simulation = { checks: Check[]; buyAllowed: boolean; impactBps: number; expectedTokens: number; minimumTokens: number; exitReason: string; backendReserveGap: boolean; reservesPass: boolean };
+type Simulation = { checks: Check[]; candidateAllowed: boolean; executionReady: boolean; impactBps: number; expectedTokens: number; minimumTokens: number; exitReason: string; reservesPass: boolean; marketCapDifferencePct: number };
 
 const PRESETS: { label: string; description: string; patch: Partial<LabInputs> }[] = [
   { label: 'Fluxo saudável', description: 'Entrada elegível e cotação dentro dos limites.', patch: {} },
-  { label: 'Feed/RPC indisponível', description: 'Falha fechada no modo que exige validação RPC.', patch: { websocketMarketCap: false, rpcAvailable: false } },
+  { label: 'RPC atrasado · WebSocket rápido', description: 'Candidato segue pelo feed; a execução live avalia o atraso separadamente.', patch: { websocketMarketCap: true, rpcLatencyMs: 5000 } },
+  { label: 'Feed/RPC indisponível', description: 'Compara a admissão WebSocket com o caminho RPC legado.', patch: { websocketMarketCap: false, rpcAvailable: false } },
   { label: 'Entrada atrasada', description: 'A idade excede o limite após espera e latência.', patch: { ageAtDetection: 23, entryDelay: 5, networkDelayMs: 2500 } },
-  { label: 'Reservas abaixo do mínimo', description: 'Exercita a faixa inclusiva da curva real em modo RPC.', patch: { websocketMarketCap: false, realSolReserves: 0.2, minReserves: 0.3 } },
+  { label: 'WS e RPC discordantes', description: 'Confere qual fonte decide o market cap sem esperar a outra.', patch: { websocketMarketCap: true, websocketMarketCapSol: 35, rpcMarketCapSol: 18 } },
+  { label: 'Reserva fora da faixa', description: 'Compara bloqueio no caminho RPC e aviso não bloqueante no WebSocket.', patch: { websocketMarketCap: false, realSolReserves: 0.2, minReserves: 0.3 } },
   { label: 'Cotação vencida', description: 'A cotação envelhece antes do envio.', patch: { quoteAgeMs: 2200, maxQuoteAgeMs: 1500 } },
   { label: 'Impacto alto', description: 'Ordem grande para a reserva virtual disponível.', patch: { orderSol: 1.2, virtualSolReserves: 5, maxCurveImpactBps: 1000 } },
   { label: 'Mint já comprado', description: 'Impede duplicar entrada ou repetir compra persistida.', patch: { previousBuyExists: true } },
@@ -103,16 +115,22 @@ const PRESETS: { label: string; description: string; patch: Partial<LabInputs> }
 function simulate(input: LabInputs): Simulation {
   const checks: Check[] = [];
   const elapsedAge = input.ageAtDetection + input.entryDelay + input.networkDelayMs / 1000;
-  const effectiveMarketCap = input.marketCapSol;
+  const rpcResponsiveForEntry = input.rpcAvailable && input.rpcLatencyMs <= input.legacyEntryRpcTimeoutMs;
+  const rpcResponsiveForLive = input.rpcAvailable && input.rpcLatencyMs <= input.liveSnipeTimeoutMs;
+  const effectiveMarketCap = input.websocketMarketCap ? input.websocketMarketCapSol : input.rpcMarketCapSol;
   const reservesPass = input.realSolReserves >= input.minReserves && input.realSolReserves <= input.maxReserves;
   const validTiming = input.ageAtDetection >= 0 && input.entryDelay >= 0 && input.networkDelayMs >= 0
-    && input.maxTokenAge >= 0 && Number.isFinite(elapsedAge);
+    && input.maxTokenAge >= 0 && input.rpcLatencyMs >= 0 && input.legacyEntryRpcTimeoutMs >= 0
+    && input.liveSnipeTimeoutMs >= 0 && Number.isFinite(elapsedAge);
   const validLimits = input.maxQuoteAgeMs >= 1 && input.maxQuoteAgeMs <= 120_000
     && input.requestedSlippageBps >= 0 && input.maxSlippageBps >= 1 && input.maxSlippageBps <= 10_000
     && input.maxCurveImpactBps >= 1 && input.maxCurveImpactBps <= 10_000;
   const marketCapPass = Number.isFinite(effectiveMarketCap) && effectiveMarketCap > 0
     && effectiveMarketCap >= input.minMarketCap
     && (input.maxMarketCap <= 0 || effectiveMarketCap <= input.maxMarketCap);
+  const marketCapDifferencePct = input.rpcMarketCapSol > 0
+    ? Math.abs(input.websocketMarketCapSol - input.rpcMarketCapSol) / input.rpcMarketCapSol * 100
+    : Number.POSITIVE_INFINITY;
 
   checks.push({
     label: 'Parâmetros de cenário',
@@ -132,10 +150,18 @@ function simulate(input: LabInputs): Simulation {
   });
   checks.push({
     label: 'Reservas reais da bonding curve · política esperada',
-    status: !input.rpcAvailable || !reservesPass ? 'fail' : 'pass',
-    detail: !input.rpcAvailable
-      ? 'RPC indisponível: reservas não verificáveis; política exige bloquear em qualquer modo'
-      : `${input.realSolReserves.toFixed(3)} SOL · faixa inclusiva ${input.minReserves.toFixed(3)}–${input.maxReserves.toFixed(3)} SOL`,
+    status: input.websocketMarketCap
+      ? !rpcResponsiveForEntry || !reservesPass ? 'warn' : 'pass'
+      : !rpcResponsiveForEntry || !reservesPass ? 'fail' : 'pass',
+    detail: input.websocketMarketCap
+      ? !rpcResponsiveForEntry
+        ? `RPC levou ${input.rpcLatencyMs} ms ou não respondeu; o caminho rápido não espera essa leitura. Reserva não confirmada antes da admissão.`
+        : !reservesPass
+          ? `${input.realSolReserves.toFixed(3)} SOL fora da faixa ${input.minReserves.toFixed(3)}–${input.maxReserves.toFixed(3)}; aviso não bloqueante no gate WebSocket atual.`
+          : `${input.realSolReserves.toFixed(3)} SOL dentro da faixa-alvo; observação RPC não bloqueia o caminho WebSocket.`
+      : !rpcResponsiveForEntry
+        ? `RPC indisponível ou acima do timeout do gate legado (${input.legacyEntryRpcTimeoutMs} ms); candidato bloqueado neste caminho.`
+        : `${input.realSolReserves.toFixed(3)} SOL · faixa inclusiva ${input.minReserves.toFixed(3)}–${input.maxReserves.toFixed(3)} SOL`,
   });
   checks.push({
     label: 'Duplicidade e posição anterior',
@@ -156,23 +182,29 @@ function simulate(input: LabInputs): Simulation {
   });
   checks.push({
     label: 'Market cap de entrada',
-    status: !input.websocketMarketCap && !input.rpcAvailable ? 'fail' : marketCapPass ? 'pass' : 'fail',
+    status: !input.websocketMarketCap && !rpcResponsiveForEntry ? 'fail' : marketCapPass ? 'pass' : 'fail',
     detail: `${effectiveMarketCap.toFixed(2)} SOL via ${input.websocketMarketCap ? 'WebSocket' : 'RPC'} · mínimo ${input.minMarketCap} SOL${input.maxMarketCap > 0 ? ` · máximo ${input.maxMarketCap} SOL` : ' · teto desativado'}`,
   });
+  checks.push({
+    label: 'Diferença de market cap entre fontes · diagnóstico',
+    status: Number.isFinite(marketCapDifferencePct) && marketCapDifferencePct <= input.marketCapDifferenceAlertPct ? 'pass' : 'warn',
+    detail: `${input.websocketMarketCapSol.toFixed(2)} SOL WS vs ${input.rpcMarketCapSol.toFixed(2)} SOL RPC · diferença ${Number.isFinite(marketCapDifferencePct) ? `${marketCapDifferencePct.toFixed(1)}%` : 'indisponível'} · aviso acima de ${input.marketCapDifferenceAlertPct}% · não bloqueia candidato`,
+  });
 
+  const strategyCheckCount = checks.length;
   const validQuoteInputs = input.orderSol > 0 && input.virtualSolReserves > 0 && input.virtualTokenReserves > 0;
   const expectedTokens = validQuoteInputs ? input.virtualTokenReserves * input.orderSol / (input.virtualSolReserves + input.orderSol) : 0;
   const impactBps = validQuoteInputs ? input.orderSol / (input.virtualSolReserves + input.orderSol) * 10_000 : Number.POSITIVE_INFINITY;
   const minimumTokens = expectedTokens * (1 - Math.min(input.requestedSlippageBps, input.maxSlippageBps) / 10_000);
   checks.push({
     label: 'Cotação da curva',
-    status: input.executionMode === 'paper' ? 'warn' : !validQuoteInputs || !input.rpcAvailable || input.quoteAgeMs > input.maxQuoteAgeMs ? 'fail' : 'pass',
+    status: input.executionMode === 'paper' ? 'warn' : !validQuoteInputs || !rpcResponsiveForLive || input.quoteAgeMs > input.maxQuoteAgeMs ? 'fail' : 'pass',
     detail: input.executionMode === 'paper'
       ? 'Informativo: o fluxo paper não executa a preparação live que valida idade da cotação'
       : !validQuoteInputs
         ? 'Ordem e reservas virtuais devem ser positivas para gerar uma cotação válida'
-        : !input.rpcAvailable
-          ? 'RPC indisponível: sem cotação fresca da curva'
+        : !rpcResponsiveForLive
+          ? `RPC indisponível ou acima do timeout de execução live (${input.liveSnipeTimeoutMs} ms)`
           : `idade ${input.quoteAgeMs} ms · máximo ${input.maxQuoteAgeMs} ms`,
   });
   checks.push({
@@ -188,7 +220,8 @@ function simulate(input: LabInputs): Simulation {
       : `${Number.isFinite(impactBps) ? impactBps.toFixed(1) : 'inválido'} bps · máximo ${input.maxCurveImpactBps} bps`,
   });
 
-  const buyAllowed = checks.every(check => check.status !== 'fail');
+  const candidateAllowed = checks.slice(0, strategyCheckCount).every(check => check.status !== 'fail');
+  const executionReady = candidateAllowed && checks.slice(strategyCheckCount).every(check => check.status !== 'fail');
   const positionChange = input.positionCostSol > 0
     ? (input.currentPositionSol - input.positionCostSol) / input.positionCostSol * 100
     : 0;
@@ -207,8 +240,7 @@ function simulate(input: LabInputs): Simulation {
   else if (input.heldSeconds >= input.maxHoldSeconds && positionChange <= 0) exitReason = 'Max hold: posição no zero ou negativa.';
   else if (input.heldSeconds >= input.maxHoldSeconds && positionChange > 0) exitReason = 'Max hold atingido, mas posição positiva permanece aberta.';
 
-  const backendReserveGap = input.websocketMarketCap;
-  return { checks, buyAllowed, impactBps, expectedTokens, minimumTokens, exitReason, backendReserveGap, reservesPass };
+  return { checks, candidateAllowed, executionReady, impactBps, expectedTokens, minimumTokens, exitReason, reservesPass, marketCapDifferencePct };
 }
 
 function Field({ label, value, unit, step = 1, onChange }: { label: string; value: number; unit?: string; step?: number; onChange: (value: number) => void }) {
@@ -289,11 +321,11 @@ export default function FlowLabPage() {
             No paper, slippage solicitado ainda passa pelo limite configurado; idade de cotação e impacto da curva são informativos, pois não há preparação de swap live.
           </div>
           <label className="flex items-center justify-between gap-3 rounded-md border border-[hsl(var(--border))] p-3 text-xs">
-            <span><strong className="block">Market cap via WebSocket</strong><span className="mt-1 block muted">Desligado: gate RPC e reservas são obrigatórios.</span></span>
+            <span><strong className="block">Fast path via WebSocket</strong><span className="mt-1 block muted">Desligado: avaliação usa snapshot RPC, com timeout próprio.</span></span>
             <input aria-label="Usar market cap via WebSocket" type="checkbox" checked={input.websocketMarketCap} onChange={event => set('websocketMarketCap', event.target.checked)} />
           </label>
           <label className="flex items-center justify-between gap-3 rounded-md border border-[hsl(var(--border))] p-3 text-xs">
-            <span><strong className="block">RPC disponível</strong><span className="mt-1 block muted">Falha fecha a entrada nos gates que exigem RPC.</span></span>
+            <span><strong className="block">RPC disponível</strong><span className="mt-1 block muted">Controla gates RPC sem pausar o monitor WebSocket.</span></span>
             <input aria-label="RPC disponível" type="checkbox" checked={input.rpcAvailable} onChange={event => set('rpcAvailable', event.target.checked)} />
           </label>
           <label className="flex items-center justify-between gap-3 rounded-md border border-[hsl(var(--border))] p-3 text-xs">
@@ -315,12 +347,17 @@ export default function FlowLabPage() {
           <Field label="Reservas reais da curva" value={input.realSolReserves} unit="SOL" step={0.01} onChange={v => set('realSolReserves', v)} />
           <Field label="Faixa inclusiva de reservas" value={input.minReserves} unit="mín. SOL" step={0.01} onChange={v => set('minReserves', v)} />
           <Field label="Teto de reservas" value={input.maxReserves} unit="máx. SOL" step={0.01} onChange={v => set('maxReserves', v)} />
-          <Field label="Market cap" value={input.marketCapSol} unit="SOL" step={1} onChange={v => set('marketCapSol', v)} />
+          <Field label="Market cap do WebSocket" value={input.websocketMarketCapSol} unit="SOL" step={1} onChange={v => set('websocketMarketCapSol', v)} />
+          <Field label="Market cap do RPC" value={input.rpcMarketCapSol} unit="SOL" step={1} onChange={v => set('rpcMarketCapSol', v)} />
+          <Field label="Diferença WS/RPC para alerta" value={input.marketCapDifferenceAlertPct} unit="%" step={0.5} onChange={v => set('marketCapDifferenceAlertPct', v)} />
           <Field label="Limites de market cap" value={input.minMarketCap} unit="mín. SOL" step={1} onChange={v => set('minMarketCap', v)} />
           <Field label="Teto de market cap (0 = desligado)" value={input.maxMarketCap} unit="máx. SOL" step={1} onChange={v => set('maxMarketCap', v)} />
           <Field label="Idade ao detectar" value={input.ageAtDetection} unit="segundos" step={0.1} onChange={v => set('ageAtDetection', v)} />
           <Field label="Espera antes de avaliar" value={input.entryDelay} unit="segundos" step={0.1} onChange={v => set('entryDelay', v)} />
           <Field label="Latência até avaliação" value={input.networkDelayMs} unit="ms" step={10} onChange={v => set('networkDelayMs', v)} />
+          <Field label="Latência observada do RPC" value={input.rpcLatencyMs} unit="ms" step={10} onChange={v => set('rpcLatencyMs', v)} />
+          <Field label="Timeout do gate RPC sem WS" value={input.legacyEntryRpcTimeoutMs} unit="ms" step={100} onChange={v => set('legacyEntryRpcTimeoutMs', v)} />
+          <Field label="Timeout da snipe live" value={input.liveSnipeTimeoutMs} unit="ms" step={100} onChange={v => set('liveSnipeTimeoutMs', v)} />
           <Field label="Idade máxima do token (0 = desligado)" value={input.maxTokenAge} unit="segundos" step={1} onChange={v => set('maxTokenAge', v)} />
           <Field label="Tamanho da ordem de compra" value={input.orderSol} unit="SOL" step={0.005} onChange={v => set('orderSol', v)} />
           <Field label="Reservas virtuais de SOL" value={input.virtualSolReserves} unit="SOL" step={0.1} onChange={v => set('virtualSolReserves', v)} />
@@ -332,7 +369,7 @@ export default function FlowLabPage() {
           <Field label="Impacto máximo da curva" value={input.maxCurveImpactBps} unit="bps" step={10} onChange={v => set('maxCurveImpactBps', v)} />
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[hsl(var(--border))] px-4 py-3">
-          <span className="text-[10px] muted">Reservas reais verificam elegibilidade; reservas virtuais estimam impacto da ordem.</span>
+          <span className="text-[10px] muted">Reserva real compara a política; a reserva virtual estima o impacto da ordem.</span>
           <button className="button button-primary button-small" type="button" onClick={() => setHasRun(true)}><Play size={13} /> Executar cenário</button>
         </div>
       </section>
@@ -341,14 +378,15 @@ export default function FlowLabPage() {
         <section className="panel">
           <div className="flex items-center justify-between border-b border-[hsl(var(--border))] px-4 py-3">
             <h2 className="m-0 text-sm font-semibold">Trilha de decisão</h2>
-            <span className={`text-xs font-semibold ${result.buyAllowed ? 'positive' : 'negative'}`}>{result.buyAllowed ? 'COMPRA ELEGÍVEL' : 'COMPRA BLOQUEADA'}</span>
+            <span className={`text-xs font-semibold ${result.candidateAllowed ? 'positive' : 'negative'}`}>{result.candidateAllowed ? 'CANDIDATO ADMITIDO' : 'CANDIDATO BLOQUEADO'}</span>
           </div>
           <div className="px-4 py-1">{result.checks.map(check => <CheckRow key={check.label} check={check} />)}</div>
           <div className="border-t border-[hsl(var(--border))] p-4">
             <div className="eyebrow">RESULTADO DO CENÁRIO</div>
-            <p className="mb-0 mt-2 text-xs leading-5 muted">{hasRun ? `Cenário processado localmente. ${result.buyAllowed ? 'Os gates simulados aprovaram a entrada.' : 'Um ou mais gates simularam bloqueio.'}` : 'Ajuste os parâmetros ou escolha um preset; os resultados são recalculados ao vivo. Clique em “Executar cenário” para registrar que avaliou esta configuração.'}</p>
+            <div className={`mt-2 text-xs font-semibold ${result.executionReady ? 'positive' : 'warning'}`}>{input.executionMode === 'live' ? result.executionReady ? 'Gates locais de execução live: prontos' : 'Candidato e execução live: verificar bloqueios acima' : result.candidateAllowed ? 'Candidato admitido no fluxo paper' : 'Candidato bloqueado no fluxo paper'}</div>
+            <p className="mb-0 mt-2 text-xs leading-5 muted">{hasRun ? `Cenário processado localmente. ${result.candidateAllowed ? 'O caminho de estratégia admitiu o candidato.' : 'Um gate de estratégia impediu a admissão.'}` : 'Ajuste os parâmetros ou escolha um preset; os resultados são recalculados ao vivo. Clique em “Executar cenário” para registrar que avaliou esta configuração.'}</p>
           </div>
-          {result.backendReserveGap && <div className="border-t border-amber-400/25 bg-amber-400/5 p-4 text-xs leading-5 warning" role="alert"><strong>Desvio de política encontrado no backend:</strong> a política documentada exige validar reservas em todos os modos, mas o caminho atual de market cap WebSocket desativa o gate de reservas na avaliação do candidato. {input.rpcAvailable && result.reservesPass ? 'Este cenário está dentro da faixa; altere as reservas para fora dos limites para reproduzir a divergência.' : 'Neste cenário, a política esperada bloqueia, mas o gate de entrada WebSocket não consulta as reservas.'} A preparação de uma execução live ainda pode falhar depois ao exigir cotação RPC. O backend não foi alterado.</div>}
+          <div className="border-t border-sky-400/25 bg-sky-400/5 p-4 text-xs leading-5 technical" role="note"><strong>Dois estágios, sem confundir atraso com rejeição:</strong> {input.websocketMarketCap ? 'o candidato é avaliado pelo market cap WebSocket sem esperar o snapshot RPC de reservas. A leitura de reservas fica marcada como não confirmada/fora da faixa, sem travar a admissão rápida.' : 'o caminho legado precisa do snapshot RPC para market cap e reservas; latência acima do timeout impede essa avaliação.'} Depois da admissão, uma compra live ainda depende de cotação RPC fresca, slippage e impacto dentro dos limites. Isso bloqueia a execução daquela ordem, não deve congelar o monitor nem as demais avaliações.</div>
         </section>
         <section className="panel">
           <div className="border-b border-[hsl(var(--border))] px-4 py-3"><h2 className="m-0 text-sm font-semibold">Cotação estimada da compra</h2></div>
@@ -420,7 +458,7 @@ export default function FlowLabPage() {
       <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-3">
         {[
           ['Idade e atraso', 'A idade é checada depois da espera; no limite exato, o token é rejeitado.'],
-          ['Feed WebSocket', 'Market cap WS pode aprovar o gate sem validar reservas reais nessa etapa; o painel sinaliza isso.'],
+          ['Feed WebSocket e RPC', 'No fast path, a decisão de market cap usa WS; RPC pode divergir ou atrasar sem bloquear a admissão. Compare os dois valores e o estágio de execução separado.'],
           ['Reservas não são volume', 'O limite observa reservas reais SOL da curva, uma proxy de liquidez — não volume negociado acumulado.'],
           ['Cotação e slippage', 'No live, cotação vencida e impacto bloqueiam a preparação; slippage acima do limite também é rejeitada. Paper não modela execução de swap.'],
           ['Impacto e tamanho', 'O impacto cresce com a ordem em relação à reserva virtual e pode bloquear ordens grandes.'],
