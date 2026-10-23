@@ -1,4 +1,4 @@
-modules = ["nodejs-20", "python-3.12", "go-1.21", "web", "rust-stable"]
+modules = ["nodejs-20", "python-3.12", "web", "rust-stable"]
 
 [nix]
 channel = "stable-25_05"
