@@ -357,10 +357,13 @@ func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint stri
 		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0}, nil
 	}
 
-	// CORRIGIDO: Pump.fun usa 6 decimais. Para calcular o MC em SOL corretamente:
-	// O token supply está em 1e6 (não 1e9).
-	priceFromReserves := float64(state.VirtualSOLReserves) / float64(state.VirtualTokenReserves)
-	state.MarketCapSOL = priceFromReserves * float64(state.TokenSupply) / 1e6
+	// RPC reserves are stored as lamports and 6-decimal token base units.
+	// Convert both reserves and supply to human units before calculating SOL market cap.
+	virtualSOLReservesSOL := float64(state.VirtualSOLReserves) / 1e9
+	virtualTokenReserves := float64(state.VirtualTokenReserves) / 1e6
+	tokenSupply := float64(state.TokenSupply) / 1e6
+	priceFromReserves := virtualSOLReservesSOL / virtualTokenReserves
+	state.MarketCapSOL = priceFromReserves * tokenSupply
 
 	if state.MarketCapSOL <= 0 || math.IsNaN(state.MarketCapSOL) || math.IsInf(state.MarketCapSOL, 0) {
 		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0}, nil

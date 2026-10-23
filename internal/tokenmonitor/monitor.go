@@ -1183,11 +1183,6 @@ func (m *Monitor) markTradeLocked(ctx context.Context, mint string, marketCapSOL
 		return
 	}
 
-	// CORREÇÃO: limita o returnPct a 1000% para evitar P&L absurdo
-	if returnPct > 1000 {
-		returnPct = 1000
-	}
-
 	m.log.Info("mark update",
 		zap.String("mint", mint),
 		zap.Float64("mcap_sol", marketCapSOL),
