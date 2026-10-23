@@ -3,7 +3,7 @@ import {
   AlertTriangle, Check, CircleHelp, FlaskConical, Play, RotateCcw, ShieldCheck,
   X,
 } from 'lucide-react';
-import { evaluateEntryFlow } from '@/lib/flow-lab-model.mjs';
+import { evaluateEntryFlow, evaluateExitFlow } from '@/lib/flow-lab-model.mjs';
 
 type LabInputs = {
   executionMode: 'paper' | 'live';
@@ -12,8 +12,12 @@ type LabInputs = {
   rpcLatencyMs: number;
   legacyEntryRpcTimeoutMs: number;
   liveSnipeTimeoutMs: number;
+  botAcceptingEntries: boolean;
+  reconciliationRequired: boolean;
+  solUsdPriceAvailable: boolean;
   activePositionExists: boolean;
   previousBuyExists: boolean;
+  databaseAvailable: boolean;
   creatorBlocked: boolean;
   queueAvailable: boolean;
   transactionOutcome: 'confirmed' | 'definitive-failure' | 'unknown';
@@ -38,6 +42,21 @@ type LabInputs = {
   requestedSlippageBps: number;
   maxSlippageBps: number;
   maxCurveImpactBps: number;
+  maxTradeSol: number;
+  priorityFeeSol: number;
+  maxPriorityFeeSol: number;
+  openPositions: number;
+  pendingBuys: number;
+  maxOpenPositions: number;
+  openExposureSol: number;
+  pendingExposureSol: number;
+  maxExposureSol: number;
+  dailyRealizedLossSol: number;
+  maxDailyLossSol: number;
+  availableBalanceSol: number;
+  feeReserveSol: number;
+  pendingReservedSol: number;
+  simulationBaseFeeSol: number;
   positionCostSol: number;
   currentPositionSol: number;
   peakPositionSol: number;
@@ -48,6 +67,7 @@ type LabInputs = {
   stopLossPct: number;
   trailingStopPct: number;
   trailingArmPct: number;
+  exitTriggerBufferPct: number;
   exitLiquidityVerified: boolean;
 };
 
@@ -58,8 +78,12 @@ const DEFAULTS: LabInputs = {
   rpcLatencyMs: 350,
   legacyEntryRpcTimeoutMs: 2000,
   liveSnipeTimeoutMs: 15000,
+  botAcceptingEntries: true,
+  reconciliationRequired: false,
+  solUsdPriceAvailable: true,
   activePositionExists: false,
   previousBuyExists: false,
+  databaseAvailable: true,
   creatorBlocked: false,
   queueAvailable: true,
   transactionOutcome: 'confirmed',
@@ -84,6 +108,21 @@ const DEFAULTS: LabInputs = {
   requestedSlippageBps: 500,
   maxSlippageBps: 1500,
   maxCurveImpactBps: 1000,
+  maxTradeSol: 0.035,
+  priorityFeeSol: 0.001,
+  maxPriorityFeeSol: 0.001,
+  openPositions: 0,
+  pendingBuys: 0,
+  maxOpenPositions: 20,
+  openExposureSol: 0,
+  pendingExposureSol: 0,
+  maxExposureSol: 0.5,
+  dailyRealizedLossSol: 0,
+  maxDailyLossSol: 0.15,
+  availableBalanceSol: 1,
+  feeReserveSol: 0.02,
+  pendingReservedSol: 0,
+  simulationBaseFeeSol: 0.000005,
   positionCostSol: 0.03,
   currentPositionSol: 0.03,
   peakPositionSol: 0.033,
@@ -94,6 +133,7 @@ const DEFAULTS: LabInputs = {
   stopLossPct: 25,
   trailingStopPct: 12,
   trailingArmPct: 10,
+  exitTriggerBufferPct: 0.5,
   exitLiquidityVerified: true,
 };
 
@@ -116,25 +156,7 @@ const PRESETS: { label: string; description: string; patch: Partial<LabInputs> }
 
 function simulate(input: LabInputs): Simulation {
   const flow = evaluateEntryFlow(input);
-  const positionChange = input.positionCostSol > 0
-    ? (input.currentPositionSol - input.positionCostSol) / input.positionCostSol * 100
-    : 0;
-  const peakGain = input.positionCostSol > 0
-    ? (input.peakPositionSol - input.positionCostSol) / input.positionCostSol * 100
-    : 0;
-  const drawdownFromPeak = input.peakPositionSol > 0
-    ? (input.peakPositionSol - input.currentPositionSol) / input.peakPositionSol * 100
-    : 0;
-  let exitReason = 'Manter posição: nenhum limite de saída acionado.';
-  if (!input.exitMarkFresh) exitReason = 'Sem saída: marca ausente ou desatualizada; posição permanece aberta.';
-  else if (!input.exitLiquidityVerified) exitReason = 'Sem saída: liquidez não verificada.';
-  else if (positionChange <= -input.stopLossPct) exitReason = 'Stop-loss: prioridade sobre os demais gatilhos.';
-  else if (peakGain >= input.trailingArmPct && drawdownFromPeak >= input.trailingStopPct) exitReason = 'Trailing stop: armado pelo pico e retração atingida.';
-  else if (positionChange >= input.takeProfitPct) exitReason = 'Take-profit: valorização atingiu o limite.';
-  else if (input.heldSeconds >= input.maxHoldSeconds && positionChange <= 0) exitReason = 'Max hold: posição no zero ou negativa.';
-  else if (input.heldSeconds >= input.maxHoldSeconds && positionChange > 0) exitReason = 'Max hold atingido, mas posição positiva permanece aberta.';
-
-  return { ...flow, exitReason };
+  return { ...flow, exitReason: evaluateExitFlow(input) };
 }
 
 function Field({ label, value, unit, step = 1, onChange }: { label: string; value: number; unit?: string; step?: number; onChange: (value: number) => void }) {
@@ -212,7 +234,7 @@ export default function FlowLabPage() {
             </select>
           </label>
           <div className="flex items-center rounded-md border border-[hsl(var(--border))] p-3 text-[11px] leading-5 muted">
-            No paper, slippage solicitado ainda passa pelo limite configurado; idade de cotação e impacto da curva são informativos, pois não há preparação de swap live.
+            Paper também respeita os limites comuns do motor. Cotação RPC, reservas virtuais e impacto live não são preparados nesse modo.
           </div>
           <label className="flex items-center justify-between gap-3 rounded-md border border-[hsl(var(--border))] p-3 text-xs">
             <span><strong className="block">Fast path via WebSocket</strong><span className="mt-1 block muted">Desligado: avaliação usa snapshot RPC, com timeout próprio.</span></span>
@@ -231,6 +253,10 @@ export default function FlowLabPage() {
             <input type="checkbox" checked={input.previousBuyExists} onChange={event => set('previousBuyExists', event.target.checked)} />
           </label>
           <label className="flex items-center justify-between gap-3 rounded-md border border-[hsl(var(--border))] p-3 text-xs">
+            <span><strong className="block">Banco disponível</strong><span className="mt-1 block muted">A estratégia bloqueia a entrada se não conseguir validar estado persistido.</span></span>
+            <input type="checkbox" checked={input.databaseAvailable} onChange={event => set('databaseAvailable', event.target.checked)} />
+          </label>
+          <label className="flex items-center justify-between gap-3 rounded-md border border-[hsl(var(--border))] p-3 text-xs">
             <span><strong className="block">Criador bloqueado</strong><span className="mt-1 block muted">Simula bloqueio após stop-loss.</span></span>
             <input type="checkbox" checked={input.creatorBlocked} onChange={event => set('creatorBlocked', event.target.checked)} />
           </label>
@@ -243,7 +269,7 @@ export default function FlowLabPage() {
           <Field label="Teto de reservas" value={input.maxReserves} unit="máx. SOL" step={0.01} onChange={v => set('maxReserves', v)} />
           <Field label="Market cap do WebSocket" value={input.websocketMarketCapSol} unit="SOL" step={1} onChange={v => set('websocketMarketCapSol', v)} />
           <Field label="Market cap do RPC" value={input.rpcMarketCapSol} unit="SOL" step={1} onChange={v => set('rpcMarketCapSol', v)} />
-          <Field label="Diferença WS/RPC para alerta" value={input.marketCapDifferenceAlertPct} unit="%" step={0.5} onChange={v => set('marketCapDifferenceAlertPct', v)} />
+          <Field label="Diferença WS/RPC para aviso local" value={input.marketCapDifferenceAlertPct} unit="%" step={0.5} onChange={v => set('marketCapDifferenceAlertPct', v)} />
           <Field label="Limites de market cap" value={input.minMarketCap} unit="mín. SOL" step={1} onChange={v => set('minMarketCap', v)} />
           <Field label="Teto de market cap (0 = desligado)" value={input.maxMarketCap} unit="máx. SOL" step={1} onChange={v => set('maxMarketCap', v)} />
           <Field label="Idade ao detectar" value={input.ageAtDetection} unit="segundos" step={0.1} onChange={v => set('ageAtDetection', v)} />
@@ -261,6 +287,31 @@ export default function FlowLabPage() {
           <Field label="Slippage solicitado" value={input.requestedSlippageBps} unit="bps" step={10} onChange={v => set('requestedSlippageBps', v)} />
           <Field label="Limite máximo de slippage" value={input.maxSlippageBps} unit="bps" step={10} onChange={v => set('maxSlippageBps', v)} />
           <Field label="Impacto máximo da curva" value={input.maxCurveImpactBps} unit="bps" step={10} onChange={v => set('maxCurveImpactBps', v)} />
+        </div>
+        <div className="border-t border-[hsl(var(--border))] p-4">
+          <h3 className="eyebrow mb-3">Gates comuns do motor de execução</h3>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={input.botAcceptingEntries} onChange={event => set('botAcceptingEntries', event.target.checked)} /> Bot aceita entradas</label>
+            <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={input.reconciliationRequired} onChange={event => set('reconciliationRequired', event.target.checked)} /> Reconciliação pendente</label>
+            <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={input.solUsdPriceAvailable} onChange={event => set('solUsdPriceAvailable', event.target.checked)} /> Cotação SOL/USD disponível</label>
+          </div>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <Field label="Limite por operação" value={input.maxTradeSol} unit="SOL (0 = desligado)" step={0.005} onChange={v => set('maxTradeSol', v)} />
+            <Field label="Taxa prioritária da ordem" value={input.priorityFeeSol} unit="SOL" step={0.0001} onChange={v => set('priorityFeeSol', v)} />
+            <Field label="Limite da taxa prioritária" value={input.maxPriorityFeeSol} unit="SOL (0 = desligado)" step={0.0001} onChange={v => set('maxPriorityFeeSol', v)} />
+            <Field label="Posições abertas" value={input.openPositions} step={1} onChange={v => set('openPositions', v)} />
+            <Field label="Compras pendentes" value={input.pendingBuys} step={1} onChange={v => set('pendingBuys', v)} />
+            <Field label="Máximo de posições" value={input.maxOpenPositions} step={1} onChange={v => set('maxOpenPositions', v)} />
+            <Field label="Exposição aberta" value={input.openExposureSol} unit="SOL" step={0.01} onChange={v => set('openExposureSol', v)} />
+            <Field label="Exposição pendente" value={input.pendingExposureSol} unit="SOL" step={0.01} onChange={v => set('pendingExposureSol', v)} />
+            <Field label="Limite de exposição" value={input.maxExposureSol} unit="SOL (0 = desligado)" step={0.01} onChange={v => set('maxExposureSol', v)} />
+            <Field label="Perda realizada hoje" value={input.dailyRealizedLossSol} unit="SOL" step={0.01} onChange={v => set('dailyRealizedLossSol', v)} />
+            <Field label="Limite de perda diária" value={input.maxDailyLossSol} unit="SOL (0 = desligado)" step={0.01} onChange={v => set('maxDailyLossSol', v)} />
+            <Field label="Saldo disponível antes da ordem" value={input.availableBalanceSol} unit="SOL" step={0.01} onChange={v => set('availableBalanceSol', v)} />
+            <Field label="Reserva mínima de taxas" value={input.feeReserveSol} unit="SOL" step={0.001} onChange={v => set('feeReserveSol', v)} />
+            <Field label="Capital reservado em outras entradas" value={input.pendingReservedSol} unit="SOL" step={0.01} onChange={v => set('pendingReservedSol', v)} />
+            <Field label="Taxa-base paper" value={input.simulationBaseFeeSol} unit="SOL" step={0.000001} onChange={v => set('simulationBaseFeeSol', v)} />
+          </div>
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[hsl(var(--border))] px-4 py-3">
           <span className="text-[10px] muted">Reserva real compara a política; a reserva virtual estima o impacto da ordem.</span>
@@ -288,12 +339,12 @@ export default function FlowLabPage() {
             <div className="eyebrow">RESULTADO DO CENÁRIO</div>
             <div className={`mt-2 text-xs font-semibold ${result.entryFlowReady ? 'positive' : 'warning'}`}>
               {input.executionMode === 'paper'
-                ? result.candidateAllowed ? 'Candidato admitido no fluxo paper; execução live não se aplica' : 'Candidato bloqueado no fluxo paper'
-                : result.entryFlowReady ? 'Candidato admitido e gates de execução live prontos' : result.candidateAllowed ? 'Candidato admitido; execução live bloqueada nos gates acima' : 'Candidato bloqueado antes da execução'}
+                ? result.entryFlowReady ? 'Candidato admitido; limites comuns do motor paper aprovados' : result.candidateAllowed ? 'Candidato admitido; um limite comum do motor paper bloqueia a ordem' : 'Candidato bloqueado antes da execução'
+                : result.entryFlowReady ? 'Candidato admitido e gates do motor live aprovados' : result.candidateAllowed ? 'Candidato admitido; um gate do motor bloqueia a ordem' : 'Candidato bloqueado antes da execução'}
             </div>
             <p className="mb-0 mt-2 text-xs leading-5 muted">{hasRun ? `Cenário processado localmente. ${result.candidateAllowed ? 'A admissão passou pelos gates de entrada.' : 'Um gate de admissão impediu a entrada.'}` : 'Ajuste os parâmetros ou escolha um preset; os resultados são recalculados ao vivo. Clique em “Executar cenário” para registrar que avaliou esta configuração.'}</p>
           </div>
-          <div className="border-t border-sky-400/25 bg-sky-400/5 p-4 text-xs leading-5 technical" role="note"><strong>Estágios independentes:</strong> {input.websocketMarketCap ? 'o fast path aplica os limites de market cap WebSocket sem esperar o RPC de reservas. Uma reserva fora da faixa aparece como desconformidade diagnóstica, mas não muda a admissão neste caminho.' : 'o caminho legado depende do snapshot RPC para market cap e reservas; falha/timeout ou reserva fora da faixa bloqueiam essa avaliação.'} A compra live ainda exige cotação RPC fresca, slippage e impacto dentro dos limites. Esses gates podem impedir aquela ordem sem congelar o monitor nem as demais avaliações.</div>
+          <div className="border-t border-sky-400/25 bg-sky-400/5 p-4 text-xs leading-5 technical" role="note"><strong>Estágios independentes:</strong> {input.websocketMarketCap ? 'o fast path aplica os limites de market cap WebSocket sem esperar o RPC de reservas. A faixa de reservas é apenas um cenário diagnóstico e não altera a admissão.' : 'o caminho legado depende do snapshot RPC para market cap e reservas; falha/timeout ou reserva fora da faixa bloqueiam essa avaliação.'} Os limites do motor são avaliados depois da admissão e podem recusar uma ordem individual sem congelar o monitor nem as demais avaliações. Comparação WS/RPC nesta tela é hipotética: o fast path real não consulta RPC para validar reservas ou market cap.</div>
         </section>
         <section className="panel">
           <div className="border-b border-[hsl(var(--border))] px-4 py-3"><h2 className="m-0 text-sm font-semibold">Cotação estimada da compra</h2></div>
@@ -335,6 +386,7 @@ export default function FlowLabPage() {
         <Field label="Stop-loss" value={input.stopLossPct} unit="%" step={1} onChange={v => set('stopLossPct', v)} />
         <Field label="Trailing stop / armado em" value={input.trailingStopPct} unit="retração %" step={1} onChange={v => set('trailingStopPct', v)} />
         <Field label="Armar trailing após ganho" value={input.trailingArmPct} unit="%" step={1} onChange={v => set('trailingArmPct', v)} />
+        <Field label="Margem dos gatilhos de saída" value={input.exitTriggerBufferPct} unit="%" step={0.1} onChange={v => set('exitTriggerBufferPct', v)} />
         <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={input.exitLiquidityVerified} onChange={event => set('exitLiquidityVerified', event.target.checked)} /> Liquidez de saída verificada</label>
         <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={input.exitMarkFresh} onChange={event => set('exitMarkFresh', event.target.checked)} /> Marca atual válida e fresca</label>
         <div className="sm:col-span-2 lg:col-span-3 flex items-center gap-2 rounded-md border border-[hsl(var(--border))] p-3 text-xs">
@@ -367,7 +419,7 @@ export default function FlowLabPage() {
           ['Idade e atraso', 'A idade é checada depois da espera; no limite exato, o token é rejeitado.'],
           ['Feed WebSocket e RPC', 'No fast path, a decisão de market cap usa WS; RPC pode divergir ou atrasar sem bloquear a admissão. Compare os dois valores e o estágio de execução separado.'],
           ['Reservas não são volume', 'O limite observa reservas reais SOL da curva, uma proxy de liquidez — não volume negociado acumulado.'],
-          ['Cotação e slippage', 'No live, cotação vencida e impacto bloqueiam a preparação; slippage acima do limite também é rejeitada. Paper não modela execução de swap.'],
+          ['Cotação e slippage', 'Slippage acima do limite bloqueia paper e live; cotação vencida e impacto só bloqueiam a preparação live.'],
           ['Impacto e tamanho', 'O impacto cresce com a ordem em relação à reserva virtual e pode bloquear ordens grandes.'],
           ['Saída e confirmação', 'Max hold não encerra posição positiva; uma saída live precisa de confirmação, não só de estimativa.'],
         ].map(([title, text]) => <div key={title} className="rounded-md border border-[hsl(var(--border))] p-3"><div className="text-xs font-semibold">{title}</div><p className="mb-0 mt-1 text-[11px] leading-5 muted">{text}</p></div>)}

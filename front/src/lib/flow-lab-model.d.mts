@@ -8,8 +8,12 @@ export type EntryFlowInput = {
   rpcLatencyMs: number;
   legacyEntryRpcTimeoutMs: number;
   liveSnipeTimeoutMs: number;
+  botAcceptingEntries: boolean;
+  reconciliationRequired: boolean;
+  solUsdPriceAvailable: boolean;
   activePositionExists: boolean;
   previousBuyExists: boolean;
+  databaseAvailable: boolean;
   creatorBlocked: boolean;
   queueAvailable: boolean;
   realSolReserves: number;
@@ -32,6 +36,36 @@ export type EntryFlowInput = {
   requestedSlippageBps: number;
   maxSlippageBps: number;
   maxCurveImpactBps: number;
+  maxTradeSol: number;
+  priorityFeeSol: number;
+  maxPriorityFeeSol: number;
+  openPositions: number;
+  pendingBuys: number;
+  maxOpenPositions: number;
+  openExposureSol: number;
+  pendingExposureSol: number;
+  maxExposureSol: number;
+  dailyRealizedLossSol: number;
+  maxDailyLossSol: number;
+  availableBalanceSol: number;
+  feeReserveSol: number;
+  pendingReservedSol: number;
+  simulationBaseFeeSol: number;
+};
+
+export type ExitFlowInput = {
+  positionCostSol: number;
+  currentPositionSol: number;
+  peakPositionSol: number;
+  heldSeconds: number;
+  maxHoldSeconds: number;
+  exitMarkFresh: boolean;
+  exitLiquidityVerified: boolean;
+  takeProfitPct: number;
+  stopLossPct: number;
+  trailingStopPct: number;
+  trailingArmPct: number;
+  exitTriggerBufferPct: number;
 };
 
 export type EntryFlowResult = {
@@ -50,3 +84,4 @@ export type EntryFlowResult = {
 };
 
 export function evaluateEntryFlow(input: EntryFlowInput): EntryFlowResult;
+export function evaluateExitFlow(input: ExitFlowInput): string;
