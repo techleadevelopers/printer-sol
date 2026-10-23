@@ -45,7 +45,7 @@ func TestMaxHoldReleasesFlatPositionAfterLimit(t *testing.T) {
 				t.Fatalf("flat position exited before its hold limit: %q", got)
 			}
 			for _, age := range []time.Duration{90 * time.Second, 180 * time.Second, 30 * time.Minute} {
-				if got := ExitReason(position, 1, true, limits, openedAt.Add(age)); got != "max hold (position negative)" {
+				if got := ExitReason(position, 1, true, limits, openedAt.Add(age)); got != "max hold flat (liberar vaga)" {
 					t.Fatalf("flat position should release its slot after %s; got %q", age, got)
 				}
 			}
@@ -53,14 +53,14 @@ func TestMaxHoldReleasesFlatPositionAfterLimit(t *testing.T) {
 	}
 }
 
-func TestMaxHoldKeepsPositivePositionsOpen(t *testing.T) {
+func TestMaxHoldKeepsPositionsInDeadZoneOpen(t *testing.T) {
 	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
 	limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second}
 
-	for _, current := range []float64{1.01, 1.049, 1.30} {
+	for _, current := range []float64{0.901, 1.01, 1.049} {
 		if got := ExitReason(position, current, true, limits, openedAt.Add(90*time.Second)); got != "" {
-			t.Fatalf("positive return %.3f should remain open after max hold; got %q", current, got)
+			t.Fatalf("return %.3f should remain in the dead zone after max hold; got %q", current, got)
 		}
 	}
 }
@@ -71,22 +71,22 @@ func TestMaxHoldExitsNegativeReturnAtLimit(t *testing.T) {
 	limits := Limits{TakeProfitPct: 50, StopLossPct: 25, TrailingStopPct: 12, MaxHold: 90 * time.Second}
 
 	for _, current := range []float64{0.90, 0.89} {
-		if got := ExitReason(position, current, true, limits, openedAt.Add(90*time.Second)); got != "max hold (position negative)" {
+		if got := ExitReason(position, current, true, limits, openedAt.Add(90*time.Second)); got != "max hold (loss threshold)" {
 			t.Fatalf("negative return should max-hold close at %.2f; got %q", current, got)
 		}
 	}
 }
 
-func TestMaxHoldLeavesPositiveBoundaryOpenAndExitsNegativeBoundary(t *testing.T) {
+func TestMaxHoldExitsAtProfitAndLossBoundaries(t *testing.T) {
 	openedAt := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	position := Position{CostSOL: 1, PeakSOL: 1, OpenedAt: openedAt}
 	limits := Limits{MaxHold: 90 * time.Second}
 
-	if got := ExitReason(position, 1.05, true, limits, openedAt.Add(90*time.Second)); got != "" {
-		t.Fatalf("positive boundary should remain open; got %q", got)
+	if got := ExitReason(position, 1.05, true, limits, openedAt.Add(90*time.Second)); got != "max hold (gain threshold)" {
+		t.Fatalf("+5%% boundary should exit; got %q", got)
 	}
-	if got := ExitReason(position, 0.90, true, limits, openedAt.Add(90*time.Second)); got != "max hold (position negative)" {
-		t.Fatalf("negative boundary should max-hold close; got %q", got)
+	if got := ExitReason(position, 0.90, true, limits, openedAt.Add(90*time.Second)); got != "max hold (loss threshold)" {
+		t.Fatalf("-10%% boundary should max-hold close; got %q", got)
 	}
 }
 
@@ -96,10 +96,10 @@ func TestMaxHoldTableForPositiveThirtyAndNegativeTenPercent(t *testing.T) {
 	limits := Limits{MaxHold: 90 * time.Second}
 	now := openedAt.Add(91 * time.Second)
 
-	if got := ExitReason(position, 1.30, true, limits, now); got != "" {
-		t.Fatalf("+30%% return should remain open after max hold; got %q", got)
+	if got := ExitReason(position, 1.30, true, limits, now); got != "max hold (gain threshold)" {
+		t.Fatalf("+30%% return should close after max hold; got %q", got)
 	}
-	if got := ExitReason(position, 0.90, true, limits, now); got != "max hold (position negative)" {
+	if got := ExitReason(position, 0.90, true, limits, now); got != "max hold (loss threshold)" {
 		t.Fatalf("-10%% return should close after max hold; got %q", got)
 	}
 }

@@ -20,11 +20,11 @@ const defaults = {
   realSolReserves: 0.7,
   minReserves: 0,
   maxReserves: 1.5,
-  websocketMarketCapSol: 35,
-  rpcMarketCapSol: 33,
+  websocketMarketCapSol: 3.5,
+  rpcMarketCapSol: 3.3,
   marketCapDifferenceAlertPct: 5,
-  minMarketCap: 20,
-  maxMarketCap: 0,
+  minMarketCap: 0,
+  maxMarketCap: 4,
   ageAtDetection: 1,
   entryDelay: 5,
   networkDelayMs: 180,
@@ -72,12 +72,12 @@ test('fast WebSocket admission is independent of delayed RPC and live readiness'
 test('WebSocket market cap remains the admission source when RPC disagrees', () => {
   const result = evaluateEntryFlow({
     ...defaults,
-    websocketMarketCapSol: 35,
-    rpcMarketCapSol: 18,
+    websocketMarketCapSol: 3.5,
+    rpcMarketCapSol: 1.8,
   });
 
   assert.equal(result.candidateAllowed, true);
-  assert.match(result.admissionChecks.find(item => item.label === 'Market cap de entrada').detail, /35\.00 SOL via WebSocket/);
+  assert.match(result.admissionChecks.find(item => item.label === 'Market cap de entrada').detail, /3\.50 SOL via WebSocket/);
   assert.equal(result.sourceDifferenceCheck.status, 'warn');
   assert.equal(result.entryFlowReady, true);
 });
@@ -290,7 +290,7 @@ test('exit simulation uses the runtime trigger buffer without changing stop orde
   assert.match(takeProfit, /^Take-profit/);
 });
 
-test('max hold zero disables the timer; positive positions remain open after it', () => {
+test('max hold zero disables the timer; dead-zone positions remain open after it', () => {
   const disabled = evaluateExitFlow({
     ...exitDefaults,
     currentPositionSol: 0.9,
@@ -301,11 +301,11 @@ test('max hold zero disables the timer; positive positions remain open after it'
 
   const positive = evaluateExitFlow({
     ...exitDefaults,
-    currentPositionSol: 1.1,
-    peakPositionSol: 1.1,
+    currentPositionSol: 1.01,
+    peakPositionSol: 1.01,
     heldSeconds: 300,
   });
-  assert.match(positive, /posição positiva permanece aberta/);
+  assert.match(positive, /zona morta.*permanece aberta/);
 });
 
 test('max hold exits flat positions only with an enabled timer and a fresh mark', () => {
@@ -314,7 +314,7 @@ test('max hold exits flat positions only with an enabled timer and a fresh mark'
     heldSeconds: 300,
     currentPositionSol: 1,
   });
-  assert.match(flatAtMaxHold, /^Max hold/);
+  assert.match(flatAtMaxHold, /Max hold.*flat.*liberar vaga/);
 
   const staleStopLoss = evaluateExitFlow({
     ...exitDefaults,
@@ -322,6 +322,31 @@ test('max hold exits flat positions only with an enabled timer and a fresh mark'
     exitMarkFresh: false,
   });
   assert.match(staleStopLoss, /posição permanece aberta/);
+});
+
+test('max hold exits exactly at the +5% and -10% boundaries', () => {
+  const profitBoundary = evaluateExitFlow({
+    ...exitDefaults,
+    currentPositionSol: 1.05,
+    peakPositionSol: 1.05,
+    heldSeconds: 300,
+  });
+  assert.match(profitBoundary, /Max hold.*ganho.*5%/);
+
+  const lossBoundary = evaluateExitFlow({
+    ...exitDefaults,
+    currentPositionSol: 0.9,
+    heldSeconds: 300,
+  });
+  assert.match(lossBoundary, /Max hold.*perda.*10%/);
+
+  const deadZone = evaluateExitFlow({
+    ...exitDefaults,
+    currentPositionSol: 1.049,
+    peakPositionSol: 1.049,
+    heldSeconds: 300,
+  });
+  assert.match(deadZone, /zona morta.*permanece aberta/);
 });
 
 test('stop-loss takes precedence over a trailing-stop signal', () => {

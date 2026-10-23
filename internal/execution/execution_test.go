@@ -85,7 +85,7 @@ func TestSimulationChargesPriorityAndBaseFeePerTransaction(t *testing.T) {
 	}
 }
 
-func TestFailedSimulationSellDoesNotCloseOrChargePosition(t *testing.T) {
+func TestFailedSimulationSellClosesPositionWithoutChargingIt(t *testing.T) {
 	db, err := database.Open(filepath.Join(t.TempDir(), "failed-simulation-sell.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -117,8 +117,8 @@ func TestFailedSimulationSellDoesNotCloseOrChargePosition(t *testing.T) {
 	if id == "" {
 		t.Fatal("failed finalization did not retain its trade id")
 	}
-	if _, open, openErr := db.PositionOpenedAt("failed-paper-mint"); openErr != nil || !open {
-		t.Fatalf("failed simulated sell should keep position open: open=%v err=%v", open, openErr)
+	if _, open, openErr := db.PositionOpenedAt("failed-paper-mint"); openErr != nil || open {
+		t.Fatalf("failed simulated sell should close the position and release its slot: open=%v err=%v", open, openErr)
 	}
 
 	var state string

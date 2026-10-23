@@ -163,6 +163,7 @@ func (m *Manager) call(ctx context.Context, url, method string, params, result a
 type httpError struct{ status int }
 
 func (e *httpError) Error() string { return fmt.Sprintf("RPC HTTP %d", e.status) }
+func (e *httpError) StatusCode() int { return e.status }
 func httpStatus(err error) int {
 	var target *httpError
 	if errors.As(err, &target) {

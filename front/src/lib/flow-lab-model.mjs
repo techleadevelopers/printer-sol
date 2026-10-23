@@ -379,10 +379,16 @@ export function evaluateExitFlow(input) {
     return 'Take-profit: valorização atingiu o limite.';
   }
   if (input.maxHoldSeconds > 0 && input.heldSeconds >= input.maxHoldSeconds) {
-    if (positionChange <= 0) {
-      return 'Max hold: posição no zero ou negativa.';
+    if (positionChange === 0) {
+      return 'Max hold flat: liberar vaga.';
     }
-    return 'Max hold atingido, mas posição positiva permanece aberta.';
+    if (positionChange >= 5) {
+      return 'Max hold: ganho de pelo menos 5%, fechar posição.';
+    }
+    if (positionChange <= -10) {
+      return 'Max hold: perda de pelo menos 10%, fechar posição.';
+    }
+    return 'Max hold na zona morta entre -10% e +5%; posição permanece aberta.';
   }
   return 'Manter posição: nenhum limite de saída acionado.';
 }

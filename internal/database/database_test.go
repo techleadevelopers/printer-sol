@@ -605,3 +605,36 @@ func TestPreparedLiveSellPersistsQuoteAndBlocksDuplicateActiveTrade(t *testing.T
 		t.Fatal("database accepted a duplicate active trade for the same mint")
 	}
 }
+
+func TestReopenedPositionUsesNewEffectiveEntryTime(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "reopened-position-entry-time.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenPosition("reopened-mint", 0.1); err != nil {
+		t.Fatal(err)
+	}
+	firstOpenedAt, open, err := db.PositionOpenedAt("reopened-mint")
+	if err != nil || !open {
+		t.Fatalf("initial position open=%v err=%v", open, err)
+	}
+
+	staleOpenedAt := firstOpenedAt.Add(-time.Hour)
+	if _, err = db.Exec(`UPDATE positions SET status='closed',opened_at=? WHERE mint=?`, staleOpenedAt, "reopened-mint"); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.OpenPosition("reopened-mint", 0.2); err != nil {
+		t.Fatal(err)
+	}
+	reopenedAt, open, err := db.PositionOpenedAt("reopened-mint")
+	if err != nil || !open {
+		t.Fatalf("reopened position open=%v err=%v", open, err)
+	}
+	if !reopenedAt.After(staleOpenedAt) {
+		t.Fatalf("reopened position retained stale entry time %s; want a new effective entry time", reopenedAt)
+	}
+}

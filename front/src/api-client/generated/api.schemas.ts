@@ -226,6 +226,8 @@ export interface Token {
   riskResult: string | null;
   /** @nullable */
   decisionReason: string | null;
+  /** @nullable */
+  postEntryRiskReason: string | null;
   operationStatus: TokenStatus;
 }
 

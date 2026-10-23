@@ -146,7 +146,6 @@ func (d *DB) InsertTrade(t Trade) error {
 		if exitReason == "" {
 			exitReason = "unspecified exit"
 		}
-		realizedPnl = 0.0
 	}
 	tx, e := d.Begin()
 	if e != nil {
@@ -725,9 +724,14 @@ func (d *DB) ListTokens() (*sql.Rows, error) {
 	// The console shows persisted detections and their latest real assessment
 	// and operation state; it does not infer that an approved token was bought.
 	return d.Query(d.bind(`SELECT e.mint,COALESCE(e.creator,''),e.received_at,e.latency_ms
-		,r.approved,COALESCE(r.reason,''),COALESCE(t.side,''),COALESCE(t.state,''),COALESCE(p.status,'')
+		,r.approved,COALESCE(r.reason,''),COALESCE(t.side,''),COALESCE(t.state,''),COALESCE(p.status,''),
+		COALESCE((SELECT l.message FROM operational_logs l
+			WHERE l.event_type='post_entry_risk_screen'
+			AND l.payload_json LIKE '%' || e.mint || '%'
+			ORDER BY l.id DESC LIMIT 1),'')
 		FROM token_events e
-		LEFT JOIN risk_assessments r ON r.id=(SELECT MAX(r2.id) FROM risk_assessments r2 WHERE r2.mint=e.mint)
+		LEFT JOIN risk_assessments r ON r.id=(SELECT MAX(r2.id) FROM risk_assessments r2
+			WHERE r2.mint=e.mint AND r2.reason NOT LIKE 'post-entry risk screen:%')
 		LEFT JOIN trades t ON t.id=(SELECT t2.id FROM trades t2 WHERE t2.mint=e.mint ORDER BY t2.created_at DESC LIMIT 1)
 		LEFT JOIN positions p ON p.mint=e.mint
 		ORDER BY e.id DESC LIMIT 200`))
@@ -749,7 +753,7 @@ func (d *DB) FinalizeSimulationBuy(id, mint string, amount float64, feesOpt ...f
 		fees = feesOpt[0]
 	}
 	if _, err = tx.Exec(d.bind(`INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
-		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,updated_at=excluded.updated_at`),
+		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,opened_at=excluded.opened_at,updated_at=excluded.updated_at`),
 		mint, fmt.Sprint(amount), amount, "open", now, now); err != nil {
 		return err
 	}
@@ -837,7 +841,7 @@ func (d *DB) FinalizeLiveBuy(id, mint, state, signature string, cost, fees float
 
 	now := time.Now().UTC()
 	if _, err = tx.Exec(d.bind(`INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
-		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,updated_at=excluded.updated_at`),
+		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,opened_at=excluded.opened_at,updated_at=excluded.updated_at`),
 		mint, quantity, cost, "open", now, now); err != nil {
 		return err
 	}
@@ -1002,7 +1006,7 @@ func setSimulationTradeState(tx *sql.Tx, d *DB, id string, amount, fees float64,
 func (d *DB) OpenPosition(mint string, amount float64) error {
 	now := time.Now().UTC()
 	query := `INSERT INTO positions(mint,quantity,cost_sol,status,opened_at,updated_at) VALUES(?,?,?,?,?,?)
-		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,updated_at=excluded.updated_at`
+		ON CONFLICT(mint) DO UPDATE SET quantity=excluded.quantity,cost_sol=excluded.cost_sol,status=excluded.status,opened_at=excluded.opened_at,updated_at=excluded.updated_at`
 	_, e := d.Exec(d.bind(query), mint, fmt.Sprint(amount), amount, "open", now, now)
 	return e
 }
@@ -1414,7 +1418,10 @@ func (d *DB) SimulationAvailableBalanceSOL(initialBalance float64) (float64, err
 		WHERE t.state='simulated' AND t.side='sell' AND t.realized_pnl_sol IS NOT NULL
 		AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')),0)
 		- COALESCE((SELECT SUM(fees_sol) FROM trades WHERE state='simulated'),0)
-		- COALESCE((SELECT SUM(cost_sol) FROM positions WHERE status='open'),0)`), initialBalance).Scan(&balance)
+		- COALESCE((SELECT SUM(cost_sol) FROM positions WHERE status='open'),0)
+		- COALESCE((SELECT SUM(p.cost_sol) FROM positions p WHERE p.status='closed'
+			AND (SELECT t.state FROM trades t WHERE t.mint=p.mint AND t.side='sell'
+				ORDER BY t.created_at DESC,t.id DESC LIMIT 1)='failed'),0)`), initialBalance).Scan(&balance)
 	return balance, err
 }
 

@@ -429,10 +429,10 @@ function TokensPage() {
   const [cursor, setCursor] = useState<string | undefined>();
   const params = useMemo<GetTokensParams>(() => ({ limit: 30, ...(filter ? { status: filter as GetTokensParams['status'] } : {}), ...(mint ? { mint } : {}), ...(detectedFrom ? { detectedFrom: new Date(detectedFrom).toISOString() } : {}), ...(detectedTo ? { detectedTo: new Date(detectedTo).toISOString() } : {}), ...(cursor ? { cursor } : {}) }), [filter, mint, detectedFrom, detectedTo, cursor]);
   const page = useGetTokens(params, { query: { refetchInterval: LIVE_DATA_REFRESH_MS } });
-  return <DataPageFrame description="Fluxo de descoberta e triagem reportado pela API.">
+  return <DataPageFrame description="Fluxo de descoberta reportado pela API. Liquidez e trades aparecem indisponíveis quando não há métricas coletadas; isso não significa valor zero.">
     <section className="panel mb-4 p-4"><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><label className="text-xs muted">Estado<select className="select mt-1" value={filter} onChange={e => { setFilter(e.target.value); setCursor(undefined); }} aria-label="Filtrar por estado de análise" data-testid="select-token-status"><option value="">Todos os estados</option>{['detected','analyzing','approved','rejected','buy_submitted','buy_confirmed','buy_failed','position_open','sell_submitted','sell_confirmed'].map(x => <option value={x} key={x}>{x.replaceAll('_',' ')}</option>)}</select></label><label className="text-xs muted">Endereço mint<input className="input mt-1 mono" placeholder="Filtrar pelo mint" value={mint} onChange={e => { setMint(e.target.value); setCursor(undefined); }} /></label><label className="text-xs muted">Detetado a partir de<input type="datetime-local" className="input mt-1" value={detectedFrom} onChange={e => { setDetectedFrom(e.target.value); setCursor(undefined); }} /></label><label className="text-xs muted">Detetado até<input type="datetime-local" className="input mt-1" value={detectedTo} onChange={e => { setDetectedTo(e.target.value); setCursor(undefined); }} /></label></div></section>
     <QueryState loading={page.isLoading} error={page.isError} onRetry={() => void page.refetch()} />
-     {!page.isLoading && !page.isError && <section className="panel"><PanelTitle title="Deteções" aside={<span className="eyebrow">{page.data?.items.length ?? 0} REGISTOS</span>} />{page.data?.items.length ? <div className="table-wrap"><table><thead><tr><th>Detetado</th><th>Token</th><th>Mint / Criador</th><th>Análise</th><th>Liquidez</th><th>Trades</th><th>Risco / motivo</th><th>Operação</th></tr></thead><tbody>{page.data.items.map(t => <tr key={t.id}><td className="whitespace-nowrap text-xs muted">{fmtDate(t.detectedAt)}</td><td><div className="text-xs font-medium">{t.name || t.symbol || 'Token sem nome'}</div><div className="mono mt-1 text-[10px] muted">{t.symbol || 'Símbolo indisponível'}</div></td><td><div className="mono text-xs">{shortKey(t.mint)}</div><div className="mt-1 flex items-center gap-2"><span className="text-[10px] muted">Criador: {shortKey(t.creatorWallet)}</span><button type="button" className="button button-small" aria-label="Copiar endereço mint" onClick={() => void copyValue(t.mint, 'Endereço mint')}><Copy size={12} /></button></div></td><td><StatusTag value={t.analysisStatus} positive={['approved']} negative={['rejected', 'buy_failed']} warning={['detected', 'analyzing']} /></td><td className="mono text-xs">{fmtSol(t.liquiditySol)}</td><td className="mono text-xs">{fmt(t.tradeCount, 0)}</td><td><div className="text-xs">{t.riskResult || 'Indisponível'}</div><div className="mt-1 max-w-52 text-xs muted">{t.decisionReason || 'Indisponível'}</div></td><td><StatusTag value={t.operationStatus} positive={['buy_confirmed', 'position_open', 'sell_confirmed']} negative={['buy_failed']} warning={['buy_submitted', 'sell_submitted']} /></td></tr>)}</tbody></table></div> : <EmptyRows>Não existem tokens para os filtros selecionados.</EmptyRows>}<Pagination nextCursor={page.data?.nextCursor} setCursor={setCursor} cursor={cursor} /></section>}
+     {!page.isLoading && !page.isError && <section className="panel"><PanelTitle title="Deteções" aside={<span className="eyebrow">{page.data?.items.length ?? 0} REGISTOS</span>} />{page.data?.items.length ? <div className="table-wrap"><table><thead><tr><th>Detetado</th><th>Token</th><th>Mint / Criador</th><th>Análise</th><th>Liquidez</th><th>Trades</th><th>Risco / motivo</th><th>Operação</th></tr></thead><tbody>{page.data.items.map(t => <tr key={t.id}><td className="whitespace-nowrap text-xs muted">{fmtDate(t.detectedAt)}</td><td><div className="text-xs font-medium">{t.name || t.symbol || 'Token sem nome'}</div><div className="mono mt-1 text-[10px] muted">{t.symbol || 'Símbolo indisponível'}</div></td><td><div className="mono text-xs">{shortKey(t.mint)}</div><div className="mt-1 flex items-center gap-2"><span className="text-[10px] muted">Criador: {shortKey(t.creatorWallet)}</span><button type="button" className="button button-small" aria-label="Copiar endereço mint" onClick={() => void copyValue(t.mint, 'Endereço mint')}><Copy size={12} /></button></div></td><td><StatusTag value={t.analysisStatus} positive={['approved']} negative={['rejected', 'buy_failed']} warning={['detected', 'analyzing']} /></td><td className="mono text-xs">{fmtSol(t.liquiditySol)}</td><td className="mono text-xs">{fmt(t.tradeCount, 0)}</td><td><div className="text-xs">{t.riskResult || 'Indisponível'}</div><div className="mt-1 max-w-52 text-xs muted">{t.decisionReason || 'Indisponível'}</div>{t.postEntryRiskReason && <div className="mt-2 max-w-60 text-xs warning" title="Alerta pós-entrada; não fecha a posição automaticamente."><strong>Alerta pós-entrada:</strong> {t.postEntryRiskReason}</div>}</td><td><StatusTag value={t.operationStatus} positive={['buy_confirmed', 'position_open', 'sell_confirmed']} negative={['buy_failed']} warning={['buy_submitted', 'sell_submitted']} /></td></tr>)}</tbody></table></div> : <EmptyRows>Não existem tokens para os filtros selecionados.</EmptyRows>}<Pagination nextCursor={page.data?.nextCursor} setCursor={setCursor} cursor={cursor} /></section>}
   </DataPageFrame>;
 }
 function Pagination({ nextCursor, setCursor, cursor }: { nextCursor?: string | null; setCursor: (v?: string) => void; cursor?: string }) {
@@ -455,7 +455,7 @@ function PositionsPage() {
      {!page.isLoading && !page.isError && <section className="panel">
        <PanelTitle title="Posições" aside={<span className="eyebrow">{page.data?.items.length ?? 0} REGISTOS</span>} />
        {page.data?.items.length ? <div className="table-wrap"><table>
-         <thead><tr><th>Token / Mint</th><th>Capital investido</th><th>Taxas pagas</th><th>Valor estimado</th><th>P&L aberto estimado</th><th>P&L realizado líquido</th><th>Última marca</th><th>Aberta</th><th>Retenção</th><th>Estado / venda</th><th>Ação</th></tr></thead>
+          <thead><tr><th>Token / Mint</th><th>Capital investido</th><th>Taxas pagas</th><th>Valor estimado</th><th>P&L aberto estimado</th><th>P&L realizado líquido</th><th>Última marca</th><th>Aberta</th><th>Retenção</th><th>Posição / ordem de venda</th><th>Ação</th></tr></thead>
          <tbody>{page.data.items.map(p => {
            const markAge = p.markAgeSeconds;
            const markIsStale = markAge != null && markAge > 30;
@@ -471,7 +471,7 @@ function PositionsPage() {
              </td>
              <td className="whitespace-nowrap text-xs muted">{fmtDate(p.openedAt)}</td>
              <td className="whitespace-nowrap text-xs muted">{elapsedSince(p.openedAt)}</td>
-             <td><StatusTag value={p.status} positive={['open', 'closed']} warning={['closing']} negative={['failed']} /><div className="mt-1"><StatusTag value={p.sellStatus} positive={['confirmed']} warning={['submitted']} negative={['failed']} /></div></td>
+              <td><div className="flex items-center gap-1"><span className="eyebrow">Posição</span><StatusTag value={p.status} positive={['open', 'closed']} warning={['closing']} negative={['failed']} /></div><div className="mt-1 flex items-center gap-1"><span className="eyebrow">Venda</span><StatusTag value={p.sellStatus} positive={['confirmed']} warning={['submitted']} negative={['failed']} /></div></td>
              <td><button className="button button-small button-danger" disabled={p.status !== 'open' || sell.isPending} onClick={() => setSellId(p.id)}>Solicitar venda</button></td>
            </tr>;
          })}</tbody>
@@ -512,6 +512,11 @@ type RuntimeConfigView = {
   liveTradingEnabled: boolean;
   maxHoldSeconds: number;
   effectiveMaxHoldSeconds: number;
+  entryDelaySeconds: number;
+  tokenMaxAgeSeconds: number;
+  minMarketCapSol: number;
+  maxMarketCapSol: number;
+  useWsMarketCap: boolean;
 };
 
 function StrategyPage() {
@@ -532,6 +537,28 @@ function StrategyPage() {
         </div>
       </div>
       <p className="mb-0 px-4 pb-4 text-xs muted">Somente leitura. Para alterar, ajuste MAX_HOLD_SECONDS no ambiente do serviço e reinicie o backend.</p>
+    </section>}
+    {!q.isLoading && !q.isError && config && <section className="panel mt-4">
+      <PanelTitle title="Filtros efetivos de entrada" aside={<StatusTag value={config.useWsMarketCap ? 'websocket fast path' : 'RPC legacy path'} positive={['websocket fast path']} warning={['RPC legacy path']} />} />
+      <div className="grid gap-4 p-4 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="rounded-lg border border-border/70 p-4">
+          <div className="eyebrow">MIN_MARKET_CAP_SOL</div>
+          <div className="display mt-2 text-2xl">{config.minMarketCapSol == null ? 'Indisponível' : `${fmt(config.minMarketCapSol, 3)} SOL`}</div>
+        </div>
+        <div className="rounded-lg border border-border/70 p-4">
+          <div className="eyebrow">MAX_MARKET_CAP_SOL</div>
+          <div className="display mt-2 text-2xl">{config.maxMarketCapSol == null ? 'Indisponível' : config.maxMarketCapSol === 0 ? 'Sem teto' : `${fmt(config.maxMarketCapSol, 3)} SOL`}</div>
+        </div>
+        <div className="rounded-lg border border-border/70 p-4">
+          <div className="eyebrow">TOKEN_MAX_AGE_SECONDS</div>
+          <div className="display mt-2 text-2xl">{config.tokenMaxAgeSeconds == null ? 'Indisponível' : config.tokenMaxAgeSeconds === 0 ? 'Desativado' : `${fmt(config.tokenMaxAgeSeconds, 0)} s`}</div>
+        </div>
+        <div className="rounded-lg border border-border/70 p-4">
+          <div className="eyebrow">ENTRY_DELAY_SECONDS</div>
+          <div className="display mt-2 text-2xl">{config.entryDelaySeconds == null ? 'Indisponível' : `${fmt(config.entryDelaySeconds, 0)} s`}</div>
+        </div>
+      </div>
+      <p className="mb-0 px-4 pb-4 text-xs muted">Valores carregados pelo backend no início do serviço. O padrão do projeto limita a entrada a 4 SOL; uma variável de ambiente explícita substitui esse padrão. Mesmo com o corte de idade desativado, um mint sem timestamp confiável não passa pelo gate.</p>
     </section>}
   </DataPageFrame>;
 }

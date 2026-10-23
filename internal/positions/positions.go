@@ -3,6 +3,11 @@ package positions
 
 import "time"
 
+const (
+	maxHoldProfitExitPct = 5.0
+	maxHoldLossExitPct   = -10.0
+)
+
 type Limits struct {
 TakeProfitPct, StopLossPct, TrailingStopPct, TrailingStopArmPct, ExitTriggerBufferPct float64
 MaxSlippagePct, MaxExposureSOL, MaxDailyLossSOL                                        float64
@@ -23,9 +28,8 @@ type Position struct {
 //  2. stop loss            — the only reason that triggers creator blacklist
 //  3. trailing stop        — only after the peak armed the trailing arm
 //  4. take profit
-//  5. max hold             — only exits NEGATIVE (or flat) positions.
-//     Positive positions are left open so take profit / trailing stop
-//     can still run. This prevents cutting winners short.
+//  5. max hold             — exits flat positions, gains of 5% or more, and
+//     losses of 10% or more. The interval (-10%, +5%) stays open.
 func ExitReason(p Position, currentSOL float64, liquid bool, l Limits, now time.Time) string {
 	if !liquid {
 		return "insufficient verified liquidity"
@@ -55,12 +59,16 @@ if l.TakeProfitPct > 0 && change >= l.TakeProfitPct-l.ExitTriggerBufferPct {
 		return "take profit"
 	}
 
-	// Max hold only forces an exit for NEGATIVE (or flat) positions.
-	// Positive positions are left open so take profit and trailing stop
-	// can still run; closing them early would cut winners short.
+	// After max hold, release flat positions and exits outside the configured
+	// dead zone. Exactly flat is handled separately so it frees capacity.
 	if l.MaxHold > 0 && now.Sub(p.OpenedAt) >= l.MaxHold {
-		if change <= 0 {
-			return "max hold (position negative)"
+		switch {
+		case change == 0:
+			return "max hold flat (liberar vaga)"
+		case change >= maxHoldProfitExitPct:
+			return "max hold (gain threshold)"
+		case change <= maxHoldLossExitPct:
+			return "max hold (loss threshold)"
 		}
 	}
 	return ""

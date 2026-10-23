@@ -378,6 +378,18 @@ func (e *Engine) reconcileRows(ctx context.Context, rows *sql.Rows) error {
 	}
 	return nil
 }
+func (e *Engine) failPreparedTrade(id string, cause error) error {
+	if markErr := e.db.MarkTradeFailed(id); markErr != nil {
+		e.emit("risk_alert", map[string]any{
+			"tradeId": id,
+			"reason":  "could not persist failed trade state",
+			"detail":  markErr.Error(),
+		})
+		return fmt.Errorf("%w; could not persist failed trade state: %v", cause, markErr)
+	}
+	return cause
+}
+
 func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	e.executionGate.RLock()
 	defer e.executionGate.RUnlock()
@@ -502,8 +514,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	}
 	prepared, err := e.prepareLiveRequest(ctx, id, r)
 	if err != nil {
-		_ = e.db.MarkTradeFailed(id)
-		return id, err
+return id, e.failPreparedTrade(id, err)
 	}
 	amount := any(prepared.amount)
 	if prepared.denominatedInSOL {
@@ -511,48 +522,41 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	}
 	txBytes, err := e.portal.Prepare(ctx, pumpportal.Request{PublicKey: e.wallet.Address(), Action: r.Side, Mint: r.Mint, Amount: amount, DenominatedInSOL: fmt.Sprint(prepared.denominatedInSOL), Slippage: prepared.slippage, PriorityFee: r.PriorityFee, Pool: r.Pool})
 	if err != nil {
-		_ = e.db.MarkTradeFailed(id)
-		return id, err
+return id, e.failPreparedTrade(id, err)
 	}
 	tx, err := solana.TransactionFromBytes(txBytes)
 	if err != nil {
-		_ = e.db.MarkTradeFailed(id)
-		return id, fmt.Errorf("unsupported PumpPortal transaction encoding: %w", err)
+return id, e.failPreparedTrade(id, fmt.Errorf("unsupported PumpPortal transaction encoding: %w", err))
 	}
 	if err = tx.Sanitize(); err != nil {
-		_ = e.db.MarkTradeFailed(id)
-		return id, fmt.Errorf("unsafe transaction: %w", err)
+return id, e.failPreparedTrade(id, fmt.Errorf("unsafe transaction: %w", err))
 	}
 	if err = e.validatePreparedTransaction(tx, r, prepared); err != nil {
-		_ = e.db.MarkTradeFailed(id)
-		return id, fmt.Errorf("unsafe prepared transaction: %w", err)
+return id, e.failPreparedTrade(id, fmt.Errorf("unsafe prepared transaction: %w", err))
 	}
 	if prepared.quoteAgeLimit > 0 {
 		quoteAge := time.Since(prepared.quotedAt)
 		if quoteAge < 0 || quoteAge > time.Duration(prepared.quoteAgeLimit)*time.Millisecond {
-			_ = e.db.MarkTradeFailed(id)
-			return id, fmt.Errorf("bonding-curve quote exceeded MAX_QUOTE_AGE_MS before submission")
+return id, e.failPreparedTrade(id, fmt.Errorf("bonding-curve quote exceeded MAX_QUOTE_AGE_MS before submission"))
 		}
 		if err = e.db.UpdateTradeQuote(id, prepared.quotedAt, quoteAge.Milliseconds(), prepared.curveImpactBPS, prepared.minimumOutputSOL, prepared.requestedValueSOL, prepared.tokenQuantity); err != nil {
-			_ = e.db.MarkTradeFailed(id)
-			return id, fmt.Errorf("persist execution quote: %w", err)
+return id, e.failPreparedTrade(id, fmt.Errorf("persist execution quote: %w", err))
 		}
 	}
 	if !tx.IsSigner(e.wallet.PublicKey()) {
-		_ = e.db.MarkTradeFailed(id)
-		return id, fmt.Errorf("prepared transaction does not require operational wallet")
+return id, e.failPreparedTrade(id, fmt.Errorf("prepared transaction does not require operational wallet"))
 	}
 	if err = e.wallet.Sign(tx); err != nil {
-		_ = e.db.MarkTradeFailed(id)
-		return id, err
+return id, e.failPreparedTrade(id, err)
 	}
 	raw, err := tx.MarshalBinary()
 	if err != nil {
-		_ = e.db.MarkTradeFailed(id)
-		return id, err
+return id, e.failPreparedTrade(id, err)
 	}
 	signature := tx.Signatures[0].String()
-	_ = e.db.UpdateTradeState(id, "signed", signature, false)
+if err = e.db.UpdateTradeState(id, "signed", signature, false); err != nil {
+return id, e.failPreparedTrade(id, fmt.Errorf("persist signed trade before submission: %w", err))
+}
 	attempts := e.Limits().MaxAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -765,10 +769,18 @@ func (e *Engine) resolveSellFinalizationError(
 		return nil
 	}
 
-	definitiveFailure := snapshotErr == nil &&
-		(snapshot.TradeState == "prepared" || snapshot.TradeState == "confirmed") &&
-		(snapshot.TransactionState == "prepared" || snapshot.TransactionState == "confirmed") &&
-		snapshot.PositionState == "open"
+	definitiveFailure := snapshotErr == nil && snapshot.PositionState == "open"
+	if definitiveFailure && isSimulation {
+		// Paper sells have no external transaction side effect. An unknown
+		// persisted attempt can therefore be failed safely to release the slot.
+		definitiveFailure =
+			(snapshot.TradeState == "prepared" || snapshot.TradeState == "unknown") &&
+				(snapshot.TransactionState == "prepared" || snapshot.TransactionState == "unknown")
+	} else if definitiveFailure {
+		definitiveFailure =
+			(snapshot.TradeState == "prepared" || snapshot.TradeState == "confirmed") &&
+				(snapshot.TransactionState == "prepared" || snapshot.TransactionState == "confirmed")
+	}
 	var stateErr error
 	if definitiveFailure {
 		stateErr = markFailedFn(id, request.Mint)

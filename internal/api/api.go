@@ -279,10 +279,10 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var mint, creator, at, reason, tradeSide, tradeState, positionState string
+		var mint, creator, at, reason, tradeSide, tradeState, positionState, postEntryRiskReason string
 		var latency int64
 		var approved sql.NullBool
-		if err := rows.Scan(&mint, &creator, &at, &latency, &approved, &reason, &tradeSide, &tradeState, &positionState); err != nil {
+		if err := rows.Scan(&mint, &creator, &at, &latency, &approved, &reason, &tradeSide, &tradeState, &positionState, &postEntryRiskReason); err != nil {
 			fail(w, http.StatusInternalServerError, "database_unavailable", "could not read token state")
 			return
 		}
@@ -293,29 +293,34 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 			analysisStatus, riskResult = "rejected", "rejected"
 		}
 		operationStatus := analysisStatus
-		if positionState == "open" {
-			operationStatus = "position_open"
-		} else {
-			switch tradeState {
-			case "prepared", "signed", "submitted", "pending":
-				operationStatus = tradeSide + "_submitted"
-			case "simulated", "confirmed", "finalized":
-				operationStatus = tradeSide + "_confirmed"
-			case "failed":
-				operationStatus = tradeSide + "_failed"
-			case "unknown":
-				operationStatus = "unknown"
+		switch tradeState {
+		case "prepared", "signed", "submitted", "pending":
+			operationStatus = tradeSide + "_submitted"
+		case "simulated", "confirmed", "finalized":
+			operationStatus = tradeSide + "_confirmed"
+		case "failed":
+			operationStatus = tradeSide + "_failed"
+		case "unknown":
+			operationStatus = "unknown"
+		default:
+			if positionState == "open" {
+				operationStatus = "position_open"
 			}
 		}
 		var decisionReason any
 		if reason != "" {
 			decisionReason = reason
 		}
+		var postEntryRisk any
+		if postEntryRiskReason != "" {
+			postEntryRisk = postEntryRiskReason
+		}
 		out = append(out, map[string]any{
 			"id": mint, "detectedAt": at, "name": nil, "symbol": nil, "mint": mint,
 			"creatorWallet": creator, "analysisStatus": analysisStatus,
 			"liquiditySol": nil, "tradeCount": nil, "riskResult": riskResult,
-			"decisionReason": decisionReason, "operationStatus": operationStatus,
+			"decisionReason": decisionReason, "postEntryRiskReason": postEntryRisk,
+			"operationStatus": operationStatus,
 		})
 	}
 	write(w, 200, map[string]any{"items": out, "nextCursor": nil})
@@ -638,6 +643,11 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 			"liveTradingEnabled":     s.cfg.EnableLiveTrading,
 			"maxHoldSeconds":         s.cfg.MaxHoldSeconds,
 			"effectiveMaxHoldSeconds": s.monitor.MaxHoldSeconds(),
+"entryDelaySeconds":      s.cfg.EntryDelaySeconds,
+"tokenMaxAgeSeconds":     s.cfg.TokenMaxAgeSeconds,
+"minMarketCapSol":        s.cfg.MinMarketCapSOL,
+"maxMarketCapSol":        s.cfg.MaxMarketCapSOL,
+"useWsMarketCap":         s.cfg.UseWSMarketCap,
 			"limits":                 s.engine.Limits(),
 		})
 		return

@@ -130,6 +130,8 @@ stuckExitQuarantineAge          time.Duration
 	priceSourceStatusMu             sync.Mutex
 	priceSourceFailures             int
 	priceSourceAlerted              bool
+	rpcRateLimitFailures            int
+	rpcRateLimitUntil               time.Time
 }
 
 const exitRetryDelay = 5 * time.Second
@@ -245,8 +247,8 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		EntryDelay:            5 * time.Second,
 		MinVolumeBeforeBuySOL: 0,
 		MaxVolumeBeforeBuySOL: 1.5,
-		MinMarketCapSOL:       20,
-		MaxMarketCapSOL:       0,
+		MinMarketCapSOL:       0,
+		MaxMarketCapSOL:       4,
 StuckExitQuarantine:   defaultStuckExitQuarantineAge,
 TrailingStopArmPct:    10,
 ExitTriggerBufferPct:  0.5,
@@ -254,7 +256,7 @@ ExitTriggerBufferPct:  0.5,
 		PricePollInterval:     20 * time.Second,
 		SnipeConcurrency:      4,
 		SnipeTimeout:          15 * time.Second,
-		DedupeTTL:             60 * time.Second,
+		DedupeTTL:             30 * time.Minute,
 	}
 	if len(options) > 0 {
 		option := options[0]
@@ -357,7 +359,7 @@ func (m *Monitor) runSeenJanitor(ctx context.Context) {
 func (m *Monitor) pruneSeen(now time.Time) {
 	ttl := m.dedupeTTL
 	if ttl <= 0 {
-		ttl = 60 * time.Second
+		ttl = 30 * time.Minute
 	}
 	cutoff := now.Add(-ttl)
 	m.recentlyProcessed.Range(func(mint, value any) bool {
@@ -372,7 +374,7 @@ func (m *Monitor) pruneSeen(now time.Time) {
 func (m *Monitor) rememberMint(mint string, now time.Time) bool {
 	ttl := m.dedupeTTL
 	if ttl <= 0 {
-		ttl = 60 * time.Second
+		ttl = 30 * time.Minute
 	}
 	m.recentlyProcessedMu.Lock()
 	defer m.recentlyProcessedMu.Unlock()
@@ -397,7 +399,14 @@ func (m *Monitor) snipeEventExpired(event Event, now time.Time) bool {
 	}
 	ttl := m.dedupeTTL
 	if ttl <= 0 {
-		ttl = 60 * time.Second
+		ttl = 30 * time.Minute
+	}
+	queueTTL := m.snipeTimeout
+	if queueTTL <= 0 {
+		queueTTL = 15 * time.Second
+	}
+	if ttl > queueTTL {
+		ttl = queueTTL
 	}
 	return !now.Before(event.queuedAt.Add(ttl))
 }
@@ -879,9 +888,6 @@ func (m *Monitor) connect(ctx context.Context) error {
 		}
 		received := time.Now().UTC()
 		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
-		if created.IsZero() {
-			created = received
-		}
 
 		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
 		m.runOperation(func() {
@@ -992,17 +998,28 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 	}
 	if e.MarketCapSOL <= 0 {
 		reason := "missing creation market cap for take-profit baseline"
-		_ = m.db.RecordAssessment(e.Mint, false, reason)
+		m.persistAssessment(e.Mint, false, reason)
 		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 		return
 	}
 
-	if m.maxTokenAge > 0 && !e.Created.IsZero() {
+	if e.Created.IsZero() {
+		reason := "token creation timestamp unavailable; age cannot be verified"
+		m.persistAssessment(e.Mint, false, reason)
+		m.bus.Publish("token_rejected", map[string]any{
+			"mint": e.Mint, "reason": reason, "latencyMs": latency,
+		})
+		m.log.Info("token rejected without a verifiable creation timestamp", zap.String("mint", e.Mint))
+		return
+	}
+	if m.maxTokenAge > 0 {
 		age := time.Since(e.Created)
-		if age >= m.maxTokenAge {
-			reason := fmt.Sprintf("token age %s exceeds maximum %s",
-				age.Truncate(time.Second), m.maxTokenAge)
-			_ = m.db.RecordAssessment(e.Mint, false, reason)
+		if age < 0 || age >= m.maxTokenAge {
+			reason := fmt.Sprintf("token age %s exceeds maximum %s", age.Truncate(time.Second), m.maxTokenAge)
+			if age < 0 {
+				reason = "token creation timestamp is in the future"
+			}
+			m.persistAssessment(e.Mint, false, reason)
 			m.bus.Publish("token_rejected", map[string]any{
 				"mint": e.Mint, "reason": reason, "latencyMs": latency,
 			})
@@ -1017,20 +1034,20 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 	ok, reason := m.strategy.EvaluateFast(e.Mint, e.Created)
 	m.log.Info("token evaluated", zap.String("mint", e.Mint), zap.Bool("eligible", ok), zap.String("reason", reason), zap.Int64("latency_ms", latency))
 	if !ok || m.entry == nil {
-		_ = m.db.RecordAssessment(e.Mint, false, reason)
+		m.persistAssessment(e.Mint, false, reason)
 		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 		return
 	}
 
 	if e.MarketCapSOL < m.minMarketCapSOL {
 		reason := fmt.Sprintf("market cap %.6f SOL is below minimum %.6f SOL", e.MarketCapSOL, m.minMarketCapSOL)
-		_ = m.db.RecordAssessment(e.Mint, false, reason)
+		m.persistAssessment(e.Mint, false, reason)
 		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 		return
 	}
 	if m.maxMarketCapSOL > 0 && e.MarketCapSOL > m.maxMarketCapSOL {
 		reason := fmt.Sprintf("market cap %.6f SOL exceeds maximum %.6f SOL", e.MarketCapSOL, m.maxMarketCapSOL)
-		_ = m.db.RecordAssessment(e.Mint, false, reason)
+		m.persistAssessment(e.Mint, false, reason)
 		m.bus.Publish("token_rejected", map[string]any{"mint": e.Mint, "reason": reason, "latencyMs": latency})
 		m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.String("reason", reason))
 		return
@@ -1038,14 +1055,12 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 
 	id, entryErr := m.entry.BuyNewTokenUSD(ctx, e.Mint, m.tradeUSD, m.slippage, m.priorityFee, "pump", reason)
 	if entryErr != nil {
-		_ = m.db.RecordAssessment(e.Mint, false, entryErr.Error())
+		m.persistAssessment(e.Mint, false, entryErr.Error())
 		m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": entryErr.Error()})
 		m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.Error(entryErr))
 		return
 	}
-	if assessmentErr := m.db.RecordAssessment(e.Mint, true, reason); assessmentErr != nil {
-		m.log.Warn("record entered-token assessment", zap.Error(assessmentErr))
-	}
+	m.persistAssessment(e.Mint, true, reason)
 	if m.simulation {
 		if err := m.db.RecordPaperMark(e.Mint, e.MarketCapSOL); err != nil {
 			m.log.Warn("record paper mark", zap.Error(err))
@@ -1084,9 +1099,6 @@ func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {
 			detail = "risk screen did not return an explicit pass"
 		}
 		assessment := "post-entry risk screen: " + detail
-		if recordErr := m.db.RecordAssessment(mint, false, assessment); recordErr != nil {
-			m.log.Warn("record post-entry risk assessment", zap.String("mint", mint), zap.Error(recordErr))
-		}
 		payload, _ := json.Marshal(map[string]string{"mint": mint, "reason": detail})
 		if logErr := m.db.LogOperational("warn", "post_entry_risk_screen", assessment, string(payload)); logErr != nil {
 			m.log.Warn("record post-entry risk alert", zap.String("mint", mint), zap.Error(logErr))
