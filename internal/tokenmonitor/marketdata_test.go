@@ -180,18 +180,32 @@ func TestCandidateGateUsesWebSocketMarketCapAndEnforcesReserveRange(t *testing.T
 }
 
 func TestCandidateGateAppliesMarketCapMaximumWithoutTolerance(t *testing.T) {
-	monitor, closeDB := newMarketDataTestMonitor(t)
-	defer closeDB()
-	monitor.useWSMarketCap = true
-	monitor.maxMarketCapSOL = 150
-	event := testCandidate("market-cap-over-configured-maximum")
-	event.MarketCapSOL = 150.000001
-	if !monitor.addCandidate(event) {
-		t.Fatal("candidate was not queued")
-	}
-	monitor.checkCandidate(context.Background(), event.Mint)
-	if len(monitor.q) != 0 {
-		t.Fatal("candidate above MAX_MARKET_CAP_SOL was queued")
+	for _, test := range []struct {
+		name         string
+		marketCapSOL float64
+		wantQueued   bool
+	}{
+		{name: "at configured maximum", marketCapSOL: 150, wantQueued: true},
+		{name: "above configured maximum", marketCapSOL: 150.000001, wantQueued: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			monitor, closeDB := newMarketDataTestMonitor(t)
+			defer closeDB()
+			monitor.useWSMarketCap = true
+			monitor.maxMarketCapSOL = 150
+			event := testCandidate("market-cap-" + test.name)
+			event.MarketCapSOL = test.marketCapSOL
+			if !monitor.addCandidate(event) {
+				t.Fatal("candidate was not queued")
+			}
+			monitor.checkCandidate(context.Background(), event.Mint)
+			if test.wantQueued && len(monitor.q) != 1 {
+				t.Fatalf("candidate at MAX_MARKET_CAP_SOL %.6f was rejected", test.marketCapSOL)
+			}
+			if !test.wantQueued && len(monitor.q) != 0 {
+				t.Fatalf("candidate above MAX_MARKET_CAP_SOL %.6f was queued", test.marketCapSOL)
+			}
+		})
 	}
 }
 
