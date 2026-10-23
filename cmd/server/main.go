@@ -114,8 +114,10 @@ func main() {
 		tokenmonitor.Settings{
 			EntryDelay:            time.Duration(cfg.EntryDelaySeconds) * time.Second,
 			MinVolumeBeforeBuySOL: cfg.MinVolumeBeforeBuySOL,
+			MaxVolumeBeforeBuySOL: cfg.MaxVolumeBeforeBuySOL,
 			MinMarketCapSOL:       cfg.MinMarketCapSOL,
 			MaxMarketCapSOL:       cfg.MaxMarketCapSOL,
+			UseWSMarketCap:        cfg.UseWSMarketCap,
 			MaxTokenAge:           time.Duration(cfg.TokenMaxAgeSeconds) * time.Second,
 			PricePollInterval:     time.Duration(cfg.PricePollSeconds) * time.Second,
 			SnipeConcurrency:      cfg.SnipeConcurrency,

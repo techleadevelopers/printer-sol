@@ -14,12 +14,13 @@ import (
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
 	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, SkipPreflight, EnableRugCheck                                                                                                                  bool
+	UseWSMarketCap                                                                                                                                                                                        bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds                                                  int
 	SnipeConcurrency, SnipeTimeoutMS, DedupeTTLMS                                                                                                                                                           int
 	EntryDelaySeconds, PricePollSeconds                                                                                                                                                                      int
-	MinVolumeBeforeBuySOL, MinMarketCapSOL, MaxMarketCapSOL                                                                                                                                                  float64
+	MinVolumeBeforeBuySOL, MaxVolumeBeforeBuySOL, MinMarketCapSOL, MaxMarketCapSOL                                                                                                                         float64
 	RPCEndpoints                                                                                                                                                                                            []string
 }
 
@@ -54,6 +55,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.EnableRugCheck, err = boolEnv("ENABLE_RUGCHECK", true); err != nil {
+		return c, err
+	}
+	if c.UseWSMarketCap, err = boolEnv("USE_WS_MARKET_CAP", false); err != nil {
 		return c, err
 	}
 	if c.SimulationDatabaseURL != "" || c.RealDatabaseURL != "" {
@@ -109,7 +113,10 @@ func Load() (Config, error) {
 	if c.EntryDelaySeconds, err = intEnv("ENTRY_DELAY_SECONDS", 5); err != nil {
 		return c, err
 	}
-	if c.MinVolumeBeforeBuySOL, err = floatEnv("MIN_VOLUME_BEFORE_BUY", .02); err != nil {
+	if c.MinVolumeBeforeBuySOL, err = floatEnv("MIN_VOLUME_BEFORE_BUY", 0); err != nil {
+		return c, err
+	}
+	if c.MaxVolumeBeforeBuySOL, err = floatEnv("MAX_VOLUME_BEFORE_BUY", 1.5); err != nil {
 		return c, err
 	}
 	if c.MinMarketCapSOL, err = floatEnv("MIN_MARKET_CAP_SOL", 20); err != nil {
@@ -189,8 +196,11 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("queue, position, and timing values must be positive; entry delay must be under five minutes; submission attempts must be 1-6")
 	}
 	// ALTERADO: aceita 0 no MinVolumeBeforeBuySOL e MinMarketCapSOL (antes era <= 0)
-	if c.MinVolumeBeforeBuySOL < 0 || c.MinMarketCapSOL < 0 {
-		return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY and MIN_MARKET_CAP_SOL must be non-negative")
+	if c.MinVolumeBeforeBuySOL < 0 || c.MaxVolumeBeforeBuySOL <= 0 || c.MinMarketCapSOL < 0 {
+		return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY and MIN_MARKET_CAP_SOL must be non-negative; MAX_VOLUME_BEFORE_BUY must be positive")
+	}
+	if c.MaxVolumeBeforeBuySOL < c.MinVolumeBeforeBuySOL {
+		return c, fmt.Errorf("MAX_VOLUME_BEFORE_BUY must be greater than or equal to MIN_VOLUME_BEFORE_BUY")
 	}
 	if c.SnipeConcurrency < 1 || c.SnipeConcurrency > 10 || c.SnipeTimeoutMS < 1 || c.SnipeTimeoutMS > 120000 || c.DedupeTTLMS < 1 || c.DedupeTTLMS > 3600000 {
 		return c, fmt.Errorf("SNIPE_CONCURRENCY must be 1-10, SNIPE_TIMEOUT_MS must be 1-120000, and DEDUPE_TTL_MS must be 1-3600000")
@@ -201,7 +211,7 @@ func Load() (Config, error) {
 	if !c.Simulation && c.TokenMaxAgeSeconds == 0 {
 		return c, fmt.Errorf("live trading requires TOKEN_MAX_AGE_SECONDS > 0")
 	}
-	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuySOL, c.MinMarketCapSOL, c.MaxMarketCapSOL} {
+	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuySOL, c.MaxVolumeBeforeBuySOL, c.MinMarketCapSOL, c.MaxMarketCapSOL} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}

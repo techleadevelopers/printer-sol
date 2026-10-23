@@ -3,6 +3,7 @@ package tokenmonitor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -40,7 +41,8 @@ func newMarketDataTestMonitor(t *testing.T) (*Monitor, func()) {
 	monitor := New("", "", 8, db, strategy.New(db, time.Minute), &recordingEntrier{},
 		1, 0, 0, 50, 25, time.Minute, true, events.New(), zap.NewNop(),
 		Settings{
-			MinVolumeBeforeBuySOL: .02,
+			MinVolumeBeforeBuySOL: 0,
+			MaxVolumeBeforeBuySOL: 1.5,
 			MinMarketCapSOL:       20,
 			BondingCurve:          fixedBondingCurveMarketCap{marketCapSOL: 30, reservesSOL: .05},
 		})
@@ -85,6 +87,7 @@ func TestCandidateGateRejectsBelowRPCReserveOrMarketCapFloor(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			monitor, closeDB := newMarketDataTestMonitor(t)
 			defer closeDB()
+			monitor.minVolumeBeforeBuySOL = .02
 			monitor.bondingCurve = fixedBondingCurveMarketCap{
 				marketCapSOL: test.marketCap,
 				reservesSOL:  test.reservesSOL,
@@ -98,6 +101,61 @@ func TestCandidateGateRejectsBelowRPCReserveOrMarketCapFloor(t *testing.T) {
 				t.Fatal("candidate below an RPC threshold was queued")
 			}
 		})
+	}
+}
+
+func TestCandidateGateAllowsInclusiveRealReserveRange(t *testing.T) {
+	for _, reservesSOL := range []float64{0, 1.5} {
+		t.Run(fmt.Sprintf("reserves_%.1f", reservesSOL), func(t *testing.T) {
+			monitor, closeDB := newMarketDataTestMonitor(t)
+			defer closeDB()
+			monitor.bondingCurve = fixedBondingCurveMarketCap{
+				marketCapSOL: 30,
+				reservesSOL:  reservesSOL,
+			}
+			event := testCandidate(fmt.Sprintf("reserve-boundary-%v", reservesSOL))
+			if !monitor.addCandidate(event) {
+				t.Fatal("candidate was not queued")
+			}
+			monitor.checkCandidate(context.Background(), event.Mint)
+			if len(monitor.q) != 1 {
+				t.Fatalf("candidate at reserve boundary %.6f SOL was not queued", reservesSOL)
+			}
+		})
+	}
+}
+
+func TestCandidateGateRejectsAboveMaximumRealReserves(t *testing.T) {
+	monitor, closeDB := newMarketDataTestMonitor(t)
+	defer closeDB()
+	monitor.bondingCurve = fixedBondingCurveMarketCap{marketCapSOL: 30, reservesSOL: 1.500001}
+	event := testCandidate("reserve-above-maximum")
+	if !monitor.addCandidate(event) {
+		t.Fatal("candidate was not queued")
+	}
+	monitor.checkCandidate(context.Background(), event.Mint)
+	if len(monitor.q) != 0 {
+		t.Fatal("candidate above the configured real-reserve maximum was queued")
+	}
+}
+
+func TestCandidateGateCanUseWebSocketMarketCapButStillRequiresRPCCurve(t *testing.T) {
+	monitor, closeDB := newMarketDataTestMonitor(t)
+	defer closeDB()
+	monitor.useWSMarketCap = true
+	event := testCandidate("websocket-market-cap-entry")
+	event.MarketCapSOL = 55
+	if !monitor.addCandidate(event) {
+		t.Fatal("candidate was not queued")
+	}
+	monitor.checkCandidate(context.Background(), event.Mint)
+	select {
+	case queued := <-monitor.q:
+		if queued.MarketCapSOL != 55 {
+			t.Fatalf("entry baseline market cap = %f, want WebSocket value 55", queued.MarketCapSOL)
+		}
+	default:
+		t.Fatal("candidate with a valid RPC reserve and WebSocket market cap was not queued")
 	}
 }
 

@@ -174,6 +174,7 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 		"MAX_SLIPPAGE_PCT", "MAX_PRIORITY_FEE_SOL", "TOKEN_QUEUE_SIZE",
 		"MAX_OPEN_POSITIONS", "MAX_CONFIRMATION_WAIT_SECONDS", "MAX_SUBMISSION_ATTEMPTS",
 		"RPC_HEALTH_CHECK_INTERVAL_SECONDS", "ENTRY_DELAY_SECONDS", "MIN_VOLUME_BEFORE_BUY",
+		"MAX_VOLUME_BEFORE_BUY", "USE_WS_MARKET_CAP",
 		"MIN_MARKET_CAP_SOL",
 		"PRICE_POLL_SECONDS", "SNIPE_CONCURRENCY", "SNIPE_TIMEOUT_MS", "DEDUPE_TTL_MS",
 		"TRADE_USD", "SIMULATION_BALANCE_SOL", "SIMULATION_BASE_FEE_SOL",
@@ -212,8 +213,19 @@ func TestSimulationRequiresPriceFeedAndDefaultsExitControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinVolumeBeforeBuySOL != .02 || cfg.MinMarketCapSOL != 20 || cfg.PricePollSeconds != 20 || cfg.SnipeConcurrency != 4 || cfg.SnipeTimeoutMS != 15000 || cfg.DedupeTTLMS != 60000 || cfg.TokenMaxAgeSeconds != 30 {
+	if cfg.TradeUSD != 3 || cfg.StopLossPct != 25 || cfg.TakeProfitGrossPct != 50 || cfg.TrailingStopPct != 12 || cfg.MaxHoldSeconds != 300 || cfg.MaxSubmissionAttempts != 3 || cfg.SimulationBaseFeeSOL != 0.000005 || cfg.MaxPriorityFeeSOL != 0.001 || !cfg.LiveUnlockRequiresPaper || !cfg.SkipPreflight || cfg.EntryDelaySeconds != 5 || cfg.MinVolumeBeforeBuySOL != 0 || cfg.MaxVolumeBeforeBuySOL != 1.5 || cfg.UseWSMarketCap || cfg.MinMarketCapSOL != 20 || cfg.PricePollSeconds != 20 || cfg.SnipeConcurrency != 4 || cfg.SnipeTimeoutMS != 15000 || cfg.DedupeTTLMS != 60000 || cfg.TokenMaxAgeSeconds != 30 {
 		t.Fatalf("unexpected simulation defaults: tradeUsd=%.1f stop=%.1f take=%.1f trail=%.1f maxHold=%d attempts=%d baseFee=%.9f priorityFee=%.9f liveGate=%v skipPreflight=%v entryDelay=%d minVolumeSOL=%.3f minMarketCapSOL=%.1f pricePoll=%d snipeConcurrency=%d snipeTimeoutMs=%d dedupeTtlMs=%d tokenMaxAge=%d", cfg.TradeUSD, cfg.StopLossPct, cfg.TakeProfitGrossPct, cfg.TrailingStopPct, cfg.MaxHoldSeconds, cfg.MaxSubmissionAttempts, cfg.SimulationBaseFeeSOL, cfg.MaxPriorityFeeSOL, cfg.LiveUnlockRequiresPaper, cfg.SkipPreflight, cfg.EntryDelaySeconds, cfg.MinVolumeBeforeBuySOL, cfg.MinMarketCapSOL, cfg.PricePollSeconds, cfg.SnipeConcurrency, cfg.SnipeTimeoutMS, cfg.DedupeTTLMS, cfg.TokenMaxAgeSeconds)
+	}
+
+	_ = os.Setenv("MIN_VOLUME_BEFORE_BUY", "0.25")
+	_ = os.Setenv("MAX_VOLUME_BEFORE_BUY", "2")
+	_ = os.Setenv("USE_WS_MARKET_CAP", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MinVolumeBeforeBuySOL != .25 || cfg.MaxVolumeBeforeBuySOL != 2 || !cfg.UseWSMarketCap {
+		t.Fatalf("entry env overrides were not applied: min=%.2f max=%.2f useWSMarketCap=%v", cfg.MinVolumeBeforeBuySOL, cfg.MaxVolumeBeforeBuySOL, cfg.UseWSMarketCap)
 	}
 
 	_ = os.Setenv("MAX_HOLD_SECONDS", `"120"`)

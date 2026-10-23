@@ -48,8 +48,10 @@ type BondingCurveMarketCapSource interface {
 type Settings struct {
 	EntryDelay            time.Duration
 	MinVolumeBeforeBuySOL float64
+	MaxVolumeBeforeBuySOL float64
 	MinMarketCapSOL       float64
 	MaxMarketCapSOL       float64
+	UseWSMarketCap        bool
 	MaxTokenAge           time.Duration
 	PricePollInterval     time.Duration
 	SnipeConcurrency      int
@@ -62,6 +64,12 @@ type candidate struct {
 	event      Event
 	detectedAt time.Time
 	checking   bool
+}
+
+type pendingMark struct {
+	generation   uint64
+	marketCapSOL float64
+	source       string
 }
 
 type Monitor struct {
@@ -95,13 +103,18 @@ type Monitor struct {
 	exitRetryExhausted              sync.Map
 	candidateMu                     sync.Mutex
 	candidates                      map[string]*candidate
+	pendingMarksMu                  sync.Mutex
+	pendingMarks                    map[string]pendingMark
+	markWake                        chan struct{}
 	snipeMu                         sync.Mutex
 	snipePending                    map[string]time.Time
 	validationSlots                 chan struct{}
 	entryDelay                      time.Duration
 	minVolumeBeforeBuySOL           float64
+	maxVolumeBeforeBuySOL           float64
 	minMarketCapSOL                 float64
 	maxMarketCapSOL                 float64
+	useWSMarketCap                  bool
 	pricePollInterval               time.Duration
 	snipeConcurrency                int
 	snipeTimeout                    time.Duration
@@ -197,6 +210,9 @@ func (m *Monitor) ResetInMemoryState() {
 	m.candidateMu.Lock()
 	m.candidates = make(map[string]*candidate)
 	m.candidateMu.Unlock()
+	m.pendingMarksMu.Lock()
+	m.pendingMarks = make(map[string]pendingMark)
+	m.pendingMarksMu.Unlock()
 	m.snipeMu.Lock()
 	m.snipePending = make(map[string]time.Time)
 	m.snipeMu.Unlock()
@@ -223,7 +239,8 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 	}
 	settings := Settings{
 		EntryDelay:            5 * time.Second,
-		MinVolumeBeforeBuySOL: .02,
+		MinVolumeBeforeBuySOL: 0,
+		MaxVolumeBeforeBuySOL: 1.5,
 		MinMarketCapSOL:       20,
 		MaxMarketCapSOL:       0,
 		MaxTokenAge:           0,
@@ -237,8 +254,9 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		if option.EntryDelay > 0 {
 			settings.EntryDelay = option.EntryDelay
 		}
-		if option.MinVolumeBeforeBuySOL > 0 {
-			settings.MinVolumeBeforeBuySOL = option.MinVolumeBeforeBuySOL
+		settings.MinVolumeBeforeBuySOL = option.MinVolumeBeforeBuySOL
+		if option.MaxVolumeBeforeBuySOL > 0 {
+			settings.MaxVolumeBeforeBuySOL = option.MaxVolumeBeforeBuySOL
 		}
 		if option.MinMarketCapSOL > 0 {
 			settings.MinMarketCapSOL = option.MinMarketCapSOL
@@ -246,6 +264,7 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		if option.MaxMarketCapSOL > 0 {
 			settings.MaxMarketCapSOL = option.MaxMarketCapSOL
 		}
+		settings.UseWSMarketCap = option.UseWSMarketCap
 		if option.MaxTokenAge > 0 {
 			settings.MaxTokenAge = option.MaxTokenAge
 		}
@@ -273,12 +292,16 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		maxHold: maxHold, maxTokenAge: settings.MaxTokenAge,
 		simulation: simulation, subscriptions: make(chan string, size),
 		candidates:      make(map[string]*candidate),
+		pendingMarks:    make(map[string]pendingMark),
+		markWake:        make(chan struct{}, 1),
 		snipePending:    make(map[string]time.Time),
 		validationSlots: make(chan struct{}, settings.SnipeConcurrency),
 		entryDelay:      settings.EntryDelay,
 		minVolumeBeforeBuySOL: settings.MinVolumeBeforeBuySOL,
+		maxVolumeBeforeBuySOL: settings.MaxVolumeBeforeBuySOL,
 		minMarketCapSOL:       settings.MinMarketCapSOL,
 		maxMarketCapSOL:       settings.MaxMarketCapSOL,
+		useWSMarketCap:        settings.UseWSMarketCap,
 		pricePollInterval:     settings.PricePollInterval,
 		snipeConcurrency:      settings.SnipeConcurrency,
 		snipeTimeout:          settings.SnipeTimeout, dedupeTTL: settings.DedupeTTL,
@@ -300,6 +323,7 @@ func (m *Monitor) MaxHoldSeconds() int {
 func (m *Monitor) Run(ctx context.Context) {
 	m.restoreOpenPositions()
 	go m.consume(ctx)
+	go m.runTradeMarkWorker(ctx)
 	go m.runMaxHoldChecker(ctx)
 	go m.runSeenJanitor(ctx)
 	go m.runCandidateChecker(ctx)
@@ -812,7 +836,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 		}
 		if tracked {
 			if d.MarketCapSol > 0 {
-				m.markTrade(ctx, d.Mint, d.MarketCapSol)
+				m.queueTradeMark(d.Mint, d.MarketCapSol, "pumpportal_websocket_market_cap")
 			} else {
 				m.log.Warn("tracked token trade skipped without positive market cap",
 					zap.String("mint", d.Mint),
@@ -834,7 +858,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 			created = received
 		}
 
-		if m.maxMarketCapSOL > 0 && d.MarketCapSol > (m.maxMarketCapSOL*1.15) {
+		if m.useWSMarketCap && m.maxMarketCapSOL > 0 && d.MarketCapSol > (m.maxMarketCapSOL*1.15) {
 			m.log.Info("token rejected instantly by websocket max market cap tolerance",
 				zap.String("mint", d.Mint),
 				zap.Float64("ws_mcap_sol", d.MarketCapSol),
@@ -1055,6 +1079,50 @@ func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {
 
 func (m *Monitor) markTrade(ctx context.Context, mint string, marketCapSOL float64) {
 	m.markTradeWithSource(ctx, mint, marketCapSOL, "pumpportal_websocket_market_cap")
+}
+
+func (m *Monitor) queueTradeMark(mint string, marketCapSOL float64, source string) {
+	m.pendingMarksMu.Lock()
+	if m.pendingMarks == nil {
+		m.pendingMarks = make(map[string]pendingMark)
+	}
+	m.pendingMarks[mint] = pendingMark{
+		generation:   m.resetGeneration.Load(),
+		marketCapSOL: marketCapSOL,
+		source:       source,
+	}
+	m.pendingMarksMu.Unlock()
+
+	select {
+	case m.markWake <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Monitor) runTradeMarkWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.markWake:
+			for {
+				m.pendingMarksMu.Lock()
+				batch := m.pendingMarks
+				m.pendingMarks = make(map[string]pendingMark)
+				m.pendingMarksMu.Unlock()
+
+				if len(batch) == 0 {
+					break
+				}
+				for mint, mark := range batch {
+					if ctx.Err() != nil {
+						return
+					}
+					m.markTradeWithSourceAt(mark.generation, ctx, mint, mark.marketCapSOL, mark.source)
+				}
+			}
+		}
+	}
 }
 
 func (m *Monitor) markTradeWithSource(ctx context.Context, mint string, marketCapSOL float64, source string) {

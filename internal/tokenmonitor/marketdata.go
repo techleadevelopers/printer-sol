@@ -187,57 +187,42 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 	delete(m.candidates, mint)
 	m.candidateMu.Unlock()
 
-	// Se o RPC falhou OU se a reserva real é 0 (token novo/morto no RPC), NÃO REJEITAMOS.
-	// Usamos o WebSocket e seguimos para a fila.
-	if rpcErr != nil || realSOLReservesSOL == 0 {
-		marketCapToCheck := event.MarketCapSOL
-		if marketCapToCheck <= 0 {
-			m.rejectCandidate(event, "RPC failed/empty and no valid WebSocket market cap")
-			return
-		}
-
-		maxWithTolerance := m.maxMarketCapSOL * 1.15
-		minWithTolerance := m.minMarketCapSOL * 0.85
-
-		if m.maxMarketCapSOL > 0 && marketCapToCheck > maxWithTolerance {
-			m.rejectCandidate(event, fmt.Sprintf("websocket mcap %.2f exceeds max tolerance (%.2f)", marketCapToCheck, maxWithTolerance))
-			return
-		}
-		if m.minMarketCapSOL > 0 && marketCapToCheck < minWithTolerance {
-			m.rejectCandidate(event, fmt.Sprintf("websocket mcap %.2f below min tolerance (%.2f)", marketCapToCheck, minWithTolerance))
-			return
-		}
-
-		m.log.Info("RPC failed/empty or zero reserves, falling back to WebSocket",
-			zap.String("mint", mint),
-			zap.Float64("ws_mcap", marketCapToCheck))
-
-		queued, enqueueReason := m.enqueueSnipe(event)
-		if !queued {
-			m.rejectCandidate(event, enqueueReason)
-		}
+	if rpcErr != nil {
+		m.rejectCandidate(event, fmt.Sprintf("bonding-curve RPC could not verify real SOL reserves: %v", rpcErr))
 		return
 	}
 
-	// Se o RPC funcionou, usamos o valor do RPC como auditoria.
-	event.MarketCapSOL = rpcMarketCapSOL
+	marketCapToCheck := rpcMarketCapSOL
+	marketCapSource := "RPC"
+	if m.useWSMarketCap {
+		marketCapToCheck = event.MarketCapSOL
+		marketCapSource = "WebSocket"
+	}
+	if marketCapToCheck <= 0 || math.IsNaN(marketCapToCheck) || math.IsInf(marketCapToCheck, 0) {
+		m.rejectCandidate(event, fmt.Sprintf("%s market cap is missing or invalid", marketCapSource))
+		return
+	}
+	event.MarketCapSOL = marketCapToCheck
 
 	maxToleranceSOL := m.maxMarketCapSOL * 1.15
 	minToleranceSOL := m.minMarketCapSOL * 0.85
-	volToleranceSOL := m.minVolumeBeforeBuySOL * 0.85
 
-	if m.maxMarketCapSOL > 0 && rpcMarketCapSOL > maxToleranceSOL {
-		m.rejectCandidate(event, fmt.Sprintf("market cap %.6f SOL exceeds max tolerance (%.6f)", rpcMarketCapSOL, maxToleranceSOL))
+	if m.maxMarketCapSOL > 0 && marketCapToCheck > maxToleranceSOL {
+		m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL exceeds max tolerance (%.6f)", marketCapSource, marketCapToCheck, maxToleranceSOL))
 		return
 	}
 
-	if m.minMarketCapSOL > 0 && rpcMarketCapSOL < minToleranceSOL {
-		m.rejectCandidate(event, fmt.Sprintf("market cap %.6f SOL below min tolerance (%.6f)", rpcMarketCapSOL, minToleranceSOL))
+	if m.minMarketCapSOL > 0 && marketCapToCheck < minToleranceSOL {
+		m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL below min tolerance (%.6f)", marketCapSource, marketCapToCheck, minToleranceSOL))
 		return
 	}
 
-	if realSOLReservesSOL < volToleranceSOL {
-		m.rejectCandidate(event, fmt.Sprintf("volume %.6f SOL below tolerance (%.6f)", realSOLReservesSOL, volToleranceSOL))
+	if realSOLReservesSOL < m.minVolumeBeforeBuySOL {
+		m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL are below minimum %.6f SOL", realSOLReservesSOL, m.minVolumeBeforeBuySOL))
+		return
+	}
+	if realSOLReservesSOL > m.maxVolumeBeforeBuySOL {
+		m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL exceed maximum %.6f SOL", realSOLReservesSOL, m.maxVolumeBeforeBuySOL))
 		return
 	}
 
@@ -247,8 +232,8 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 	}
 
 	m.log.Info(fmt.Sprintf(
-		"ENTRY APPROVED (tolerant): mint=%s mcap=%.2f SOL, volume=%.2f SOL",
-		mint, rpcMarketCapSOL, realSOLReservesSOL,
+		"ENTRY APPROVED: mint=%s mcap=%.2f SOL (%s), bonding-curve real SOL reserves=%.6f SOL",
+		mint, marketCapToCheck, marketCapSource, realSOLReservesSOL,
 	))
 	queued, enqueueReason := m.enqueueSnipe(event)
 	if !queued {
@@ -263,7 +248,7 @@ func (m *Monitor) readBondingCurveEntryMetrics(ctx context.Context, mint string)
 		return 0, 0, err
 	}
 	marketCapSOL, realSOLReservesSOL, err := m.bondingCurve.BondingCurveEntryMetrics(ctx, mint)
-	if err == nil && (marketCapSOL <= 0 || math.IsNaN(marketCapSOL) || math.IsInf(marketCapSOL, 0)) {
+	if err == nil && !m.useWSMarketCap && (marketCapSOL <= 0 || math.IsNaN(marketCapSOL) || math.IsInf(marketCapSOL, 0)) {
 		err = fmt.Errorf("bonding-curve RPC market cap is not positive and finite")
 	}
 	if err == nil && (realSOLReservesSOL < 0 || math.IsNaN(realSOLReservesSOL) || math.IsInf(realSOLReservesSOL, 0)) {
