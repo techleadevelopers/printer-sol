@@ -3,6 +3,7 @@ import {
   AlertTriangle, Check, CircleHelp, FlaskConical, Play, RotateCcw, ShieldCheck,
   X,
 } from 'lucide-react';
+import { evaluateEntryFlow } from '@/lib/flow-lab-model.mjs';
 
 type LabInputs = {
   executionMode: 'paper' | 'live';
@@ -97,7 +98,7 @@ const DEFAULTS: LabInputs = {
 };
 
 type Check = { label: string; status: 'pass' | 'fail' | 'warn'; detail: string };
-type Simulation = { checks: Check[]; candidateAllowed: boolean; executionReady: boolean; impactBps: number; expectedTokens: number; minimumTokens: number; exitReason: string; reservesPass: boolean; marketCapDifferencePct: number };
+type Simulation = ReturnType<typeof evaluateEntryFlow> & { exitReason: string };
 
 const PRESETS: { label: string; description: string; patch: Partial<LabInputs> }[] = [
   { label: 'Fluxo saudável', description: 'Entrada elegível e cotação dentro dos limites.', patch: {} },
@@ -105,7 +106,8 @@ const PRESETS: { label: string; description: string; patch: Partial<LabInputs> }
   { label: 'Feed/RPC indisponível', description: 'Compara a admissão WebSocket com o caminho RPC legado.', patch: { websocketMarketCap: false, rpcAvailable: false } },
   { label: 'Entrada atrasada', description: 'A idade excede o limite após espera e latência.', patch: { ageAtDetection: 23, entryDelay: 5, networkDelayMs: 2500 } },
   { label: 'WS e RPC discordantes', description: 'Confere qual fonte decide o market cap sem esperar a outra.', patch: { websocketMarketCap: true, websocketMarketCapSol: 35, rpcMarketCapSol: 18 } },
-  { label: 'Reserva fora da faixa', description: 'Compara bloqueio no caminho RPC e aviso não bloqueante no WebSocket.', patch: { websocketMarketCap: false, realSolReserves: 0.2, minReserves: 0.3 } },
+  { label: 'Reserva fora da faixa · WebSocket', description: 'A desconformidade aparece no diagnóstico sem travar a admissão rápida.', patch: { websocketMarketCap: true, realSolReserves: 0.2, minReserves: 0.3 } },
+  { label: 'Reserva fora da faixa · RPC legado', description: 'No modo legado, a reserva fora da faixa impede a admissão.', patch: { websocketMarketCap: false, realSolReserves: 0.2, minReserves: 0.3 } },
   { label: 'Cotação vencida', description: 'A cotação envelhece antes do envio.', patch: { quoteAgeMs: 2200, maxQuoteAgeMs: 1500 } },
   { label: 'Impacto alto', description: 'Ordem grande para a reserva virtual disponível.', patch: { orderSol: 1.2, virtualSolReserves: 5, maxCurveImpactBps: 1000 } },
   { label: 'Mint já comprado', description: 'Impede duplicar entrada ou repetir compra persistida.', patch: { previousBuyExists: true } },
@@ -113,115 +115,7 @@ const PRESETS: { label: string; description: string; patch: Partial<LabInputs> }
 ];
 
 function simulate(input: LabInputs): Simulation {
-  const checks: Check[] = [];
-  const elapsedAge = input.ageAtDetection + input.entryDelay + input.networkDelayMs / 1000;
-  const rpcResponsiveForEntry = input.rpcAvailable && input.rpcLatencyMs <= input.legacyEntryRpcTimeoutMs;
-  const rpcResponsiveForLive = input.rpcAvailable && input.rpcLatencyMs <= input.liveSnipeTimeoutMs;
-  const effectiveMarketCap = input.websocketMarketCap ? input.websocketMarketCapSol : input.rpcMarketCapSol;
-  const reservesPass = input.realSolReserves >= input.minReserves && input.realSolReserves <= input.maxReserves;
-  const validTiming = input.ageAtDetection >= 0 && input.entryDelay >= 0 && input.networkDelayMs >= 0
-    && input.maxTokenAge >= 0 && input.rpcLatencyMs >= 0 && input.legacyEntryRpcTimeoutMs >= 0
-    && input.liveSnipeTimeoutMs >= 0 && Number.isFinite(elapsedAge);
-  const validLimits = input.maxQuoteAgeMs >= 1 && input.maxQuoteAgeMs <= 120_000
-    && input.requestedSlippageBps >= 0 && input.maxSlippageBps >= 1 && input.maxSlippageBps <= 10_000
-    && input.maxCurveImpactBps >= 1 && input.maxCurveImpactBps <= 10_000;
-  const marketCapPass = Number.isFinite(effectiveMarketCap) && effectiveMarketCap > 0
-    && effectiveMarketCap >= input.minMarketCap
-    && (input.maxMarketCap <= 0 || effectiveMarketCap <= input.maxMarketCap);
-  const marketCapDifferencePct = input.rpcMarketCapSol > 0
-    ? Math.abs(input.websocketMarketCapSol - input.rpcMarketCapSol) / input.rpcMarketCapSol * 100
-    : Number.POSITIVE_INFINITY;
-
-  checks.push({
-    label: 'Parâmetros de cenário',
-    status: validTiming && validLimits && input.orderSol > 0 ? 'pass' : 'fail',
-    detail: !validTiming
-      ? 'Idades e latências precisam ser não negativas; 0 desativa somente o filtro de idade do token'
-      : !validLimits
-        ? 'Limites inválidos: quote age 1–120000 ms, slippage e impacto entre 1 e 10000 bps'
-        : input.orderSol <= 0
-          ? 'O tamanho da ordem deve ser positivo'
-          : 'Valores em faixas utilizáveis para este modelo',
-  });
-  checks.push({
-    label: 'Idade do token após espera',
-    status: !validTiming || input.maxTokenAge > 0 && elapsedAge >= input.maxTokenAge ? 'fail' : 'pass',
-    detail: `${elapsedAge.toFixed(2)} s no gate${input.maxTokenAge > 0 ? ` · limite estrito < ${input.maxTokenAge} s` : ' · filtro desativado (limite 0)'}`,
-  });
-  checks.push({
-    label: 'Reservas reais da bonding curve · política esperada',
-    status: input.websocketMarketCap
-      ? !rpcResponsiveForEntry || !reservesPass ? 'warn' : 'pass'
-      : !rpcResponsiveForEntry || !reservesPass ? 'fail' : 'pass',
-    detail: input.websocketMarketCap
-      ? !rpcResponsiveForEntry
-        ? `RPC levou ${input.rpcLatencyMs} ms ou não respondeu; o caminho rápido não espera essa leitura. Reserva não confirmada antes da admissão.`
-        : !reservesPass
-          ? `${input.realSolReserves.toFixed(3)} SOL fora da faixa ${input.minReserves.toFixed(3)}–${input.maxReserves.toFixed(3)}; aviso não bloqueante no gate WebSocket atual.`
-          : `${input.realSolReserves.toFixed(3)} SOL dentro da faixa-alvo; observação RPC não bloqueia o caminho WebSocket.`
-      : !rpcResponsiveForEntry
-        ? `RPC indisponível ou acima do timeout do gate legado (${input.legacyEntryRpcTimeoutMs} ms); candidato bloqueado neste caminho.`
-        : `${input.realSolReserves.toFixed(3)} SOL · faixa inclusiva ${input.minReserves.toFixed(3)}–${input.maxReserves.toFixed(3)} SOL`,
-  });
-  checks.push({
-    label: 'Duplicidade e posição anterior',
-    status: input.activePositionExists || input.previousBuyExists ? 'fail' : 'pass',
-    detail: input.activePositionExists ? 'Já existe posição não reconciliada para este mint'
-      : input.previousBuyExists ? 'Já existe tentativa/compra persistida; nova compra bloqueada'
-        : 'Sem posição ativa ou compra persistida para o mint',
-  });
-  checks.push({
-    label: 'Blacklist do criador',
-    status: input.creatorBlocked ? 'fail' : 'pass',
-    detail: input.creatorBlocked ? 'Criador bloqueado após stop-loss; entrada rejeitada' : 'Criador não está bloqueado neste cenário',
-  });
-  checks.push({
-    label: 'Deduplicação e capacidade da fila',
-    status: input.queueAvailable ? 'pass' : 'fail',
-    detail: input.queueAvailable ? 'Mint não está pendente e há capacidade para enfileirar' : 'Duplicado dentro do TTL ou fila cheia; entrada rejeitada',
-  });
-  checks.push({
-    label: 'Market cap de entrada',
-    status: !input.websocketMarketCap && !rpcResponsiveForEntry ? 'fail' : marketCapPass ? 'pass' : 'fail',
-    detail: `${effectiveMarketCap.toFixed(2)} SOL via ${input.websocketMarketCap ? 'WebSocket' : 'RPC'} · mínimo ${input.minMarketCap} SOL${input.maxMarketCap > 0 ? ` · máximo ${input.maxMarketCap} SOL` : ' · teto desativado'}`,
-  });
-  checks.push({
-    label: 'Diferença de market cap entre fontes · diagnóstico',
-    status: Number.isFinite(marketCapDifferencePct) && marketCapDifferencePct <= input.marketCapDifferenceAlertPct ? 'pass' : 'warn',
-    detail: `${input.websocketMarketCapSol.toFixed(2)} SOL WS vs ${input.rpcMarketCapSol.toFixed(2)} SOL RPC · diferença ${Number.isFinite(marketCapDifferencePct) ? `${marketCapDifferencePct.toFixed(1)}%` : 'indisponível'} · aviso acima de ${input.marketCapDifferenceAlertPct}% · não bloqueia candidato`,
-  });
-
-  const strategyCheckCount = checks.length;
-  const validQuoteInputs = input.orderSol > 0 && input.virtualSolReserves > 0 && input.virtualTokenReserves > 0;
-  const expectedTokens = validQuoteInputs ? input.virtualTokenReserves * input.orderSol / (input.virtualSolReserves + input.orderSol) : 0;
-  const impactBps = validQuoteInputs ? input.orderSol / (input.virtualSolReserves + input.orderSol) * 10_000 : Number.POSITIVE_INFINITY;
-  const minimumTokens = expectedTokens * (1 - Math.min(input.requestedSlippageBps, input.maxSlippageBps) / 10_000);
-  checks.push({
-    label: 'Cotação da curva',
-    status: input.executionMode === 'paper' ? 'warn' : !validQuoteInputs || !rpcResponsiveForLive || input.quoteAgeMs > input.maxQuoteAgeMs ? 'fail' : 'pass',
-    detail: input.executionMode === 'paper'
-      ? 'Informativo: o fluxo paper não executa a preparação live que valida idade da cotação'
-      : !validQuoteInputs
-        ? 'Ordem e reservas virtuais devem ser positivas para gerar uma cotação válida'
-        : !rpcResponsiveForLive
-          ? `RPC indisponível ou acima do timeout de execução live (${input.liveSnipeTimeoutMs} ms)`
-          : `idade ${input.quoteAgeMs} ms · máximo ${input.maxQuoteAgeMs} ms`,
-  });
-  checks.push({
-    label: 'Slippage solicitado',
-    status: input.requestedSlippageBps <= input.maxSlippageBps ? 'pass' : 'fail',
-    detail: `${input.requestedSlippageBps} bps (${(input.requestedSlippageBps / 100).toFixed(2)}%) · máximo ${input.maxSlippageBps} bps`,
-  });
-  checks.push({
-    label: 'Impacto estimado da curva',
-    status: input.executionMode === 'paper' ? 'warn' : impactBps <= input.maxCurveImpactBps ? 'pass' : 'fail',
-    detail: input.executionMode === 'paper'
-      ? `${Number.isFinite(impactBps) ? `${impactBps.toFixed(1)} bps` : 'cotação inválida'} · apenas informativo no paper; o gate de impacto é da preparação live`
-      : `${Number.isFinite(impactBps) ? impactBps.toFixed(1) : 'inválido'} bps · máximo ${input.maxCurveImpactBps} bps`,
-  });
-
-  const candidateAllowed = checks.slice(0, strategyCheckCount).every(check => check.status !== 'fail');
-  const executionReady = candidateAllowed && checks.slice(strategyCheckCount).every(check => check.status !== 'fail');
+  const flow = evaluateEntryFlow(input);
   const positionChange = input.positionCostSol > 0
     ? (input.currentPositionSol - input.positionCostSol) / input.positionCostSol * 100
     : 0;
@@ -240,7 +134,7 @@ function simulate(input: LabInputs): Simulation {
   else if (input.heldSeconds >= input.maxHoldSeconds && positionChange <= 0) exitReason = 'Max hold: posição no zero ou negativa.';
   else if (input.heldSeconds >= input.maxHoldSeconds && positionChange > 0) exitReason = 'Max hold atingido, mas posição positiva permanece aberta.';
 
-  return { checks, candidateAllowed, executionReady, impactBps, expectedTokens, minimumTokens, exitReason, reservesPass, marketCapDifferencePct };
+  return { ...flow, exitReason };
 }
 
 function Field({ label, value, unit, step = 1, onChange }: { label: string; value: number; unit?: string; step?: number; onChange: (value: number) => void }) {
@@ -380,13 +274,26 @@ export default function FlowLabPage() {
             <h2 className="m-0 text-sm font-semibold">Trilha de decisão</h2>
             <span className={`text-xs font-semibold ${result.candidateAllowed ? 'positive' : 'negative'}`}>{result.candidateAllowed ? 'CANDIDATO ADMITIDO' : 'CANDIDATO BLOQUEADO'}</span>
           </div>
-          <div className="px-4 py-1">{result.checks.map(check => <CheckRow key={check.label} check={check} />)}</div>
+          <div className="px-4 py-1">
+            <h3 className="eyebrow mb-0 mt-3">1 · Admissão rápida do candidato</h3>
+            {result.admissionChecks.map(check => <CheckRow key={check.label} check={check} />)}
+            <h3 className="eyebrow mb-0 mt-4">2 · Reserva-alvo e comparação de fontes</h3>
+            <p className="mb-1 mt-1 text-[10px] muted">Diagnóstico separado da admissão; no caminho WebSocket, não espera RPC nem bloqueia por divergência de reserva.</p>
+            <CheckRow check={result.reserveCheck} />
+            <CheckRow check={result.sourceDifferenceCheck} />
+            <h3 className="eyebrow mb-0 mt-4">3 · Prontidão da execução</h3>
+            {result.executionChecks.map(check => <CheckRow key={check.label} check={check} />)}
+          </div>
           <div className="border-t border-[hsl(var(--border))] p-4">
             <div className="eyebrow">RESULTADO DO CENÁRIO</div>
-            <div className={`mt-2 text-xs font-semibold ${result.executionReady ? 'positive' : 'warning'}`}>{input.executionMode === 'live' ? result.executionReady ? 'Gates locais de execução live: prontos' : 'Candidato e execução live: verificar bloqueios acima' : result.candidateAllowed ? 'Candidato admitido no fluxo paper' : 'Candidato bloqueado no fluxo paper'}</div>
-            <p className="mb-0 mt-2 text-xs leading-5 muted">{hasRun ? `Cenário processado localmente. ${result.candidateAllowed ? 'O caminho de estratégia admitiu o candidato.' : 'Um gate de estratégia impediu a admissão.'}` : 'Ajuste os parâmetros ou escolha um preset; os resultados são recalculados ao vivo. Clique em “Executar cenário” para registrar que avaliou esta configuração.'}</p>
+            <div className={`mt-2 text-xs font-semibold ${result.entryFlowReady ? 'positive' : 'warning'}`}>
+              {input.executionMode === 'paper'
+                ? result.candidateAllowed ? 'Candidato admitido no fluxo paper; execução live não se aplica' : 'Candidato bloqueado no fluxo paper'
+                : result.entryFlowReady ? 'Candidato admitido e gates de execução live prontos' : result.candidateAllowed ? 'Candidato admitido; execução live bloqueada nos gates acima' : 'Candidato bloqueado antes da execução'}
+            </div>
+            <p className="mb-0 mt-2 text-xs leading-5 muted">{hasRun ? `Cenário processado localmente. ${result.candidateAllowed ? 'A admissão passou pelos gates de entrada.' : 'Um gate de admissão impediu a entrada.'}` : 'Ajuste os parâmetros ou escolha um preset; os resultados são recalculados ao vivo. Clique em “Executar cenário” para registrar que avaliou esta configuração.'}</p>
           </div>
-          <div className="border-t border-sky-400/25 bg-sky-400/5 p-4 text-xs leading-5 technical" role="note"><strong>Dois estágios, sem confundir atraso com rejeição:</strong> {input.websocketMarketCap ? 'o candidato é avaliado pelo market cap WebSocket sem esperar o snapshot RPC de reservas. A leitura de reservas fica marcada como não confirmada/fora da faixa, sem travar a admissão rápida.' : 'o caminho legado precisa do snapshot RPC para market cap e reservas; latência acima do timeout impede essa avaliação.'} Depois da admissão, uma compra live ainda depende de cotação RPC fresca, slippage e impacto dentro dos limites. Isso bloqueia a execução daquela ordem, não deve congelar o monitor nem as demais avaliações.</div>
+          <div className="border-t border-sky-400/25 bg-sky-400/5 p-4 text-xs leading-5 technical" role="note"><strong>Estágios independentes:</strong> {input.websocketMarketCap ? 'o fast path aplica os limites de market cap WebSocket sem esperar o RPC de reservas. Uma reserva fora da faixa aparece como desconformidade diagnóstica, mas não muda a admissão neste caminho.' : 'o caminho legado depende do snapshot RPC para market cap e reservas; falha/timeout ou reserva fora da faixa bloqueiam essa avaliação.'} A compra live ainda exige cotação RPC fresca, slippage e impacto dentro dos limites. Esses gates podem impedir aquela ordem sem congelar o monitor nem as demais avaliações.</div>
         </section>
         <section className="panel">
           <div className="border-b border-[hsl(var(--border))] px-4 py-3"><h2 className="m-0 text-sm font-semibold">Cotação estimada da compra</h2></div>

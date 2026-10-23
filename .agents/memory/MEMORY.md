@@ -4,4 +4,4 @@
 - [Code-only Go changes](code-only-go.md) — in this project, integrate Go changes in source without executing Go or starting the bot.
 - [First-pump strategy](first-pump.md) — environment limits apply strictly in every entry mode; WebSocket is primary with RPC checks for reserves and stale marks.
 - [Frontend-only integrations](frontend-only-integrations.md) — for frontend alignment, do not modify backend or `front/artifacts/`; make source-only changes without running the app or tests.
-- [WebSocket reserve-gate mismatch](websocket-reserve-gate.md) — documented policy requires reserve bounds in every mode, but the current WebSocket market-cap candidate path skips that gate.
+- [WebSocket reserve-path policy](websocket-reserve-gate.md) — fast WebSocket admission must not wait for RPC reserves; keep target-range diagnostics, legacy gates, and live execution checks separate.

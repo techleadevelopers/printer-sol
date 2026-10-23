@@ -21,6 +21,32 @@ type fixedBondingCurveMarketCap struct {
 	err          error
 }
 
+type blockingBondingCurveEntry struct {
+	called  chan struct{}
+	release chan struct{}
+}
+
+func (source *blockingBondingCurveEntry) BondingCurveMarketCapSOL(context.Context, string) (float64, error) {
+	return 0, errors.New("unexpected market-cap RPC read")
+}
+
+func (source *blockingBondingCurveEntry) BondingCurveEntryMetrics(ctx context.Context, _ string) (float64, float64, error) {
+	select {
+	case source.called <- struct{}{}:
+	default:
+	}
+	select {
+	case <-source.release:
+		return 30, .7, nil
+	case <-ctx.Done():
+		return 0, 0, ctx.Err()
+	}
+}
+
+func (source *blockingBondingCurveEntry) BondingCurvePositionMetrics(context.Context, string) (float64, float64, error) {
+	return 0, 0, errors.New("unexpected position-price RPC read")
+}
+
 func (source fixedBondingCurveMarketCap) BondingCurveMarketCapSOL(context.Context, string) (float64, error) {
 	return source.marketCapSOL, source.err
 }
@@ -194,6 +220,53 @@ func TestCandidateGateUsesWebSocketWhenRPCIsUnavailable(t *testing.T) {
 	monitor.checkCandidate(context.Background(), event.Mint)
 	if len(monitor.q) != 1 {
 		t.Fatal("valid WebSocket market cap was blocked by unavailable RPC")
+	}
+}
+
+func TestWebSocketFastPathDoesNotWaitForReserveRPC(t *testing.T) {
+	monitor, closeDB := newMarketDataTestMonitor(t)
+	defer closeDB()
+	source := &blockingBondingCurveEntry{
+		called:  make(chan struct{}, 1),
+		release: make(chan struct{}, 1),
+	}
+	monitor.useWSMarketCap = true
+	monitor.bondingCurve = source
+	event := testCandidate("websocket-does-not-wait-for-rpc")
+	event.MarketCapSOL = 55
+	if !monitor.addCandidate(event) {
+		t.Fatal("candidate was not queued")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		monitor.checkCandidate(context.Background(), event.Mint)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		source.release <- struct{}{}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("RPC-backed candidate check did not stop after releasing the test RPC")
+		}
+		t.Fatal("WebSocket candidate waited for the reserve RPC read")
+	}
+
+	select {
+	case <-source.called:
+		t.Fatal("fast WebSocket admission unexpectedly requested reserve RPC data")
+	default:
+	}
+	select {
+	case queued := <-monitor.q:
+		if queued.MarketCapSOL != 55 {
+			t.Fatalf("entry baseline market cap = %f, want WebSocket value 55", queued.MarketCapSOL)
+		}
+	default:
+		t.Fatal("delayed RPC blocked an otherwise eligible WebSocket candidate")
 	}
 }
 

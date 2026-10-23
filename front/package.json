@@ -7,7 +7,8 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:flow-lab": "node --test src/lib/flow-lab-model.test.mjs"
   },
   "dependencies": {
     "@clerk/react": "^6.17.8",

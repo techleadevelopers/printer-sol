@@ -3,8 +3,8 @@ name: WebSocket reserve-gate mismatch
 description: The safety-policy mismatch between documented reserve bounds and the WebSocket market-cap entry path.
 ---
 
-The intended invariant is that `MIN_VOLUME_BEFORE_BUY` and `MAX_VOLUME_BEFORE_BUY` bound verified real bonding-curve SOL reserves in every entry mode; these reserves are a liquidity proxy, not cumulative traded volume. The current WebSocket market-cap candidate path skips the RPC entry-metrics check and disables the reserve gate. Live execution still needs an RPC bonding-curve quote later, but that is not equivalent to enforcing the reserve bounds before admission.
+`MIN_VOLUME_BEFORE_BUY` and `MAX_VOLUME_BEFORE_BUY` describe real bonding-curve SOL reserves, a liquidity proxy rather than cumulative traded volume. Product behavior intentionally differs by admission path: the legacy RPC path verifies the inclusive range and fails closed; the WebSocket fast path must not wait for an RPC reserve snapshot or reject admission because it is delayed or divergent. Keep reserve conformance separate from candidate admission and live execution readiness.
 
-**Why:** the README and user-stated strategy require strict reserve bounds in every mode, so the current implementation can admit a candidate that violates the configured policy.
+**Why:** the user explicitly chose the low-latency WebSocket path without a blocking reserve read and asked that admission, target reserve policy, and live execution prerequisites remain independent.
 
-**How to apply:** if backend scope is authorized, validate real reserves and fail closed before enqueueing in WebSocket mode too, then add coverage for in-range, out-of-range, and RPC-unavailable cases. Do not silently reinterpret the limits as traded volume.
+**How to apply:** do not add a synchronous reserve gate to the WebSocket candidate path. Keep the legacy RPC path fail-closed, use a fresh RPC quote plus configured slippage/impact limits for live preparation, and add tests for RPC delay, unavailable data, source divergence, and boundary reserves.
