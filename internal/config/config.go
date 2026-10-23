@@ -57,7 +57,7 @@ func Load() (Config, error) {
 	if c.EnableRugCheck, err = boolEnv("ENABLE_RUGCHECK", true); err != nil {
 		return c, err
 	}
-	if c.UseWSMarketCap, err = boolEnv("USE_WS_MARKET_CAP", false); err != nil {
+	if c.UseWSMarketCap, err = boolEnv("USE_WS_MARKET_CAP", true); err != nil {
 		return c, err
 	}
 	if c.SimulationDatabaseURL != "" || c.RealDatabaseURL != "" {

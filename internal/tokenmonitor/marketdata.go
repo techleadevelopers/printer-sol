@@ -155,6 +155,13 @@ func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 		return
 	}
 
+	if m.useWSMarketCap {
+		m.runOperationAt(generation, func() {
+			m.finishCandidate(mint, event, event.MarketCapSOL, 0, nil)
+		})
+		return
+	}
+
 	rpcCtx, rpcCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer rpcCancel()
 
@@ -217,13 +224,15 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 		return
 	}
 
-	if realSOLReservesSOL < m.minVolumeBeforeBuySOL {
-		m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL are below minimum %.6f SOL", realSOLReservesSOL, m.minVolumeBeforeBuySOL))
-		return
-	}
-	if realSOLReservesSOL > m.maxVolumeBeforeBuySOL {
-		m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL exceed maximum %.6f SOL", realSOLReservesSOL, m.maxVolumeBeforeBuySOL))
-		return
+	if !m.useWSMarketCap {
+		if realSOLReservesSOL < m.minVolumeBeforeBuySOL {
+			m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL are below minimum %.6f SOL", realSOLReservesSOL, m.minVolumeBeforeBuySOL))
+			return
+		}
+		if realSOLReservesSOL > m.maxVolumeBeforeBuySOL {
+			m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL exceed maximum %.6f SOL", realSOLReservesSOL, m.maxVolumeBeforeBuySOL))
+			return
+		}
 	}
 
 	if reason := m.creatorBlacklistReason(event.Creator); reason != "" {
@@ -231,10 +240,16 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 		return
 	}
 
-	m.log.Info(fmt.Sprintf(
-		"ENTRY APPROVED: mint=%s mcap=%.2f SOL (%s), bonding-curve real SOL reserves=%.6f SOL",
-		mint, marketCapToCheck, marketCapSource, realSOLReservesSOL,
-	))
+	fields := []zap.Field{
+		zap.String("mint", mint),
+		zap.Float64("market_cap_sol", marketCapToCheck),
+		zap.String("market_cap_source", marketCapSource),
+		zap.Bool("reserve_gate_enabled", !m.useWSMarketCap),
+	}
+	if !m.useWSMarketCap {
+		fields = append(fields, zap.Float64("real_sol_reserves", realSOLReservesSOL))
+	}
+	m.log.Info("entry approved", fields...)
 	queued, enqueueReason := m.enqueueSnipe(event)
 	if !queued {
 		m.rejectCandidate(event, enqueueReason)

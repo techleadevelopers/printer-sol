@@ -2,4 +2,4 @@
 - [Unknown live exits](unknown-live-exits.md) — reconcile a persisted signature before retrying; only a definitive failure permits a replacement sell.
 - [Simulation sell finalization](simulation-sell-finalization.md) — zero-valued failure rows are schema-compatible, but only successful sells on closed positions count as realized.
 - [Code-only Go changes](code-only-go.md) — in this project, integrate Go changes in source without executing Go or starting the bot.
-- [First-pump strategy](first-pump.md) — use the configurable real-reserve window and optional WS market-cap source; retain exit, risk, and reconciliation safeguards.
+- [First-pump strategy](first-pump.md) — default to WS-only fast entry; reserve limits apply in legacy RPC mode while exit and risk safeguards remain.

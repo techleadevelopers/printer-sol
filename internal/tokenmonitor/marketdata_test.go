@@ -139,10 +139,13 @@ func TestCandidateGateRejectsAboveMaximumRealReserves(t *testing.T) {
 	}
 }
 
-func TestCandidateGateCanUseWebSocketMarketCapButStillRequiresRPCCurve(t *testing.T) {
+func TestCandidateGateUsesWebSocketOnlyAndSkipsReserveGate(t *testing.T) {
 	monitor, closeDB := newMarketDataTestMonitor(t)
 	defer closeDB()
 	monitor.useWSMarketCap = true
+	monitor.bondingCurve = nil
+	monitor.minVolumeBeforeBuySOL = 10
+	monitor.maxVolumeBeforeBuySOL = 0.01
 	event := testCandidate("websocket-market-cap-entry")
 	event.MarketCapSOL = 55
 	if !monitor.addCandidate(event) {
@@ -155,7 +158,7 @@ func TestCandidateGateCanUseWebSocketMarketCapButStillRequiresRPCCurve(t *testin
 			t.Fatalf("entry baseline market cap = %f, want WebSocket value 55", queued.MarketCapSOL)
 		}
 	default:
-		t.Fatal("candidate with a valid RPC reserve and WebSocket market cap was not queued")
+		t.Fatal("candidate with a valid WebSocket market cap was not queued")
 	}
 }
 

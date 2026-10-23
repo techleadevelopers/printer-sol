@@ -327,7 +327,9 @@ func (m *Monitor) Run(ctx context.Context) {
 	go m.runMaxHoldChecker(ctx)
 	go m.runSeenJanitor(ctx)
 	go m.runCandidateChecker(ctx)
-	go m.runPricePoller(ctx)
+	if !m.useWSMarketCap {
+		go m.runPricePoller(ctx)
+	}
 	m.runConnections(ctx)
 }
 
