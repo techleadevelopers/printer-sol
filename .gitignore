@@ -27,3 +27,7 @@ sniper
 coverage.out
 coverage.html
 tmp/
+sniper_v*
+sniper_commit*
+audit_*.txt
+auditoria.txt

@@ -17,11 +17,11 @@ type Config struct {
 	UseWSMarketCap                                                                                                                                                                                        bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
-TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds, StuckExitQuarantineSeconds int
+	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds, StuckExitQuarantineSeconds int
 	SnipeConcurrency, SnipeTimeoutMS, DedupeTTLMS                                                                                                                                                           int
 	EntryDelaySeconds, PricePollSeconds                                                                                                                                                                      int
 	MinVolumeBeforeBuySOL, MaxVolumeBeforeBuySOL, MinMarketCapSOL, MaxMarketCapSOL                                                             float64
-TrailingStopArmPct, ExitTriggerBufferPct                                                                                                                                                               float64
+	TrailingStopArmPct, ExitTriggerBufferPct                                                                                                                                                               float64
 	RPCEndpoints                                                                                                                                                                                            []string
 }
 
@@ -167,18 +167,18 @@ func Load() (Config, error) {
 	if c.MaxHoldSeconds, err = intEnv("MAX_HOLD_SECONDS", 300); err != nil {
 		return c, err
 	}
-if c.StuckExitQuarantineSeconds, err = intEnv("STUCK_EXIT_QUARANTINE_SECONDS", 120); err != nil {
-return c, err
-}
+	if c.StuckExitQuarantineSeconds, err = intEnv("STUCK_EXIT_QUARANTINE_SECONDS", 120); err != nil {
+		return c, err
+	}
 	if c.TrailingStopPct, err = floatEnv("TRAILING_STOP_PCT", 12); err != nil {
 		return c, err
 	}
-if c.TrailingStopArmPct, err = floatEnv("TRAILING_STOP_ARM_PCT", 10); err != nil {
-return c, err
-}
-if c.ExitTriggerBufferPct, err = floatEnv("EXIT_TRIGGER_BUFFER_PCT", .5); err != nil {
-return c, err
-}
+	if c.TrailingStopArmPct, err = floatEnv("TRAILING_STOP_ARM_PCT", 10); err != nil {
+		return c, err
+	}
+	if c.ExitTriggerBufferPct, err = floatEnv("EXIT_TRIGGER_BUFFER_PCT", .5); err != nil {
+		return c, err
+	}
 	if strings.TrimSpace(c.HTTPAddr) == "" || (c.DatabaseURL == "" && strings.TrimSpace(c.DatabasePath) == "") || strings.TrimSpace(c.PumpPortalURL) == "" || strings.TrimSpace(c.PumpPortalWS) == "" || len(c.RPCEndpoints) == 0 {
 		return c, fmt.Errorf("HTTP_ADDR, DATABASE_URL (or DATABASE_PATH locally), PumpPortal URLs and at least one RPC endpoint are required")
 	}
@@ -209,16 +209,17 @@ return c, err
 	if c.MinVolumeBeforeBuySOL < 0 || c.MaxVolumeBeforeBuySOL <= 0 || c.MinMarketCapSOL < 0 {
 		return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY and MIN_MARKET_CAP_SOL must be non-negative; MAX_VOLUME_BEFORE_BUY must be positive")
 	}
-if c.MaxVolumeBeforeBuySOL < c.MinVolumeBeforeBuySOL {
+	if c.MaxVolumeBeforeBuySOL < c.MinVolumeBeforeBuySOL {
 		return c, fmt.Errorf("MAX_VOLUME_BEFORE_BUY must be greater than or equal to MIN_VOLUME_BEFORE_BUY")
 	}
 	for name, value := range map[string]float64{
-		"TRAILING_STOP_ARM_PCT": c.TrailingStopArmPct,
-"EXIT_TRIGGER_BUFFER_PCT": c.ExitTriggerBufferPct,
-} {
-if value > 100 {
-return c, fmt.Errorf("%s must be between 0 and 100", name)
-}
+		"TRAILING_STOP_ARM_PCT":  c.TrailingStopArmPct,
+		"EXIT_TRIGGER_BUFFER_PCT": c.ExitTriggerBufferPct,
+	} {
+		if value > 100 {
+			return c, fmt.Errorf("%s must be between 0 and 100", name)
+		}
+	}
 	if c.SnipeConcurrency < 1 || c.SnipeConcurrency > 10 || c.SnipeTimeoutMS < 1 || c.SnipeTimeoutMS > 120000 || c.DedupeTTLMS < 1 || c.DedupeTTLMS > 3600000 {
 		return c, fmt.Errorf("SNIPE_CONCURRENCY must be 1-10, SNIPE_TIMEOUT_MS must be 1-120000, and DEDUPE_TTL_MS must be 1-3600000")
 	}
