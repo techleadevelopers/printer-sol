@@ -24,11 +24,21 @@ type Event struct {
 	Mint         string `json:"mint"`
 	Creator      string `json:"creator"`
 	User         string `json:"user"`
+	Signature    string `json:"signature,omitempty"`
 	Received     time.Time
 	Created      time.Time
 	MarketCapSOL float64
 	Raw          string
 	queuedAt     time.Time
+}
+
+// CreationTimeResolver is an optional RPC-backed source of truth for a token's
+// creation time. It is consulted only when the PumpPortal websocket payload
+// does not carry a usable timestamp AND a signature (or at least a mint) is
+// available. Returning (zero, nil) means "not resolvable now"; the caller
+// must still enforce the age gate and reject unverified tokens.
+type CreationTimeResolver interface {
+	ResolveCreationTime(ctx context.Context, mint, signature string) (time.Time, error)
 }
 
 type Entrier interface {
@@ -52,9 +62,9 @@ type Settings struct {
 	MaxVolumeBeforeBuySOL float64
 	MinMarketCapSOL       float64
 	MaxMarketCapSOL       float64
-StuckExitQuarantine   time.Duration
-TrailingStopArmPct    float64
-ExitTriggerBufferPct  float64
+	StuckExitQuarantine   time.Duration
+	TrailingStopArmPct    float64
+	ExitTriggerBufferPct  float64
 	UseWSMarketCap        bool
 	MaxTokenAge           time.Duration
 	PricePollInterval     time.Duration
@@ -62,6 +72,7 @@ ExitTriggerBufferPct  float64
 	SnipeTimeout          time.Duration
 	DedupeTTL             time.Duration
 	BondingCurve          BondingCurveMarketCapSource
+	CreationResolver      CreationTimeResolver
 }
 
 type candidate struct {
@@ -89,8 +100,8 @@ type Monitor struct {
 	trailingStop                    float64
 	maxHold                         time.Duration
 	maxTokenAge                     time.Duration
-trailingStopArmPct               float64
-exitTriggerBufferPct              float64
+	trailingStopArmPct              float64
+	exitTriggerBufferPct            float64
 	simulation                      bool
 	subscriptions                   chan string
 	tracked                         sync.Map
@@ -120,13 +131,14 @@ exitTriggerBufferPct              float64
 	maxVolumeBeforeBuySOL           float64
 	minMarketCapSOL                 float64
 	maxMarketCapSOL                 float64
-stuckExitQuarantineAge          time.Duration
+	stuckExitQuarantineAge          time.Duration
 	useWSMarketCap                  bool
 	pricePollInterval               time.Duration
 	snipeConcurrency                int
 	snipeTimeout                    time.Duration
 	dedupeTTL                       time.Duration
 	bondingCurve                    BondingCurveMarketCapSource
+	creationResolver                CreationTimeResolver
 	priceSourceStatusMu             sync.Mutex
 	priceSourceFailures             int
 	priceSourceAlerted              bool
@@ -140,6 +152,10 @@ const maxAutomaticLiveExitAttempts = 3
 const staleSimulationSellRecoveryAge = time.Minute
 const staleLiveSellRecoveryAge = time.Minute
 const defaultStuckExitQuarantineAge = 2 * time.Minute
+
+// creationResolveTimeout bounds the RPC round-trip used to backfill a token's
+// creation time. Kept short so it never stalls the fast entry path for long.
+const creationResolveTimeout = 3 * time.Second
 
 func (m *Monitor) runOperation(fn func()) bool {
 	return m.runOperationAt(m.resetGeneration.Load(), fn)
@@ -249,9 +265,9 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		MaxVolumeBeforeBuySOL: 1.5,
 		MinMarketCapSOL:       0,
 		MaxMarketCapSOL:       4,
-StuckExitQuarantine:   defaultStuckExitQuarantineAge,
-TrailingStopArmPct:    10,
-ExitTriggerBufferPct:  0.5,
+		StuckExitQuarantine:   defaultStuckExitQuarantineAge,
+		TrailingStopArmPct:    10,
+		ExitTriggerBufferPct:  0.5,
 		MaxTokenAge:           0,
 		PricePollInterval:     20 * time.Second,
 		SnipeConcurrency:      4,
@@ -269,11 +285,11 @@ ExitTriggerBufferPct:  0.5,
 		}
 		settings.MinMarketCapSOL = option.MinMarketCapSOL
 		settings.MaxMarketCapSOL = option.MaxMarketCapSOL
-settings.TrailingStopArmPct = option.TrailingStopArmPct
-settings.ExitTriggerBufferPct = option.ExitTriggerBufferPct
-if option.StuckExitQuarantine > 0 {
-settings.StuckExitQuarantine = option.StuckExitQuarantine
-}
+		settings.TrailingStopArmPct = option.TrailingStopArmPct
+		settings.ExitTriggerBufferPct = option.ExitTriggerBufferPct
+		if option.StuckExitQuarantine > 0 {
+			settings.StuckExitQuarantine = option.StuckExitQuarantine
+		}
 		settings.UseWSMarketCap = option.UseWSMarketCap
 		settings.MaxTokenAge = option.MaxTokenAge
 		if option.PricePollInterval > 0 {
@@ -289,17 +305,18 @@ settings.StuckExitQuarantine = option.StuckExitQuarantine
 			settings.DedupeTTL = option.DedupeTTL
 		}
 		settings.BondingCurve = option.BondingCurve
+		settings.CreationResolver = option.CreationResolver
 	}
 	if settings.SnipeConcurrency > 10 {
 		settings.SnipeConcurrency = 10
 	}
-	return &Monitor{
+	mon := &Monitor{
 		ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry,
 		tradeUSD: tradeUSD, slippage: slippage, priorityFee: priorityFee,
 		takeProfit: takeProfit, stopLoss: stopLoss, trailingStop: 15,
 		maxHold: maxHold, maxTokenAge: settings.MaxTokenAge,
-trailingStopArmPct: settings.TrailingStopArmPct,
-exitTriggerBufferPct: settings.ExitTriggerBufferPct,
+		trailingStopArmPct: settings.TrailingStopArmPct,
+		exitTriggerBufferPct: settings.ExitTriggerBufferPct,
 		simulation: simulation, subscriptions: make(chan string, size),
 		candidates:      make(map[string]*candidate),
 		pendingMarks:    make(map[string]pendingMark),
@@ -311,14 +328,21 @@ exitTriggerBufferPct: settings.ExitTriggerBufferPct,
 		maxVolumeBeforeBuySOL: settings.MaxVolumeBeforeBuySOL,
 		minMarketCapSOL:       settings.MinMarketCapSOL,
 		maxMarketCapSOL:       settings.MaxMarketCapSOL,
-stuckExitQuarantineAge: settings.StuckExitQuarantine,
+		stuckExitQuarantineAge: settings.StuckExitQuarantine,
 		useWSMarketCap:        settings.UseWSMarketCap,
 		pricePollInterval:     settings.PricePollInterval,
 		snipeConcurrency:      settings.SnipeConcurrency,
 		snipeTimeout:          settings.SnipeTimeout, dedupeTTL: settings.DedupeTTL,
-		bondingCurve: settings.BondingCurve,
-		bus:          b, log: l,
+		bondingCurve:     settings.BondingCurve,
+		creationResolver: settings.CreationResolver,
+		bus:              b, log: l,
 	}
+	if mon.creationResolver == nil {
+		// Sem isto, qualquer token cujo payload não traga timestamp é rejeitado
+		// silenciosamente. Logamos no arranque para não voltar a passar despercebido.
+		l.Warn("tokenmonitor: CreationResolver is nil; tokens without a payload timestamp will be rejected by the age gate")
+	}
+	return mon
 }
 func (m *Monitor) SetTrailingStopPct(pct float64) {
 	if pct > 0 {
@@ -338,7 +362,7 @@ func (m *Monitor) Run(ctx context.Context) {
 	go m.runMaxHoldChecker(ctx)
 	go m.runSeenJanitor(ctx)
 	go m.runCandidateChecker(ctx)
-		go m.runPricePoller(ctx)
+	go m.runPricePoller(ctx)
 	m.runConnections(ctx)
 }
 
@@ -530,13 +554,13 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 					zap.Int("attempts", reconciled))
 			}
 
-stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-m.stuckExitQuarantineAge))
+			stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-m.stuckExitQuarantineAge))
 			if stuckErr != nil {
 				m.log.Warn("check stuck exit mint", zap.String("mint", mint), zap.Error(stuckErr))
 				continue
 			}
 			if stuck {
-cleaned, quarantineErr := m.db.QuarantineStuckSimulationMint(mint, now.Add(-m.stuckExitQuarantineAge))
+				cleaned, quarantineErr := m.db.QuarantineStuckSimulationMint(mint, now.Add(-m.stuckExitQuarantineAge))
 				if quarantineErr != nil {
 					m.log.Warn("quarantine stuck simulated mint",
 						zap.String("mint", mint),
@@ -557,8 +581,8 @@ cleaned, quarantineErr := m.db.QuarantineStuckSimulationMint(mint, now.Add(-m.st
 					}
 					m.bus.Publish("risk_alert", map[string]any{
 						"mint": mint, "simulation": true,
-						"reason":          "stuck simulated exit quarantined; position closed and slot released",
-						"cleanedSells":    cleaned,
+						"reason":              "stuck simulated exit quarantined; position closed and slot released",
+						"cleanedSells":        cleaned,
 						"positionRemainsOpen": false,
 					})
 					m.tracked.Delete(mint)
@@ -582,13 +606,13 @@ cleaned, quarantineErr := m.db.QuarantineStuckSimulationMint(mint, now.Add(-m.st
 					zap.Int("attempts", reconciled))
 			}
 
-stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-m.stuckExitQuarantineAge))
+			stuck, stuckErr := m.db.StuckExitMint(mint, now.Add(-m.stuckExitQuarantineAge))
 			if stuckErr != nil {
 				m.log.Warn("check stuck live exit mint", zap.String("mint", mint), zap.Error(stuckErr))
 				continue
 			}
 			if stuck {
-cleaned, quarantineErr := m.db.QuarantineStuckLiveMint(mint, now.Add(-m.stuckExitQuarantineAge))
+				cleaned, quarantineErr := m.db.QuarantineStuckLiveMint(mint, now.Add(-m.stuckExitQuarantineAge))
 				if quarantineErr != nil {
 					m.log.Warn("quarantine stuck live mint",
 						zap.String("mint", mint),
@@ -609,8 +633,8 @@ cleaned, quarantineErr := m.db.QuarantineStuckLiveMint(mint, now.Add(-m.stuckExi
 					}
 					m.bus.Publish("risk_alert", map[string]any{
 						"mint": mint, "simulation": false,
-						"reason":          "stuck live exit quarantined; position closed and slot released",
-						"cleanedSells":    cleaned,
+						"reason":              "stuck live exit quarantined; position closed and slot released",
+						"cleanedSells":        cleaned,
 						"positionRemainsOpen": false,
 					})
 					m.tracked.Delete(mint)
@@ -816,6 +840,9 @@ func (m *Monitor) connect(ctx context.Context) error {
 			User             string          `json:"user"`
 			TraderPublicKey  string          `json:"traderPublicKey"`
 			TxType           string          `json:"txType"`
+			Signature        string          `json:"signature"`
+			TxSignature      string          `json:"txSignature"`
+			TxHash           string          `json:"txHash"`
 			CreatedTimestamp json.RawMessage `json:"createdTimestamp"`
 			Timestamp        json.RawMessage `json:"timestamp"`
 			BlockTime        json.RawMessage `json:"blockTime"`
@@ -886,10 +913,25 @@ func (m *Monitor) connect(ctx context.Context) error {
 		if creator == "" {
 			creator = d.User
 		}
+		signature := d.Signature
+		if signature == "" {
+			signature = d.TxSignature
+		}
+		if signature == "" {
+			signature = d.TxHash
+		}
 		received := time.Now().UTC()
 		created := timestampFromEvent(d.CreatedTimestamp, d.Timestamp, d.BlockTime)
 
-		e := Event{Mint: d.Mint, Creator: creator, Received: received, Created: created, MarketCapSOL: d.MarketCapSol, Raw: string(b)}
+		e := Event{
+			Mint:         d.Mint,
+			Creator:      creator,
+			Signature:    signature,
+			Received:     received,
+			Created:      created,
+			MarketCapSOL: d.MarketCapSol,
+			Raw:          string(b),
+		}
 		m.runOperation(func() {
 			if !m.rememberMint(e.Mint, received) {
 				return
@@ -1004,6 +1046,12 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 	}
 
 	if e.Created.IsZero() {
+		// Backfill a verifiable creation time via RPC before giving up.
+		if resolved, ok := m.resolveCreationTime(ctx, e); ok {
+			e.Created = resolved
+		}
+	}
+	if e.Created.IsZero() {
 		reason := "token creation timestamp unavailable; age cannot be verified"
 		m.persistAssessment(e.Mint, false, reason)
 		m.bus.Publish("token_rejected", map[string]any{
@@ -1080,6 +1128,37 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 	if m.strategy.HasScreen() {
 		m.screenAfterEntry(context.Background(), e.Mint)
 	}
+}
+
+// resolveCreationTime consults the configured RPC-backed resolver to obtain a
+// trustworthy creation timestamp for an event whose payload did not carry one.
+// It never falls back to the local receive time; a token whose age cannot be
+// verified must remain rejected.
+func (m *Monitor) resolveCreationTime(ctx context.Context, e Event) (time.Time, bool) {
+	if m.creationResolver == nil {
+		return time.Time{}, false
+	}
+	if strings.TrimSpace(e.Signature) == "" && strings.TrimSpace(e.Mint) == "" {
+		return time.Time{}, false
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, creationResolveTimeout)
+	defer cancel()
+	resolved, err := m.creationResolver.ResolveCreationTime(rpcCtx, e.Mint, e.Signature)
+	if err != nil {
+		m.log.Warn("resolve creation time via RPC failed",
+			zap.String("mint", e.Mint),
+			zap.String("signature", e.Signature),
+			zap.Error(err))
+		return time.Time{}, false
+	}
+	if resolved.IsZero() {
+		return time.Time{}, false
+	}
+	m.log.Info("creation time resolved via RPC",
+		zap.String("mint", e.Mint),
+		zap.String("signature", e.Signature),
+		zap.Time("created", resolved.UTC()))
+	return resolved.UTC(), true
 }
 
 func (m *Monitor) screenAfterEntry(parent context.Context, mint string) {
@@ -1314,11 +1393,11 @@ func (m *Monitor) positionExitReason(mint string, returnPct float64, openedAt, n
 		positions.Position{Mint: mint, CostSOL: cost, PeakSOL: peakValue, OpenedAt: openedAt},
 		currentValue,
 		true,
-positions.Limits{
-TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, TrailingStopPct: m.trailingStop,
-TrailingStopArmPct: m.trailingStopArmPct, ExitTriggerBufferPct: m.exitTriggerBufferPct,
-MaxHold: m.maxHold,
-},
+		positions.Limits{
+			TakeProfitPct: m.takeProfit, StopLossPct: m.stopLoss, TrailingStopPct: m.trailingStop,
+			TrailingStopArmPct: m.trailingStopArmPct, ExitTriggerBufferPct: m.exitTriggerBufferPct,
+			MaxHold: m.maxHold,
+		},
 		now,
 	)
 }
@@ -1544,6 +1623,9 @@ func (m *Monitor) blockAutomaticSimulationExitRetries(mint, reason string, faile
 	m.blockAutomaticExitRetries(mint, reason, failedAttempts)
 }
 
+// timestampFromEvent is unchanged: it still parses only numeric/string Unix
+// seconds (or ms) and RFC3339. It intentionally does NOT fall back to
+// time.Now(); unverified tokens are resolved via CreationTimeResolver instead.
 func timestampFromEvent(values ...json.RawMessage) time.Time {
 	for _, raw := range values {
 		if len(raw) == 0 || string(raw) == "null" {

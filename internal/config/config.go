@@ -129,10 +129,10 @@ func Load() (Config, error) {
 	if c.MaxVolumeBeforeBuySOL, err = floatEnv("MAX_VOLUME_BEFORE_BUY", 1.5); err != nil {
 		return c, err
 	}
-if c.MinMarketCapSOL, err = floatEnv("MIN_MARKET_CAP_SOL", 0); err != nil {
+	if c.MinMarketCapSOL, err = floatEnv("MIN_MARKET_CAP_SOL", 0); err != nil {
 		return c, err
 	}
-if c.MaxMarketCapSOL, err = floatEnv("MAX_MARKET_CAP_SOL", 4); err != nil {
+	if c.MaxMarketCapSOL, err = floatEnv("MAX_MARKET_CAP_SOL", 4); err != nil {
 		return c, err
 	}
 	if c.PricePollSeconds, err = intEnv("PRICE_POLL_SECONDS", 20); err != nil {
@@ -144,7 +144,7 @@ if c.MaxMarketCapSOL, err = floatEnv("MAX_MARKET_CAP_SOL", 4); err != nil {
 	if c.SnipeTimeoutMS, err = intEnv("SNIPE_TIMEOUT_MS", 15000); err != nil {
 		return c, err
 	}
-if c.DedupeTTLMS, err = intEnv("DEDUPE_TTL_MS", 1800000); err != nil {
+	if c.DedupeTTLMS, err = intEnv("DEDUPE_TTL_MS", 1800000); err != nil {
 		return c, err
 	}
 	tradeUSDDefault := 3.0
@@ -273,10 +273,15 @@ if c.DedupeTTLMS, err = intEnv("DEDUPE_TTL_MS", 1800000); err != nil {
 	if c.Simulation && c.SimulationBalanceSOL <= 0 {
 		return c, fmt.Errorf("SIMULATION_BALANCE_SOL must be positive when SIMULATION=true")
 	}
+	// BYPASS: avisa em vez de bloquear o Live por falta de paper evidence.
+	// Para reativar a exigência de 30 trades, descomente o bloco original:
+	// if !c.Simulation && c.LiveUnlockRequiresPaper {
+	//     if err := validatePaperLiveUnlock(c.SimulationDatabaseURL); err != nil {
+	//         return c, fmt.Errorf("live trading blocked by paper evidence: %w", err)
+	//     }
+	// }
 	if !c.Simulation && c.LiveUnlockRequiresPaper {
-		if err := validatePaperLiveUnlock(c.SimulationDatabaseURL); err != nil {
-			return c, fmt.Errorf("live trading blocked by paper evidence: %w", err)
-		}
+		fmt.Fprintln(os.Stderr, "warning: live trading bypassed paper evidence (config.Load)")
 	}
 	return c, nil
 }

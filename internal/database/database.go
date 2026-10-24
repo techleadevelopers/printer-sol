@@ -1510,15 +1510,41 @@ func (d *DB) PositionOpenedAt(mint string) (time.Time, bool, error) {
 	}
 	return opened, e == nil, e
 }
+
+// ================= ALTERAÇÃO 1: UnknownTradeCount só conta COMPRAS =================
+// A trava de reconciliação só deve bloquear novas compras se existir uma COMPRA
+// (side='buy') por resolver. Vendas unknown não bloqueiam compras novas — só
+// bloqueiam novas vendas do mesmo mint (via ActiveForMint).
 func (d *DB) UnknownTradeCount() (int, error) {
 	var n int
-	query := `SELECT COUNT(*) FROM trades WHERE state='unknown' OR reconciliation_needed=1`
+	query := `SELECT COUNT(*) FROM trades WHERE side='buy' AND (state='unknown' OR reconciliation_needed=1)`
 	if d.postgres {
-		query = `SELECT COUNT(*) FROM trades WHERE state='unknown' OR reconciliation_needed=TRUE`
+		query = `SELECT COUNT(*) FROM trades WHERE side='buy' AND (state='unknown' OR reconciliation_needed=TRUE)`
 	}
 	e := d.QueryRow(query).Scan(&n)
 	return n, e
 }
+
+// ================= ALTERAÇÃO 2: PurchasesBlocked devolve o tradeId =================
+// PurchasesBlocked devolve o tradeId da primeira compra por resolver, para que
+// o execution.go possa registar exactamente o que está a bloquear em vez de
+// uma mensagem genérica.
+func (d *DB) PurchasesBlocked() (string, bool, error) {
+	var id string
+	query := `SELECT id FROM trades WHERE side='buy' AND (state='unknown' OR reconciliation_needed=1) ORDER BY created_at ASC LIMIT 1`
+	if d.postgres {
+		query = `SELECT id FROM trades WHERE side='buy' AND (state='unknown' OR reconciliation_needed=TRUE) ORDER BY created_at ASC LIMIT 1`
+	}
+	err := d.QueryRow(query).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return id, true, nil
+}
+
 func (d *DB) OpenExposureSOL() (float64, error) {
 	var n sql.NullFloat64
 	e := d.QueryRow(`SELECT COALESCE(SUM(cost_sol),0) FROM positions WHERE status='open'`).Scan(&n)
@@ -1550,7 +1576,15 @@ func (d *DB) DailyRealizedLossSOL(simulationMode ...bool) (float64, error) {
 		AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')`), utcDayStart).Scan(&n)
 	return n.Float64, e
 }
-func (d *DB) ReconciliationRequired() (bool, error) { n, e := d.UnknownTradeCount(); return n > 0, e }
+
+// ================= ALTERAÇÃO 3: ReconciliationRequired mantém-se =================
+// Usado por Reconcile() no arranque (reconcilia trades pendentes). Continua
+// a usar o UnknownTradeCount (agora só compras).
+func (d *DB) ReconciliationRequired() (bool, error) {
+	n, e := d.UnknownTradeCount()
+	return n > 0, e
+}
+
 func (d *DB) UnreconciledTrades() (*sql.Rows, error) {
 	query := `SELECT id,COALESCE(signature,''),mint,side FROM trades WHERE reconciliation_needed=1 ORDER BY created_at ASC`
 	if d.postgres {

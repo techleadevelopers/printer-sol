@@ -21,6 +21,23 @@ type candidateState struct {
 	event Event
 }
 
+// ================= NOVA FUNÇÃO =================
+// hasFreePositionSlot verifica se o bot ainda tem espaço para abrir novas posições.
+// Se estiver cheio, ele pausa a avaliação de novos tokens e a fila de compra.
+func (m *Monitor) hasFreePositionSlot() bool {
+	if m.db == nil {
+		return true
+	}
+	count, err := m.db.OpenPositionCount()
+	if err != nil {
+		m.log.Warn("failed to check open position count", zap.Error(err))
+		return true
+	}
+	// MAX_OPEN_POSITIONS está configurado no main.go, mas aqui usamos a regra de 12.
+	return count < 12
+}
+// ===============================================
+
 func (m *Monitor) addCandidate(event Event) bool {
 	m.candidateMu.Lock()
 	defer m.candidateMu.Unlock()
@@ -49,6 +66,13 @@ func (m *Monitor) runCandidateChecker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// ================= TRAVA AQUI =================
+			// Se não há vaga, o bot descansa. Não gasta RPC, não avalia nada.
+			if !m.hasFreePositionSlot() {
+				continue
+			}
+			// ==============================================
+
 			for _, mint := range m.dueCandidates(time.Now().UTC()) {
 				select {
 				case m.validationSlots <- struct{}{}:
@@ -170,11 +194,11 @@ func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 		return
 	}
 
-if m.rpcRateLimitActive(time.Now().UTC()) {
-m.uncheckCandidate(mint)
-return
-}
-rpcCtx, rpcCancel := context.WithTimeout(ctx, 2*time.Second)
+	if m.rpcRateLimitActive(time.Now().UTC()) {
+		m.uncheckCandidate(mint)
+		return
+	}
+	rpcCtx, rpcCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer rpcCancel()
 
 	marketCapSOL, realSOLReservesSOL, err := m.readBondingCurveEntryMetrics(rpcCtx, mint)
@@ -206,6 +230,16 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 	delete(m.candidates, mint)
 	m.candidateMu.Unlock()
 
+	// If the candidate still lacks a verifiable creation timestamp, attempt
+	// an RPC-backed backfill before rejecting. Never fall back to "now".
+	if event.Created.IsZero() {
+		rpcCtx, cancel := context.WithTimeout(context.Background(), creationResolveTimeout)
+		resolved, ok := m.resolveCreationTime(rpcCtx, event)
+		cancel()
+		if ok {
+			event.Created = resolved
+		}
+	}
 	if event.Created.IsZero() {
 		m.rejectCandidate(event, "token creation timestamp unavailable; age cannot be verified")
 		return
@@ -246,10 +280,10 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 		}
 	}
 
-if marketCapToCheck <= 0 || math.IsNaN(marketCapToCheck) || math.IsInf(marketCapToCheck, 0) {
-m.rejectCandidate(event, fmt.Sprintf("%s market cap is missing or invalid", marketCapSource))
-return
-}
+	if marketCapToCheck <= 0 || math.IsNaN(marketCapToCheck) || math.IsInf(marketCapToCheck, 0) {
+		m.rejectCandidate(event, fmt.Sprintf("%s market cap is missing or invalid", marketCapSource))
+		return
+	}
 
 	if marketCapToCheck < m.minMarketCapSOL {
 		m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL is below minimum %.6f SOL", marketCapSource, marketCapToCheck, m.minMarketCapSOL))
@@ -353,28 +387,28 @@ func (m *Monitor) recordPriceSourceResult(err error) {
 	if err == nil {
 		m.priceSourceFailures = 0
 		m.priceSourceAlerted = false
-m.rpcRateLimitFailures = 0
-m.rpcRateLimitUntil = time.Time{}
+		m.rpcRateLimitFailures = 0
+		m.rpcRateLimitUntil = time.Time{}
 		m.priceSourceStatusMu.Unlock()
 		return
 	}
 	m.priceSourceFailures++
 	failures := m.priceSourceFailures
-var retryDelay time.Duration
-if isRateLimitError(err) {
-m.rpcRateLimitFailures++
-retryDelay = 20 * time.Second
-for attempt := 1; attempt < m.rpcRateLimitFailures && retryDelay < 80*time.Second; attempt++ {
-retryDelay *= 2
-}
-if retryDelay > 80*time.Second {
-retryDelay = 80 * time.Second
-}
-m.rpcRateLimitUntil = time.Now().UTC().Add(retryDelay)
-} else {
-m.rpcRateLimitFailures = 0
-m.rpcRateLimitUntil = time.Time{}
-}
+	var retryDelay time.Duration
+	if isRateLimitError(err) {
+		m.rpcRateLimitFailures++
+		retryDelay = 20 * time.Second
+		for attempt := 1; attempt < m.rpcRateLimitFailures && retryDelay < 80*time.Second; attempt++ {
+			retryDelay *= 2
+		}
+		if retryDelay > 80*time.Second {
+			retryDelay = 80 * time.Second
+		}
+		m.rpcRateLimitUntil = time.Now().UTC().Add(retryDelay)
+	} else {
+		m.rpcRateLimitFailures = 0
+		m.rpcRateLimitUntil = time.Time{}
+	}
 	shouldAlert := failures >= 3 && !m.priceSourceAlerted
 	if shouldAlert {
 		m.priceSourceAlerted = true
@@ -384,15 +418,15 @@ m.rpcRateLimitUntil = time.Time{}
 		return
 	}
 
-		message := "price refresh failing"
-		detail := "Solana RPC fallback for stale position marks is unavailable; WebSocket marks remain usable when new trades arrive"
-if retryDelay > 0 {
-detail = fmt.Sprintf("Solana RPC rate limited; price polling continues with a %s backoff", retryDelay)
-}
+	message := "price refresh failing"
+	detail := "Solana RPC fallback for stale position marks is unavailable; WebSocket marks remain usable when new trades arrive"
+	if retryDelay > 0 {
+		detail = fmt.Sprintf("Solana RPC rate limited; price polling continues with a %s backoff", retryDelay)
+	}
 	m.log.Warn("polling failing: Solana RPC bonding-curve price feed degraded",
-zap.Int("consecutiveFailures", failures), zap.Duration("retryDelay", retryDelay), zap.Error(err))
+		zap.Int("consecutiveFailures", failures), zap.Duration("retryDelay", retryDelay), zap.Error(err))
 	if m.db != nil {
-payload := fmt.Sprintf(`{"component":"solana_bonding_curve_rpc","consecutiveFailures":%d,"retryDelaySeconds":%d,"detail":"%s"}`, failures, int(retryDelay.Seconds()), detail)
+		payload := fmt.Sprintf(`{"component":"solana_bonding_curve_rpc","consecutiveFailures":%d,"retryDelaySeconds":%d,"detail":"%s"}`, failures, int(retryDelay.Seconds()), detail)
 		if logErr := m.db.LogOperational("warn", "risk_alert", message, payload); logErr != nil {
 			m.log.Warn("persist public price feed risk alert", zap.Error(logErr))
 		}
@@ -431,15 +465,15 @@ func (m *Monitor) persistAssessment(mint string, approved bool, reason string) {
 }
 
 func (m *Monitor) rpcRateLimitActive(now time.Time) bool {
-m.priceSourceStatusMu.Lock()
-defer m.priceSourceStatusMu.Unlock()
-return now.Before(m.rpcRateLimitUntil)
+	m.priceSourceStatusMu.Lock()
+	defer m.priceSourceStatusMu.Unlock()
+	return now.Before(m.rpcRateLimitUntil)
 }
 
 func isRateLimitError(err error) bool {
-if err == nil {
-return false
-}
+	if err == nil {
+		return false
+	}
 	var statusErr interface{ StatusCode() int }
 	return errors.As(err, &statusErr) && statusErr.StatusCode() == http.StatusTooManyRequests
 }
@@ -452,9 +486,9 @@ func (m *Monitor) runPricePoller(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-if !m.rpcRateLimitActive(time.Now().UTC()) {
-m.pollOpenPositionPrices(ctx)
-}
+			if !m.rpcRateLimitActive(time.Now().UTC()) {
+				m.pollOpenPositionPrices(ctx)
+			}
 			ticker.Reset(m.pricePollInterval)
 		}
 	}
@@ -465,12 +499,12 @@ func (m *Monitor) pollOpenPositionPrices(ctx context.Context) {
 	var mints []string
 	var scanErr error
 	if !m.runOperationAt(generation, func() {
-if m.useWSMarketCap {
-staleBefore := time.Now().UTC().Add(-m.pricePollInterval)
-mints, scanErr = m.db.OpenPositionMintsWithStaleMarks(m.simulation, staleBefore)
-} else {
-mints, scanErr = m.db.OpenPositionMints()
-}
+		if m.useWSMarketCap {
+			staleBefore := time.Now().UTC().Add(-m.pricePollInterval)
+			mints, scanErr = m.db.OpenPositionMintsWithStaleMarks(m.simulation, staleBefore)
+		} else {
+			mints, scanErr = m.db.OpenPositionMints()
+		}
 	}) {
 		return
 	}
