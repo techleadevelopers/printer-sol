@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gagliardetto/solana-go"
+	lookup "github.com/gagliardetto/solana-go/programs/address-lookup-table"
 	"go.uber.org/zap"
 	"solana-sniper-backend/internal/bot"
 	"solana-sniper-backend/internal/database"
@@ -36,11 +37,11 @@ type Request struct {
 }
 type Limits struct {
 	MaxTradeSOL, MaxExposureSOL, MaxDailyLossSOL, MaxSlippagePct, MaxPriorityFeeSOL, FeeReserveSOL float64
-	MaxLossPerTradePct                                                                            float64
+	MaxLossPerTradePct                                                                             float64
 	MaxSlippageBPS, MaxQuoteAgeMS, MaxCurveImpactBPS                                               int
-	SimulationBaseFeeSOL                                                                         float64
+	SimulationBaseFeeSOL                                                                           float64
 	MaxOpenPositions, MaxWaitSeconds, MaxAttempts                                                  int
-	SkipPreflight                                                                                 bool
+	SkipPreflight                                                                                  bool
 }
 type Engine struct {
 	db                *database.DB
@@ -61,16 +62,16 @@ type Engine struct {
 }
 
 type livePreparation struct {
-	amount              any
-	tokenQuantity       string
-	tokenQuantityRaw    string
-	denominatedInSOL    bool
-	slippage            float64
-	quotedAt            time.Time
-	quoteAgeLimit       int
-	curveImpactBPS      float64
-	minimumOutputSOL    float64
-	requestedValueSOL   float64
+	amount            any
+	tokenQuantity     string
+	tokenQuantityRaw  string
+	denominatedInSOL  bool
+	slippage          float64
+	quotedAt          time.Time
+	quoteAgeLimit     int
+	curveImpactBPS    float64
+	minimumOutputSOL  float64
+	requestedValueSOL float64
 }
 
 func New(db *database.DB, w *wallet.Wallet, p *pumpportal.Client, r *rpcmanager.Manager, prices pricefeed.Provider, l *zap.Logger, sim bool, simulationBalanceSOL float64, c *bot.Controller, b *events.Bus, limits Limits) *Engine {
@@ -92,9 +93,6 @@ func (e *Engine) SimulationBalanceSOL() float64 {
 	return float64(e.simulationBalance) / 1e9
 }
 
-// WithSimulationReset serializes a paper reset against execution. The callback
-// is expected to perform the database transaction; in-memory state is cleared
-// only after it commits successfully.
 func (e *Engine) WithSimulationReset(balanceSOL float64, reset func() error) error {
 	if !e.simulation {
 		return fmt.Errorf("simulation reset is unavailable in live mode")
@@ -130,9 +128,6 @@ func (e *Engine) emit(kind string, data any) {
 	}
 }
 
-// BuyNewTokenUSD sizes one one-shot entry from a fresh SOL/USD quote. The
-// reservation prevents concurrent new-token events from allocating the same
-// wallet balance before a submitted transaction becomes visible on-chain.
 func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage, priorityFee float64, pool, reason string) (string, error) {
 	if usd <= 0 || e.prices == nil {
 		return "", fmt.Errorf("USD sizing is unavailable")
@@ -167,8 +162,6 @@ func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage,
 	}
 	id, err := e.Execute(ctx, Request{Mint: mint, Side: "buy", Amount: amount, DenominatedInSOL: true, Slippage: slippage, PriorityFee: priorityFee, Pool: pool, Reason: reason})
 	if err != nil {
-		// A persisted submitted/unknown trade blocks all new buys until
-		// reconciliation; retaining this in-memory reservation would only leak.
 		e.release(mint)
 		return id, err
 	}
@@ -178,8 +171,6 @@ func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage,
 	return id, nil
 }
 
-// ClosePaperPosition records a virtual sale at the live market-marked value.
-// It is intentionally unavailable outside simulation mode.
 func (e *Engine) ClosePaperPosition(ctx context.Context, mint string, returnPct float64, reason string) (string, error) {
 	if !e.simulation {
 		return "", fmt.Errorf("paper exits are only available in simulation")
@@ -195,7 +186,6 @@ func (e *Engine) ClosePaperPosition(ctx context.Context, mint string, returnPct 
 	return e.Execute(ctx, Request{Mint: mint, Side: "sell", Amount: value, DenominatedInSOL: true, PriorityFee: e.Limits().MaxPriorityFeeSOL, Reason: reason})
 }
 
-// CloseLivePosition sells the full balance of a confirmed live position.
 func (e *Engine) CloseLivePosition(ctx context.Context, mint string, slippage, priorityFee float64, reason string) (string, error) {
 	if e.simulation {
 		return "", fmt.Errorf("live exits are unavailable in simulation")
@@ -206,6 +196,10 @@ func (e *Engine) CloseLivePosition(ctx context.Context, mint string, slippage, p
 	return e.Execute(ctx, Request{Mint: mint, Side: "sell", Amount: 100, DenominatedInSOL: false, Slippage: slippage, PriorityFee: priorityFee, Pool: "auto", Reason: reason, SellAll: true})
 }
 
+// reserve guarda o valor necessário para uma compra. O `balance` já vem da
+// blockchain e já reflecte o SOL gasto nas posições abertas; NÃO somar
+// OpenExposureSOL() de novo (isso contava a exposição duas vezes e bloqueava
+// compras mesmo com saldo disponível).
 func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error {
 	var balance uint64
 	if e.simulation {
@@ -239,20 +233,18 @@ func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error 
 	for _, v := range e.reserved {
 		reserved += v
 	}
+	// O saldo do RPC já desconta o SOL das posições abertas. Somar
+	// OpenExposureSOL() aqui contava a exposição duas vezes.
 	required := reserve + reserved + needed
-	if !e.simulation {
-		exposure, err := e.db.OpenExposureSOL()
-		if err != nil {
-			return err
-		}
-		openCost, err := wallet.SOLToLamports(exposure)
-		if err != nil {
-			return err
-		}
-		required += openCost
-	}
 	if balance < required {
-		return fmt.Errorf("insufficient free wallet balance after fee reserve and pending entries")
+		return fmt.Errorf(
+			"insufficient free wallet balance: balance=%.9f SOL, fee_reserve=%.9f SOL, pending_reserved=%.9f SOL, needed=%.9f SOL, required=%.9f SOL",
+			float64(balance)/1e9,
+			float64(reserve)/1e9,
+			float64(reserved)/1e9,
+			float64(needed)/1e9,
+			float64(required)/1e9,
+		)
 	}
 	e.reserved[mint] = needed
 	return nil
@@ -264,7 +256,6 @@ func (e *Engine) release(mint string) {
 	e.mu.Unlock()
 }
 
-// Reconcile recovers persisted in-flight submissions after a restart. It never submits a new transaction.
 func (e *Engine) Reconcile(ctx context.Context) error {
 	rows, err := e.db.UnreconciledTrades()
 	if err != nil {
@@ -273,8 +264,6 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	return e.reconcileRows(ctx, rows)
 }
 
-// ReconcileUnknown revisits outcomes that were uncertain while the service
-// stayed online. It only reads persisted signatures and never submits trades.
 func (e *Engine) ReconcileUnknown(ctx context.Context) error {
 	if e.simulation {
 		return nil
@@ -484,8 +473,6 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	id := fmt.Sprintf("tr_%d", time.Now().UTC().UnixNano())
 	simulationFees := 0.0
 	if e.simulation {
-		// Each simulated transaction pays its configured priority bid plus
-		// one base network fee. A round trip contains one buy and one sell.
 		simulationFees = r.PriorityFee + e.Limits().SimulationBaseFeeSOL
 	}
 	requestedValue := r.Amount
@@ -514,7 +501,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	}
 	prepared, err := e.prepareLiveRequest(ctx, id, r)
 	if err != nil {
-return id, e.failPreparedTrade(id, err)
+		return id, e.failPreparedTrade(id, err)
 	}
 	amount := any(prepared.amount)
 	if prepared.denominatedInSOL {
@@ -522,41 +509,50 @@ return id, e.failPreparedTrade(id, err)
 	}
 	txBytes, err := e.portal.Prepare(ctx, pumpportal.Request{PublicKey: e.wallet.Address(), Action: r.Side, Mint: r.Mint, Amount: amount, DenominatedInSOL: fmt.Sprint(prepared.denominatedInSOL), Slippage: prepared.slippage, PriorityFee: r.PriorityFee, Pool: r.Pool})
 	if err != nil {
-return id, e.failPreparedTrade(id, err)
+		return id, e.failPreparedTrade(id, err)
 	}
 	tx, err := solana.TransactionFromBytes(txBytes)
 	if err != nil {
-return id, e.failPreparedTrade(id, fmt.Errorf("unsupported PumpPortal transaction encoding: %w", err))
+		return id, e.failPreparedTrade(id, fmt.Errorf("unsupported PumpPortal transaction encoding: %w", err))
 	}
-	if err = tx.Sanitize(); err != nil {
-return id, e.failPreparedTrade(id, fmt.Errorf("unsafe transaction: %w", err))
+
+	// ORDEM CORRETA: resolver ALT → validar → sanitizar → assinar → enviar.
+	// O Sanitize() é chamado DEPOIS da resolução das ALT, porque a mensagem
+	// só está completa depois de expandir os lookups.
+	if err = e.resolveAddressLookupTables(tx); err != nil {
+		return id, e.failPreparedTrade(id, fmt.Errorf("resolve address lookup tables: %w", err))
 	}
 	if err = e.validatePreparedTransaction(tx, r, prepared); err != nil {
-return id, e.failPreparedTrade(id, fmt.Errorf("unsafe prepared transaction: %w", err))
+		return id, e.failPreparedTrade(id, fmt.Errorf("unsafe prepared transaction: %w", err))
+	}
+	if err = tx.Sanitize(); err != nil {
+		return id, e.failPreparedTrade(id, fmt.Errorf("unsafe transaction: %w", err))
 	}
 	if prepared.quoteAgeLimit > 0 {
 		quoteAge := time.Since(prepared.quotedAt)
 		if quoteAge < 0 || quoteAge > time.Duration(prepared.quoteAgeLimit)*time.Millisecond {
-return id, e.failPreparedTrade(id, fmt.Errorf("bonding-curve quote exceeded MAX_QUOTE_AGE_MS before submission"))
+			return id, e.failPreparedTrade(id, fmt.Errorf("bonding-curve quote exceeded MAX_QUOTE_AGE_MS before submission"))
 		}
 		if err = e.db.UpdateTradeQuote(id, prepared.quotedAt, quoteAge.Milliseconds(), prepared.curveImpactBPS, prepared.minimumOutputSOL, prepared.requestedValueSOL, prepared.tokenQuantity); err != nil {
-return id, e.failPreparedTrade(id, fmt.Errorf("persist execution quote: %w", err))
+			return id, e.failPreparedTrade(id, fmt.Errorf("persist execution quote: %w", err))
 		}
 	}
 	if !tx.IsSigner(e.wallet.PublicKey()) {
-return id, e.failPreparedTrade(id, fmt.Errorf("prepared transaction does not require operational wallet"))
+		return id, e.failPreparedTrade(id, fmt.Errorf("prepared transaction does not require operational wallet"))
 	}
+	// ASSINATURA: a mensagem validada é a mesma que será serializada. Não há
+	// alterações à Message depois deste ponto.
 	if err = e.wallet.Sign(tx); err != nil {
-return id, e.failPreparedTrade(id, err)
+		return id, e.failPreparedTrade(id, err)
 	}
 	raw, err := tx.MarshalBinary()
 	if err != nil {
-return id, e.failPreparedTrade(id, err)
+		return id, e.failPreparedTrade(id, err)
 	}
 	signature := tx.Signatures[0].String()
-if err = e.db.UpdateTradeState(id, "signed", signature, false); err != nil {
-return id, e.failPreparedTrade(id, fmt.Errorf("persist signed trade before submission: %w", err))
-}
+	if err = e.db.UpdateTradeState(id, "signed", signature, false); err != nil {
+		return id, e.failPreparedTrade(id, fmt.Errorf("persist signed trade before submission: %w", err))
+	}
 	attempts := e.Limits().MaxAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -579,6 +575,20 @@ return id, e.failPreparedTrade(id, fmt.Errorf("persist signed trade before submi
 	return id, nil
 }
 
+// validateSOLQuoteMint blocks direct SOL-denominated execution for bonding
+// curves whose quote mint is not SOL (zero public key). Those tokens may
+// require a multi-hop route; until that route is implemented and validated,
+// they must not reach PumpPortal preparation.
+func validateSOLQuoteMint(quoteMint solana.PublicKey) error {
+	if quoteMint != (solana.PublicKey{}) {
+		return fmt.Errorf(
+			"unsupported non-SOL quote mint %s; live execution blocked",
+			quoteMint.String(),
+		)
+	}
+	return nil
+}
+
 func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Request) (livePreparation, error) {
 	limits := e.Limits()
 	if limits.MaxSlippageBPS < 1 || limits.MaxQuoteAgeMS < 1 || limits.MaxCurveImpactBPS < 1 {
@@ -591,14 +601,21 @@ func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Requ
 	if err != nil {
 		return livePreparation{}, fmt.Errorf("fresh bonding-curve quote required: %w", err)
 	}
+	// Bloqueio conservador: se a bonding curve não for cotada em SOL, a
+	// compra directa com pool "pump" pode devolver UnsupportedQuoteMint (6063).
+	// Tokens que exigem rota multi-hop ficam bloqueados até essa rota estar
+	// implementada e validada.
+	if err := validateSOLQuoteMint(state.QuoteMint); err != nil {
+		return livePreparation{}, err
+	}
 	if state.Complete || state.VirtualSOLReserves == 0 || state.VirtualTokenReserves == 0 || state.ObservedAt.IsZero() {
 		return livePreparation{}, fmt.Errorf("bonding-curve quote is not usable for protected execution")
 	}
 	prepared := livePreparation{
-		denominatedInSOL: request.Side == "buy",
-		slippage:         request.Slippage,
-		quotedAt:         state.ObservedAt,
-		quoteAgeLimit:    limits.MaxQuoteAgeMS,
+		denominatedInSOL:  request.Side == "buy",
+		slippage:          request.Slippage,
+		quotedAt:          state.ObservedAt,
+		quoteAgeLimit:     limits.MaxQuoteAgeMS,
 		requestedValueSOL: request.Amount,
 	}
 	virtualSOL := float64(state.VirtualSOLReserves) / 1e9
@@ -648,8 +665,6 @@ func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Requ
 			return livePreparation{}, fmt.Errorf("confirmed entry cost must be positive to protect the sell")
 		}
 		maxLossFloor := cost * (1 - limits.MaxLossPerTradePct/100)
-		// Network fees are separate from the swap output; reserve the configured
-		// priority cap and base fee when enforcing the per-position loss floor.
 		entryFees, feesErr := e.db.PositionFeesSOL(request.Mint)
 		if feesErr != nil {
 			return livePreparation{}, fmt.Errorf("confirmed entry fees required to protect the sell: %w", feesErr)
@@ -692,17 +707,58 @@ func formatRawTokenAmount(raw uint64, decimals uint8) string {
 	return whole + "." + fraction
 }
 
-// resolveSimulationSellFinalizationError classifies the outcome of a failed
-// paper-sell finalization. It MUST leave the system in a terminal, retry-safe
-// state. Two terminal outcomes exist:
-//
-//  1. Complete: trade/transaction/position all persisted as simulated/closed.
-//  2. Definitive failure: trade/transaction failed AND position closed by the
-//     dedicated MarkSimulationSellFailed helper, which also releases the slot.
-//
-// Anything else is marked unknown so ActiveForMint blocks a second sell, and
-// ReconcileStaleSimulationSells later converts it to failed. Only when the
-// unknown state cannot be persisted at all is an error returned to the caller.
+// resolveAddressLookupTables busca cada ALT referenciada na transação,
+// descodifica os endereços, injeta-os na mensagem e resolve os índices.
+// Após isto, tx.Message.IsResolved() == true e a validação aceita a
+// transação V0 original. Não reconstruir a mensagem.
+func (e *Engine) resolveAddressLookupTables(tx *solana.Transaction) error {
+	if !tx.Message.IsVersioned() {
+		return nil
+	}
+	tableKeys := tx.Message.GetAddressTableLookups().GetTableIDs()
+	if len(tableKeys) == 0 {
+		return nil
+	}
+
+	resolutions := make(map[solana.PublicKey]solana.PublicKeySlice)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, key := range tableKeys {
+		info, err := e.rpcs.GetAccountInfo(ctx, key)
+		if err != nil {
+			return fmt.Errorf("fetch ALT %s: %w", key.String(), err)
+		}
+		if info == nil || info.Value == nil {
+			return fmt.Errorf("ALT %s not found", key.String())
+		}
+		data := info.Value.Data.Content
+		if len(data) == 0 {
+			return fmt.Errorf("ALT %s data is empty", key.String())
+		}
+		tableContent, err := lookup.DecodeAddressLookupTableState(data)
+		if err != nil {
+			return fmt.Errorf("decode ALT %s: %w", key.String(), err)
+		}
+		if !tableContent.IsActive() {
+			return fmt.Errorf("ALT %s is not active", key.String())
+		}
+		resolutions[key] = tableContent.Addresses
+	}
+
+	if err := tx.Message.SetAddressTables(resolutions); err != nil {
+		return fmt.Errorf("set address tables: %w", err)
+	}
+	if err := tx.Message.ResolveLookups(); err != nil {
+		return fmt.Errorf("resolve lookups: %w", err)
+	}
+
+	// Preservar a mensagem V0 original. NÃO reconstruir.
+	// O ResolveLookups já expandiu os AccountKeys e corrigiu os índices.
+	// A validação seguinte aceita V0 porque tx.Message.IsResolved() == true.
+	return nil
+}
+
 func (e *Engine) resolveSimulationSellFinalizationError(id string, request Request, fees float64, finalizeErr error) error {
 	return e.resolveSellFinalizationError(
 		id, request, fees, finalizeErr,
@@ -713,12 +769,6 @@ func (e *Engine) resolveSimulationSellFinalizationError(id string, request Reque
 	)
 }
 
-// resolveLiveSellFinalizationError mirrors resolveSimulationSellFinalizationError
-// for live sells. The state contract is identical: a failed finalization must
-// end in either (a) complete (trade/transaction finalized + position closed) or
-// (b) definitive failure (trade/transaction failed + position closed by
-// MarkLiveSellFailed) or (c) unknown, which blocks a second sell until
-// ReconcileStaleLiveSells or QuarantineStuckLiveMint resolves it.
 func (e *Engine) resolveLiveSellFinalizationError(id string, request Request, fees float64, finalizeErr error) error {
 	return e.resolveSellFinalizationError(
 		id, request, fees, finalizeErr,
@@ -771,8 +821,6 @@ func (e *Engine) resolveSellFinalizationError(
 
 	definitiveFailure := snapshotErr == nil && snapshot.PositionState == "open"
 	if definitiveFailure && isSimulation {
-		// Paper sells have no external transaction side effect. An unknown
-		// persisted attempt can therefore be failed safely to release the slot.
 		definitiveFailure =
 			(snapshot.TradeState == "prepared" || snapshot.TradeState == "unknown") &&
 				(snapshot.TransactionState == "prepared" || snapshot.TransactionState == "unknown")
@@ -858,10 +906,6 @@ func (e *Engine) resolveSellFinalizationError(
 			"error":  finalizeErr.Error(),
 		})
 	}
-	// The failure/unknown state is persisted and ActiveForMint will block a
-	// duplicate sell. Returning nil here is what stops the monitor from
-	// re-evaluating this mint in a tight loop. ReconcileStale*Sells will close
-	// the position on the next monitor pass.
 	return nil
 }
 
@@ -921,7 +965,7 @@ func (e *Engine) confirm(id, sig string, r Request) {
 				}
 				if r.Side == "buy" {
 					quantity, quantityValue, quantityErr := confirmedTokenQuantity(receipt.TokenDeltaRaw, receipt.TokenDecimals, 1)
-					if receipt.SOLDelta >= 0 || quantityErr != nil { // buy must debit SOL and receive tokens
+					if receipt.SOLDelta >= 0 || quantityErr != nil {
 						_ = e.db.UpdateTradeState(id, "unknown", sig, false)
 						e.emit("risk_alert", map[string]any{"tradeId": id, "reason": "buy confirmation lacks a verified SOL debit or token receipt"})
 						return
@@ -980,10 +1024,10 @@ func (e *Engine) confirm(id, sig string, r Request) {
 	}
 }
 
-// validatePreparedTransaction is deliberately conservative: PumpPortal may
-// construct the transaction, but only the configured wallet may authorize it
-// and that wallet must be the fee payer. Address-table transactions are
-// rejected until their tables are resolved and inspected locally.
+// validatePreparedTransaction valida a transação preparada. Aceita
+// AddressTableLookups APENAS se a mensagem já tiver sido resolvida
+// (tx.Message.IsResolved() == true), garantindo que as ALT foram
+// efectivamente carregadas antes da assinatura.
 func (e *Engine) validatePreparedTransaction(tx *solana.Transaction, request Request, prepared livePreparation) error {
 	if len(tx.Message.AccountKeys) == 0 || tx.Message.AccountKeys[0] != e.wallet.PublicKey() {
 		return fmt.Errorf("operational wallet is not the fee payer")
@@ -991,7 +1035,7 @@ func (e *Engine) validatePreparedTransaction(tx *solana.Transaction, request Req
 	if tx.Message.Header.NumRequiredSignatures != 1 || len(tx.Signatures) != 1 {
 		return fmt.Errorf("transaction must require exactly one signer")
 	}
-	if len(tx.Message.AddressTableLookups) != 0 {
+	if len(tx.Message.AddressTableLookups) != 0 && !tx.Message.IsResolved() {
 		return fmt.Errorf("address lookup transactions are not permitted without local lookup resolution")
 	}
 	if tx.Message.RecentBlockhash.IsZero() || len(tx.Message.Instructions) == 0 {

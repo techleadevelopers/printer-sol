@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
 )
 
 func TestRPCRejectsRateLimitAndForbidden(t *testing.T) {
@@ -154,5 +153,93 @@ func TestGetBondingCurveStateReadsAndDecodesRPCAccount(t *testing.T) {
 		state.RealTokenReserves != 1_500_000 || state.RealSOLReserves != 750_000_000 ||
 		state.TokenSupply != 2_000_000 || !state.Complete || state.MarketCapSOL != 1 {
 		t.Fatalf("decoded bonding curve state = %+v", state)
+	}
+	if got := state.QuoteMint.String(); got != "11111111111111111111111111111111" {
+		t.Fatalf("legacy account quote mint = %q; want zero public key", got)
+	}
+}
+
+func bondingCurveTestData(length int) []byte {
+	discriminator := sha256.Sum256([]byte("account:BondingCurve"))
+	data := make([]byte, length)
+
+	copy(data[:8], discriminator[:8])
+	binary.LittleEndian.PutUint64(data[8:16], 2_000_000)
+	binary.LittleEndian.PutUint64(data[16:24], 1_000_000_000)
+	binary.LittleEndian.PutUint64(data[24:32], 1_500_000)
+	binary.LittleEndian.PutUint64(data[32:40], 750_000_000)
+	binary.LittleEndian.PutUint64(data[40:48], 2_000_000)
+	data[48] = 0
+
+	return data
+}
+
+func newBondingCurveTestManager(t *testing.T, data []byte) *Manager {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"result": map[string]any{
+				"value": map[string]any{
+					"owner": pumpFunProgramID,
+					"data": []string{
+						base64.StdEncoding.EncodeToString(data),
+						"base64",
+					},
+				},
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	return &Manager{
+		endpoints: []Endpoint{{URL: server.URL}},
+		current:   0,
+		client:    server.Client(),
+	}
+}
+
+func TestGetBondingCurveStateDecodesNonSOLQuoteMint(t *testing.T) {
+	data := bondingCurveTestData(115)
+
+	for i := 0; i < 32; i++ {
+		data[83+i] = byte(i + 1)
+	}
+
+	manager := newBondingCurveTestManager(t, data)
+
+	state, err := manager.GetBondingCurveState(
+		"So11111111111111111111111111111111111111112",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if state.QuoteMint[0] != 1 || state.QuoteMint[31] != 32 {
+		t.Fatalf(
+			"quote mint bytes were not decoded correctly: first=%d last=%d",
+			state.QuoteMint[0],
+			state.QuoteMint[31],
+		)
+	}
+}
+
+func TestGetBondingCurveStateRejectsPartialQuoteMint(t *testing.T) {
+	// O campo começa no byte 83 e precisa de 32 bytes completos.
+	data := bondingCurveTestData(100)
+	manager := newBondingCurveTestManager(t, data)
+
+	_, err := manager.GetBondingCurveState(
+		"So11111111111111111111111111111111111111112",
+	)
+	if err == nil {
+		t.Fatal("expected error for incomplete quote_mint field")
+	}
+
+	if !strings.Contains(err.Error(), "quote_mint field is incomplete") {
+		t.Fatalf("unexpected error for partial quote_mint: %v", err)
 	}
 }

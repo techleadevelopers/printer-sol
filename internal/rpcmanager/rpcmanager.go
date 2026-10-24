@@ -145,14 +145,21 @@ func (m *Manager) call(ctx context.Context, url, method string, params, result a
 	var out struct {
 		Result json.RawMessage `json:"result"`
 		Error  *struct {
-			Message string `json:"message"`
+			Code    int             `json:"code"`
+			Message string          `json:"message"`
+			Data    json.RawMessage `json:"data"`
 		} `json:"error"`
 	}
 	if e = json.NewDecoder(res.Body).Decode(&out); e != nil {
 		return e
 	}
 	if out.Error != nil {
-		return fmt.Errorf("RPC: %s", out.Error.Message)
+		return fmt.Errorf(
+			"RPC error code=%d message=%q data=%s",
+			out.Error.Code,
+			out.Error.Message,
+			string(out.Error.Data),
+		)
 	}
 	if result != nil {
 		return json.Unmarshal(out.Result, result)
@@ -162,7 +169,7 @@ func (m *Manager) call(ctx context.Context, url, method string, params, result a
 
 type httpError struct{ status int }
 
-func (e *httpError) Error() string { return fmt.Sprintf("RPC HTTP %d", e.status) }
+func (e *httpError) Error() string   { return fmt.Sprintf("RPC HTTP %d", e.status) }
 func (e *httpError) StatusCode() int { return e.status }
 func httpStatus(err error) int {
 	var target *httpError
@@ -178,6 +185,12 @@ func (m *Manager) Send(ctx context.Context, raw []byte) (string, error) {
 // SendWithMaxRetries asks the RPC node to rebroadcast the same signed payload.
 // It never constructs or signs a replacement transaction, so retries retain
 // the original signature and are idempotent with respect to duplicate buys.
+//
+// IMPORTANT: skipPreflight is FORCED to true. Some paid RPCs (Alchemy, etc.)
+// still simulate the transaction even when the caller requests skipPreflight;
+// forcing it here guarantees the signed payload goes straight to the network.
+// preflightCommitment is "processed" (ignored when skipPreflight=true, but
+// kept for defence in depth).
 func (m *Manager) SendWithMaxRetries(ctx context.Context, raw []byte, maxRetries int, skipPreflight bool) (string, error) {
 	if maxRetries < 0 {
 		maxRetries = 0
@@ -190,7 +203,15 @@ func (m *Manager) SendWithMaxRetries(ctx context.Context, raw []byte, maxRetries
 		return "", e
 	}
 	var sig string
-	e = m.call(ctx, u, "sendTransaction", []any{base64.StdEncoding.EncodeToString(raw), map[string]any{"encoding": "base64", "skipPreflight": skipPreflight, "preflightCommitment": "confirmed", "maxRetries": maxRetries}}, &sig)
+	e = m.call(ctx, u, "sendTransaction", []any{
+		base64.StdEncoding.EncodeToString(raw),
+		map[string]any{
+			"encoding":            "base64",
+			"skipPreflight":       true,
+			"preflightCommitment": "processed",
+			"maxRetries":          maxRetries,
+		},
+	}, &sig)
 	return sig, e
 }
 func (m *Manager) Status(ctx context.Context, sig string) (string, error) {
@@ -276,6 +297,7 @@ type BondingCurveState struct {
 	RealSOLReserves      uint64
 	TokenSupply          uint64
 	Complete             bool
+	QuoteMint            solana.PublicKey
 	MarketCapSOL         float64
 	SpotPriceSOL         float64
 	ObservedAt           time.Time
@@ -338,6 +360,22 @@ func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint stri
 	if !bytes.Equal(data[:8], discriminator[:8]) {
 		return BondingCurveState{}, fmt.Errorf("account data is not a Pump.fun bonding curve")
 	}
+
+	// Decode quote_mint tolerantly. Accounts created before the field existed
+	// have len(data) <= 83 and are implicitly SOL-quoted (zero public key).
+	var quoteMint solana.PublicKey
+	switch {
+	case len(data) <= 83:
+		// Conta antiga: quote_mint ausente significa moeda cotada em SOL.
+	case len(data) < 115:
+		return BondingCurveState{}, fmt.Errorf(
+			"Pump.fun bonding-curve quote_mint field is incomplete: data_len=%d",
+			len(data),
+		)
+	default:
+		copy(quoteMint[:], data[83:115])
+	}
+
 	state := BondingCurveState{
 		VirtualTokenReserves: binary.LittleEndian.Uint64(data[8:16]),
 		VirtualSOLReserves:   binary.LittleEndian.Uint64(data[16:24]),
@@ -345,6 +383,7 @@ func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint stri
 		RealSOLReserves:      binary.LittleEndian.Uint64(data[32:40]),
 		TokenSupply:          binary.LittleEndian.Uint64(data[40:48]),
 		Complete:             data[48] != 0,
+		QuoteMint:            quoteMint,
 	}
 	if state.RealSOLReserves == 0 && m.log != nil {
 		m.log.Debug("bonding-curve real_sol_reserves decoded as zero",
@@ -352,12 +391,12 @@ func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint stri
 			zap.Int("data_len", len(data)),
 			zap.String("first_48_bytes_hex", fmt.Sprintf("%x", data[:48])))
 	}
-	
+
 	// CORRIGIDO: NÃO REJEITAR quando reserves ou supply são zero.
 	// Se VirtualTokenReserves ou VirtualSOLReserves forem zero, retorna MarketCapSOL = 0 e RealSOLReserves = 0 (sem erro).
 	// O marketdata.go vai usar o WebSocket como fallback.
 	if state.VirtualTokenReserves == 0 || state.VirtualSOLReserves == 0 || state.TokenSupply == 0 {
-		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0}, nil
+		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0, QuoteMint: quoteMint}, nil
 	}
 
 	// RPC reserves are stored as lamports and 6-decimal token base units.
@@ -371,7 +410,7 @@ func (m *Manager) GetBondingCurveStateWithContext(ctx context.Context, mint stri
 
 	if state.SpotPriceSOL <= 0 || math.IsNaN(state.SpotPriceSOL) || math.IsInf(state.SpotPriceSOL, 0) ||
 		state.MarketCapSOL <= 0 || math.IsNaN(state.MarketCapSOL) || math.IsInf(state.MarketCapSOL, 0) {
-		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0}, nil
+		return BondingCurveState{MarketCapSOL: 0, RealSOLReserves: 0, QuoteMint: quoteMint}, nil
 	}
 	state.ObservedAt = time.Now().UTC()
 	return state, nil
@@ -438,9 +477,9 @@ func (m *Manager) Execution(ctx context.Context, signature, address, mint string
 	}
 	var receipt struct {
 		Meta *struct {
-			Fee          uint64   `json:"fee"`
-			PreBalances  []uint64 `json:"preBalances"`
-			PostBalances []uint64 `json:"postBalances"`
+			Fee               uint64                  `json:"fee"`
+			PreBalances       []uint64                `json:"preBalances"`
+			PostBalances      []uint64                `json:"postBalances"`
 			PreTokenBalances  []ExecutionTokenBalance `json:"preTokenBalances"`
 			PostTokenBalances []ExecutionTokenBalance `json:"postTokenBalances"`
 		} `json:"meta"`
@@ -520,4 +559,104 @@ func sumTokenBalances(balances []ExecutionTokenBalance, owner, mint string) (*bi
 		total.Add(total, amount)
 	}
 	return total, decimals, found, nil
+}
+
+// ResolveCreationTime returns the token's creation time using the currently
+// selected healthy RPC endpoint. It is used by the token monitor to backfill
+// a creation timestamp when the PumpPortal websocket payload does not carry
+// one. It never falls back to time.Now(): if the RPC cannot provide a
+// blockTime, it returns an error and the caller must keep the token rejected.
+//
+// Strategy:
+//  1. If a signature is provided, call getTransaction and use blockTime.
+//  2. Otherwise, call getSignaturesForAddress for the mint (oldest first),
+//     then getTransaction on that signature.
+func (m *Manager) ResolveCreationTime(ctx context.Context, mint, signature string) (time.Time, error) {
+	if signature != "" {
+		if t, err := m.blockTimeOf(ctx, signature); err == nil && !t.IsZero() {
+			return t, nil
+		}
+	}
+	if mint == "" {
+		return time.Time{}, fmt.Errorf("no signature and no mint to resolve creation time")
+	}
+	sig, err := m.firstSignatureForMint(ctx, mint)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return m.blockTimeOf(ctx, sig)
+}
+
+func (m *Manager) firstSignatureForMint(ctx context.Context, mint string) (string, error) {
+	u, err := m.currentURL()
+	if err != nil {
+		return "", err
+	}
+	var r []struct {
+		Signature string `json:"signature"`
+	}
+	if err := m.call(ctx, u, "getSignaturesForAddress", []any{
+		mint,
+		map[string]any{"limit": 1, "commitment": "confirmed"},
+	}, &r); err != nil {
+		return "", fmt.Errorf("getSignaturesForAddress: %w", err)
+	}
+	if len(r) == 0 || r[0].Signature == "" {
+		return "", fmt.Errorf("no signatures for mint %s", mint)
+	}
+	return r[0].Signature, nil
+}
+
+func (m *Manager) blockTimeOf(ctx context.Context, signature string) (time.Time, error) {
+	u, err := m.currentURL()
+	if err != nil {
+		return time.Time{}, err
+	}
+	var r struct {
+		BlockTime *int64 `json:"blockTime"`
+	}
+	if err := m.call(ctx, u, "getTransaction", []any{
+		signature,
+		map[string]any{
+			"encoding":                       "json",
+			"commitment":                     "confirmed",
+			"maxSupportedTransactionVersion": 0,
+		},
+	}, &r); err != nil {
+		return time.Time{}, fmt.Errorf("getTransaction %s: %w", signature, err)
+	}
+	if r.BlockTime == nil || *r.BlockTime <= 0 {
+		return time.Time{}, fmt.Errorf("getTransaction %s: missing blockTime", signature)
+	}
+	return time.Unix(*r.BlockTime, 0).UTC(), nil
+}
+
+// ================= NOVO MÉTODO =================
+// AccountInfoResult mirrors the getAccountInfo RPC response. The Data field
+// keeps the raw base64 payload so callers can decode it for ALT resolution.
+type AccountInfoResult struct {
+	Value *struct {
+		Data       solana.Data      `json:"data"`
+		Executable bool             `json:"executable"`
+		Lamports   uint64           `json:"lamports"`
+		Owner      solana.PublicKey `json:"owner"`
+	} `json:"value"`
+}
+
+// GetAccountInfo reads a single account via getAccountInfo. It is used by the
+// execution engine to resolve Address Lookup Tables (ALT) before signing a
+// PumpPortal prepared transaction.
+func (m *Manager) GetAccountInfo(ctx context.Context, account solana.PublicKey) (*AccountInfoResult, error) {
+	u, e := m.currentURL()
+	if e != nil {
+		return nil, e
+	}
+	var r AccountInfoResult
+	if e = m.call(ctx, u, "getAccountInfo", []any{
+		account.String(),
+		map[string]any{"encoding": "base64", "commitment": "confirmed"},
+	}, &r); e != nil {
+		return nil, e
+	}
+	return &r, nil
 }

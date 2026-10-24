@@ -31,3 +31,7 @@ sniper_v*
 sniper_commit*
 audit_*.txt
 auditoria.txt
+
+ec2-user@*
+migrations_auditoria.txt
+sync_postgres_schema.sql

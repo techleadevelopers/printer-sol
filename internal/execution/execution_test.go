@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gagliardetto/solana-go"
 	"go.uber.org/zap"
 	"solana-sniper-backend/internal/database"
 	"solana-sniper-backend/internal/wallet"
@@ -157,5 +158,44 @@ func TestFailedSimulationSellClosesPositionWithoutChargingIt(t *testing.T) {
 	}
 	if balance < 0.949999999 || balance > 0.950000001 {
 		t.Fatalf("failed sell changed virtual balance to %.9f SOL; want 0.95 SOL", balance)
+	}
+}
+
+func TestValidateSOLQuoteMint(t *testing.T) {
+	tests := []struct {
+		name      string
+		quoteMint solana.PublicKey
+		wantErr   bool
+	}{
+		{
+			name:      "SOL quote is allowed",
+			quoteMint: solana.PublicKey{},
+			wantErr:   false,
+		},
+		{
+			name:      "non-SOL quote is blocked",
+			quoteMint: solana.PublicKey{1},
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSOLQuoteMint(tt.quoteMint)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected non-SOL quote mint to be rejected")
+				}
+				if !strings.Contains(err.Error(), "unsupported non-SOL quote mint") {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("SOL quote mint should be accepted: %v", err)
+			}
+		})
 	}
 }
