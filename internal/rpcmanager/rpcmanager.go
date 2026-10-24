@@ -186,11 +186,11 @@ func (m *Manager) Send(ctx context.Context, raw []byte) (string, error) {
 // It never constructs or signs a replacement transaction, so retries retain
 // the original signature and are idempotent with respect to duplicate buys.
 //
-// IMPORTANT: skipPreflight is FORCED to true. Some paid RPCs (Alchemy, etc.)
-// still simulate the transaction even when the caller requests skipPreflight;
-// forcing it here guarantees the signed payload goes straight to the network.
-// preflightCommitment is "processed" (ignored when skipPreflight=true, but
-// kept for defence in depth).
+// skipPreflight is a risk control selected by the execution engine.  It must
+// never be silently forced on: doing so bypasses Solana's simulation and can
+// charge priority fees for transactions that would have failed deterministically
+// (for example Pump.fun UnsupportedQuoteMint).  Live trading defaults to
+// preflight; an explicit, audited caller may opt out for a narrow latency case.
 func (m *Manager) SendWithMaxRetries(ctx context.Context, raw []byte, maxRetries int, skipPreflight bool) (string, error) {
 	if maxRetries < 0 {
 		maxRetries = 0
@@ -207,7 +207,7 @@ func (m *Manager) SendWithMaxRetries(ctx context.Context, raw []byte, maxRetries
 		base64.StdEncoding.EncodeToString(raw),
 		map[string]any{
 			"encoding":            "base64",
-			"skipPreflight":       true,
+			"skipPreflight":       skipPreflight,
 			"preflightCommitment": "processed",
 			"maxRetries":          maxRetries,
 		},

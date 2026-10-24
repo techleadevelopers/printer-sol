@@ -1051,13 +1051,77 @@ func (e *Engine) validatePreparedTransaction(tx *solana.Transaction, request Req
 			}
 		}
 	}
+	if err := validateDirectPumpRoute(tx); err != nil {
+		return err
+	}
 	if request.Side == "sell" {
 		return validateProtectedPumpSell(tx, prepared)
+	}
+	return validateProtectedPumpBuy(tx, request.Mint)
+}
+
+const pumpFunProgramIDForExecution = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+// validateDirectPumpRoute deliberately permits only the programs needed by a
+// direct, SOL-quoted Pump.fun bonding-curve trade.  PumpPortal returns a
+// partially signed transaction, so treating it as trusted would allow an
+// unexpected router/program to spend the wallet's signing authority.  Market
+// migrations and AMM routes require their own separately reviewed validator.
+func validateDirectPumpRoute(tx *solana.Transaction) error {
+	allowed := map[string]bool{
+		"ComputeBudget111111111111111111111111111111": true,
+		"11111111111111111111111111111111":              true,
+		"ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL":  true,
+		"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":  true,
+		"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb":  true,
+		pumpFunProgramIDForExecution:                       true,
+	}
+	for _, ix := range tx.Message.Instructions {
+		if int(ix.ProgramIDIndex) >= len(tx.Message.AccountKeys) {
+			return fmt.Errorf("instruction program index out of range")
+		}
+		program := tx.Message.AccountKeys[ix.ProgramIDIndex].String()
+		if !allowed[program] {
+			return fmt.Errorf("unapproved program %s in direct Pump.fun route", program)
+		}
 	}
 	return nil
 }
 
-const pumpFunProgramIDForExecution = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+func validateProtectedPumpBuy(tx *solana.Transaction, mint string) error {
+	pumpProgram, err := solana.PublicKeyFromBase58(pumpFunProgramIDForExecution)
+	if err != nil {
+		return fmt.Errorf("invalid Pump.fun program identifier: %w", err)
+	}
+	mintKey, err := solana.PublicKeyFromBase58(mint)
+	if err != nil {
+		return fmt.Errorf("invalid requested mint: %w", err)
+	}
+	curve, _, err := solana.FindProgramAddress([][]byte{[]byte("bonding-curve"), mintKey.Bytes()}, pumpProgram)
+	if err != nil {
+		return fmt.Errorf("derive requested mint bonding curve: %w", err)
+	}
+	discriminator := anchorInstructionDiscriminator("buy")
+	for _, ix := range tx.Message.Instructions {
+		if int(ix.ProgramIDIndex) >= len(tx.Message.AccountKeys) || tx.Message.AccountKeys[ix.ProgramIDIndex] != pumpProgram || len(ix.Data) < 24 || !bytes.Equal(ix.Data[:8], discriminator[:]) {
+			continue
+		}
+		var hasMint, hasCurve bool
+		for _, accountIndex := range ix.Accounts {
+			if int(accountIndex) >= len(tx.Message.AccountKeys) {
+				return fmt.Errorf("Pump.fun buy account index out of range")
+			}
+			account := tx.Message.AccountKeys[accountIndex]
+			hasMint = hasMint || account == mintKey
+			hasCurve = hasCurve || account == curve
+		}
+		if hasMint && hasCurve {
+			return nil
+		}
+		return fmt.Errorf("Pump.fun buy does not reference the requested mint and its bonding curve")
+	}
+	return fmt.Errorf("prepared transaction has no verifiable direct Pump.fun buy")
+}
 
 func validateProtectedPumpSell(tx *solana.Transaction, prepared livePreparation) error {
 	pumpProgram, err := solana.PublicKeyFromBase58(pumpFunProgramIDForExecution)

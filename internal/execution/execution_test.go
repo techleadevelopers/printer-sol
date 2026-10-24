@@ -199,3 +199,13 @@ func TestValidateSOLQuoteMint(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateDirectPumpRouteRejectsUnknownRouter(t *testing.T) {
+	unknown := solana.MustPublicKeyFromBase58("FAdo9NCw1ssek6Z6yeWzWjhLVsr8uiCwcWNUnKgzTnHe")
+	tx := &solana.Transaction{}
+	tx.Message.AccountKeys = solana.PublicKeySlice{unknown}
+	tx.Message.Instructions = []solana.CompiledInstruction{{ProgramIDIndex: 0, Data: []byte{1}}}
+	if err := validateDirectPumpRoute(tx); err == nil || !strings.Contains(err.Error(), "unapproved program") {
+		t.Fatalf("unapproved router was accepted: %v", err)
+	}
+}

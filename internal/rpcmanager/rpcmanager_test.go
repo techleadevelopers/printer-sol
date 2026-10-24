@@ -34,7 +34,7 @@ func TestRPCConnectionFailure(t *testing.T) {
 	}
 }
 
-func TestSendWithMaxRetriesCanSkipPreflightAndCapsRetries(t *testing.T) {
+func TestSendWithMaxRetriesForwardsPreflightChoiceAndCapsRetries(t *testing.T) {
 	var skipPreflight bool
 	var retries int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +80,14 @@ func TestSendWithMaxRetriesCanSkipPreflightAndCapsRetries(t *testing.T) {
 	}
 	if retries != 5 {
 		t.Fatalf("maxRetries = %d; want capped value 5", retries)
+	}
+
+	_, err = manager.SendWithMaxRetries(context.Background(), []byte{1, 2, 3}, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipPreflight {
+		t.Fatal("skipPreflight=false must be preserved so RPC preflight protects live trades")
 	}
 }
 
