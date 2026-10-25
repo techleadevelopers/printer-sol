@@ -20,24 +20,17 @@ import (
 //go:embed migrations/*.sql migrations/postgres/*.sql
 var migrations embed.FS
 
-// SellConfirmer is injected by main (which has rpcmanager) so live-only
-// persistence paths can require an on-chain verdict before closing a
-// position. database must not import rpcmanager (cycle: rpcmanager imports
-// database for RecordRPC).
 type SellConfirmer interface {
 	ConfirmSellState(ctx context.Context, signature string) (string, error)
 }
 
 type DB struct {
 	*sql.DB
-	postgres bool
-	// markMu serializes WebSocket and public-API updates to mark rows.
+	postgres      bool
 	markMu        sync.Mutex
 	sellConfirmer SellConfirmer
 }
 
-// SetSellConfirmer wires the live on-chain verifier. Safe to call once at
-// startup; subsequent calls replace the verifier.
 func (d *DB) SetSellConfirmer(c SellConfirmer) {
 	d.markMu.Lock()
 	d.sellConfirmer = c
@@ -79,6 +72,7 @@ func Open(target string) (*DB, error) {
 	}
 	return &DB{DB: d, postgres: postgres}, d.Ping()
 }
+
 func (d *DB) Migrate() error {
 	pattern := "migrations/*.sql"
 	if d.postgres {
@@ -134,6 +128,8 @@ type Trade struct {
 	Requested, Executed, Fees, Slippage        float64
 	DetectedAt, SubmittedAt, ConfirmedAt       *time.Time
 	EntryReason, ExitReason                    string
+	EntryProfile                               string
+	EntryScore                                 float64
 	Reconciliation                             bool
 }
 
@@ -147,11 +143,12 @@ func (d *DB) InsertTrade(t Trade) error {
 			exitReason = "unspecified exit"
 		}
 	}
+	entryProfile := strings.TrimSpace(t.EntryProfile)
 	tx, e := d.Begin()
 	if e != nil {
 		return e
 	}
-	if _, e = tx.Exec(d.bind(`INSERT INTO trades(id,mint,side,quantity,requested_value_sol,fees_sol,realized_pnl_sol,slippage_pct,state,entry_reason,exit_reason,reconciliation_needed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`), t.ID, t.Mint, t.Side, t.Quantity, t.Requested, t.Fees, realizedPnl, t.Slippage, t.State, t.EntryReason, exitReason, true, now, now); e == nil {
+	if _, e = tx.Exec(d.bind(`INSERT INTO trades(id,mint,side,quantity,requested_value_sol,fees_sol,realized_pnl_sol,slippage_pct,state,entry_reason,exit_reason,entry_profile,entry_score,reconciliation_needed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`), t.ID, t.Mint, t.Side, t.Quantity, t.Requested, t.Fees, realizedPnl, t.Slippage, t.State, t.EntryReason, exitReason, entryProfile, t.EntryScore, true, now, now); e == nil {
 		_, e = tx.Exec(d.bind(`INSERT INTO transactions(id,trade_id,state,created_at,updated_at) VALUES(?,?,?,?,?)`), "tx_"+t.ID, t.ID, t.State, now, now)
 	}
 	if e != nil {
@@ -160,6 +157,7 @@ func (d *DB) InsertTrade(t Trade) error {
 	}
 	return tx.Commit()
 }
+
 func (d *DB) UpdateTradeState(id, state, sig string, confirmed bool) error {
 	now := time.Now().UTC()
 	tx, e := d.Begin()
@@ -229,8 +227,6 @@ func (d *DB) ActiveForMint(mint string) (bool, error) {
 	return n > 0, e
 }
 
-// UpdateTradeQuote persists the quote and exact sell quantity before a live
-// transaction is signed or submitted.
 func (d *DB) UpdateTradeQuote(id string, quotedAt time.Time, quoteAgeMS int64, curveImpactBPS, minimumOutputSOL, requestedValueSOL float64, quantity string) error {
 	now := time.Now().UTC()
 	result, err := d.Exec(d.bind(`UPDATE trades
@@ -249,11 +245,9 @@ func (d *DB) UpdateTradeQuote(id string, quotedAt time.Time, quoteAgeMS int64, c
 	}
 	return nil
 }
+
 func (d *DB) HasPurchaseForMint(mint string) (bool, error) {
 	var n int
-	// A mint receives at most one buy attempt. This remains true even if the
-	// attempt failed or its outcome is unknown, preventing accidental averaging
-	// and a second entry after an RPC/PumpPortal failure.
 	e := d.QueryRow(d.bind(`SELECT COUNT(*) FROM trades WHERE mint=? AND side='buy'`), mint).Scan(&n)
 	return n > 0, e
 }
@@ -264,6 +258,7 @@ func (d *DB) PositionFeesSOL(mint string) (float64, error) {
 		WHERE mint=? AND side='buy' AND state IN ('confirmed','finalized')`), mint).Scan(&fees)
 	return fees, err
 }
+
 func (d *DB) HasFailedSellForMint(mint string) (bool, error) {
 	var n int
 	e := d.QueryRow(d.bind(`SELECT COUNT(*) FROM trades WHERE mint=? AND side='sell' AND state='failed'`), mint).Scan(&n)
@@ -303,9 +298,6 @@ func (d *DB) LastSellState(mint string) (state string, updatedAt time.Time, err 
 	return s, updatedAt, nil
 }
 
-// LastSellTradeForMint returns the most recent sell trade id and signature
-// (read-only). Live confirmation paths use it to ask the injected
-// SellConfirmer about the on-chain outcome before any close.
 func (d *DB) LastSellTradeForMint(mint string) (id, signature string, err error) {
 	var sig sql.NullString
 	err = d.QueryRow(d.bind(`SELECT id,COALESCE(signature,'') FROM trades
@@ -337,10 +329,6 @@ func (d *DB) QuarantineStuckSimulationMint(mint string, olderThan time.Time) (in
 	return d.quarantineStuckMint(mint, olderThan, false)
 }
 
-// QuarantineStuckLiveMint quarantines a live mint only after the injected
-// SellConfirmer proves the last sell failed on-chain. If the confirmer is
-// missing, or the outcome is confirmed/finalized/unknown, no position is
-// closed and an error is returned so the monitor keeps tracking it.
 func (d *DB) QuarantineStuckLiveMint(mint string, olderThan time.Time) (int, error) {
 	return d.quarantineStuckMint(mint, olderThan, true)
 }
@@ -433,18 +421,12 @@ type SimulationSellSnapshot struct {
 	PositionState    string
 }
 
-// LiveSellSnapshot mirrors SimulationSellSnapshot for live sells. The three
-// records must change together regardless of mode.
 type LiveSellSnapshot = SimulationSellSnapshot
 
-// SimulationSellSnapshot reads the records that must change together when a
-// paper sell is finalized.
 func (d *DB) SimulationSellSnapshot(id, mint string) (SimulationSellSnapshot, error) {
 	return d.sellSnapshot(id, mint)
 }
 
-// LiveSellSnapshot reads the records that must change together when a live
-// sell is finalized.
 func (d *DB) LiveSellSnapshot(id, mint string) (LiveSellSnapshot, error) {
 	return d.sellSnapshot(id, mint)
 }
@@ -509,11 +491,6 @@ func (d *DB) MarkSimulationSellFailed(id, mint string) error {
 	return d.markSellFailed(id, mint, false)
 }
 
-// MarkLiveSellFailed only closes the live position when the injected
-// SellConfirmer proves the on-chain state is failed. In every other case it
-// marks the trade/transaction unknown (keeps position open, keeps
-// reconciliation pending) so a confirmed-but-unpersisted sale cannot be
-// misclassified as a failure.
 func (d *DB) MarkLiveSellFailed(id, mint string) error {
 	var sig sql.NullString
 	err := d.QueryRow(d.bind(`SELECT COALESCE(signature,'') FROM trades WHERE id=? AND side='sell'`), id).Scan(&sig)
@@ -579,10 +556,6 @@ func (d *DB) ReconcileStaleSimulationSells(mint string, olderThan time.Time) (in
 	return d.reconcileStaleSells(mint, olderThan, false)
 }
 
-// ReconcileStaleLiveSells only closes a live position when the injected
-// SellConfirmer proves the on-chain state is failed. Otherwise the trades are
-// left unresolved (position stays open, reconciliation stays pending) and an
-// error is returned so the caller can keep tracking the mint.
 func (d *DB) ReconcileStaleLiveSells(mint string, olderThan time.Time) (int, error) {
 	return d.reconcileStaleSells(mint, olderThan, true)
 }
@@ -675,8 +648,6 @@ func (d *DB) reconcileStaleSells(mint string, olderThan time.Time, live bool) (i
 				return 0, fmt.Errorf("transaction for stale sell id=%q mint=%q changed during reconciliation", candidate.id, mint)
 			}
 		}
-		// Close the position in the same transaction so the slot is released
-		// and MaxOpenPositions stops pinning the monitor.
 		if _, closeErr := tx.Exec(d.bind(`UPDATE positions SET status='closed',updated_at=?
 			WHERE mint=? AND status='open'`), now, mint); closeErr != nil {
 			return 0, fmt.Errorf("close stale position for mint %q: %w", mint, closeErr)
@@ -701,30 +672,40 @@ func (d *DB) RecordEvent(mint, creator, raw string, at time.Time, latency int64)
 	_, e := d.Exec(d.bind(query), mint, creator, receivedAt, raw, latency)
 	return e
 }
+
 func (d *DB) RecordAssessment(mint string, approved bool, reason string) error {
 	_, e := d.Exec(d.bind(`INSERT INTO risk_assessments(mint,approved,reason,created_at) VALUES(?,?,?,?)`), mint, approved, reason, time.Now().UTC())
 	return e
 }
+
+// RecordAssessmentWithProfile persists the assessment together with the
+// entry profile that authorized the decision.
+func (d *DB) RecordAssessmentWithProfile(mint string, approved bool, reason, profile string) error {
+	_, e := d.Exec(d.bind(`INSERT INTO risk_assessments(mint,approved,reason,entry_profile,created_at) VALUES(?,?,?,?,?)`), mint, approved, reason, strings.TrimSpace(profile), time.Now().UTC())
+	return e
+}
+
 func (d *DB) ListTrades() (rows *sql.Rows, err error) {
 	return d.Query(`SELECT id,mint,side,quantity,requested_value_sol,COALESCE(executed_value_sol,0),
 		COALESCE(effective_price_sol,0),
 		COALESCE(fees_sol,0),slippage_pct,COALESCE(signature,''),state,created_at,realized_pnl_sol,
-		COALESCE(exit_reason,'') FROM trades ORDER BY created_at DESC LIMIT 200`)
+		COALESCE(exit_reason,''),COALESCE(entry_profile,''),COALESCE(entry_score,0) FROM trades ORDER BY created_at DESC LIMIT 200`)
 }
+
 func (d *DB) TokenEventCount() (int, error) {
 	var n int
 	e := d.QueryRow(`SELECT COUNT(*) FROM token_events`).Scan(&n)
 	return n, e
 }
+
 func (d *DB) RecordRPC(endpoint string, healthy bool, latency int64, status int, msg string) error {
 	_, e := d.Exec(d.bind(`INSERT INTO rpc_health(endpoint,checked_at,latency_ms,healthy,http_status,error,supports_read) VALUES(?,?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET checked_at=excluded.checked_at,latency_ms=excluded.latency_ms,healthy=excluded.healthy,http_status=excluded.http_status,error=excluded.error,supports_read=excluded.supports_read`), endpoint, time.Now().UTC(), latency, healthy, status, strings.TrimSpace(msg), healthy)
 	return e
 }
+
 func (d *DB) ListTokens() (*sql.Rows, error) {
-	// The console shows persisted detections and their latest real assessment
-	// and operation state; it does not infer that an approved token was bought.
 	return d.Query(d.bind(`SELECT e.mint,COALESCE(e.creator,''),e.received_at,e.latency_ms
-		,r.approved,COALESCE(r.reason,''),COALESCE(t.side,''),COALESCE(t.state,''),COALESCE(p.status,''),
+		,r.approved,COALESCE(r.reason,''),COALESCE(r.entry_profile,''),COALESCE(r.entry_score,0),COALESCE(t.side,''),COALESCE(t.state,''),COALESCE(p.status,''),
 		COALESCE((SELECT l.message FROM operational_logs l
 			WHERE l.event_type='post_entry_risk_screen'
 			AND l.payload_json LIKE '%' || e.mint || '%'
@@ -736,6 +717,7 @@ func (d *DB) ListTokens() (*sql.Rows, error) {
 		LEFT JOIN positions p ON p.mint=e.mint
 		ORDER BY e.id DESC LIMIT 200`))
 }
+
 func (d *DB) OpenSimulationPosition(mint string, amount float64) error {
 	return d.OpenPosition(mint, amount)
 }
@@ -896,8 +878,6 @@ func (d *DB) FinalizeLiveSell(id, mint, state, signature string, value, fees flo
 	} else if affected != 1 {
 		return fmt.Errorf("live position %q is no longer open", mint)
 	}
-	// Persist net realized P&L, matching paper-trade reporting: confirmed sale
-	// proceeds less swap cost and both confirmed network fees.
 	netPnl := value - cost - entryFees - fees
 	if err = updateExecutedTrade(tx, d, id, state, signature, quantity, value, fees, effectivePrice, netPnl, now); err != nil {
 		return err
@@ -1010,12 +990,14 @@ func (d *DB) OpenPosition(mint string, amount float64) error {
 	_, e := d.Exec(d.bind(query), mint, fmt.Sprint(amount), amount, "open", now, now)
 	return e
 }
+
 func (d *DB) RecordPaperMark(mint string, marketCapSOL float64) error {
 	return d.recordMark("paper_marks", mint, marketCapSOL)
 }
 func (d *DB) RecordLiveMark(mint string, marketCapSOL float64) error {
 	return d.recordMark("live_marks", mint, marketCapSOL)
 }
+
 const VerifiedPositionPriceSource = "solana_rpc_bonding_curve"
 
 func (d *DB) RecordVerifiedPaperMark(mint string, marketCapSOL, tokenPriceSOL float64) error {
@@ -1037,10 +1019,7 @@ func (d *DB) recordVerifiedMark(table, mint string, marketCapSOL, tokenPriceSOL 
 	) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(mint) DO NOTHING`),
 		mint, marketCapSOL, marketCapSOL, marketCapSOL, now,
 		tokenPriceSOL, tokenPriceSOL, tokenPriceSOL, VerifiedPositionPriceSource)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 func (d *DB) recordMark(table, mint string, marketCapSOL float64) error {
 	if marketCapSOL <= 0 {
@@ -1363,11 +1342,140 @@ func (d *DB) Performance(simulationMode ...bool) (PerformanceStats, error) {
 	if simulation {
 		stats.NetRealizedPnlSOL -= stats.FeesSOL
 	} else {
-		// Confirmed live realized P&L already uses wallet deltas net of fees.
 		stats.GrossRealizedPnlSOL += stats.FeesSOL
 	}
 	return stats, nil
 }
+
+func (d *DB) PerformanceByProfile(simulationMode bool, profile string) (PerformanceStats, error) {
+	var stats PerformanceStats
+	profile = strings.TrimSpace(profile)
+	err := d.QueryRow(d.bind(`SELECT
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN t.state='failed' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN t.state IN ('simulated','confirmed','finalized')
+			AND t.realized_pnl_sol IS NOT NULL
+			AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')
+			THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN t.state IN ('simulated','confirmed','finalized')
+			AND t.realized_pnl_sol>0
+			AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')
+			THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN t.state IN ('simulated','confirmed','finalized')
+			AND t.realized_pnl_sol<0
+			AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')
+			THEN 1 ELSE 0 END),0),
+		COALESCE(AVG(CASE WHEN t.state IN ('simulated','confirmed','finalized')
+			AND t.realized_pnl_sol>0
+			AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')
+			THEN t.realized_pnl_sol END),0),
+		COALESCE(AVG(CASE WHEN t.state IN ('simulated','confirmed','finalized')
+			AND t.realized_pnl_sol<0
+			AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')
+			THEN t.realized_pnl_sol END),0),
+		COALESCE(SUM(CASE WHEN t.state IN ('simulated','confirmed','finalized')
+			AND t.realized_pnl_sol IS NOT NULL
+			AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')
+			THEN t.realized_pnl_sol ELSE 0 END),0)
+		FROM trades t
+		WHERE t.side='sell' AND t.entry_profile=?`), profile).Scan(
+		&stats.SellAttempts, &stats.FailedSellAttempts, &stats.ClosedTrades,
+		&stats.Winners, &stats.Losers, &stats.AvgWinSOL, &stats.AvgLossSOL, &stats.GrossRealizedPnlSOL)
+	if err != nil {
+		return stats, err
+	}
+	err = d.QueryRow(d.bind(`SELECT COALESCE(SUM(t.fees_sol),0)
+		FROM trades t
+		WHERE t.state IN ('simulated','confirmed','finalized') AND t.entry_profile=?
+		AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')`), profile).Scan(&stats.FeesSOL)
+	if err != nil {
+		return stats, err
+	}
+	if stats.ClosedTrades > 0 {
+		stats.WinRatePct = float64(stats.Winners) * 100 / float64(stats.ClosedTrades)
+	}
+	stats.NetRealizedPnlSOL = stats.GrossRealizedPnlSOL
+	if simulationMode {
+		stats.NetRealizedPnlSOL -= stats.FeesSOL
+	} else {
+		stats.GrossRealizedPnlSOL += stats.FeesSOL
+	}
+	return stats, nil
+}
+
+// ScoreBucket agrega trades por faixa de score de entrada.
+type ScoreBucket struct {
+	Bucket     string
+	Trades     int
+	Winners    int
+	Losers     int
+	WinRatePct float64
+	NetPnlSOL  float64
+	FeesSOL    float64
+}
+
+// PerformanceByScoreBucket devolve métricas por faixa de score de entrada
+// (0-20, 20-40, 40-60, 60-80, 80-100) para provar se o score prevê resultados.
+func (d *DB) PerformanceByScoreBucket(simulation bool) ([]ScoreBucket, error) {
+	buckets := []ScoreBucket{
+		{Bucket: "0-20"}, {Bucket: "20-40"}, {Bucket: "40-60"},
+		{Bucket: "60-80"}, {Bucket: "80-100"}, {Bucket: "unknown"},
+	}
+	rows, err := d.Query(d.bind(`SELECT
+		CASE
+			WHEN t.entry_score IS NULL THEN 'unknown'
+			WHEN t.entry_score < 20 THEN '0-20'
+			WHEN t.entry_score < 40 THEN '20-40'
+			WHEN t.entry_score < 60 THEN '40-60'
+			WHEN t.entry_score < 80 THEN '60-80'
+			ELSE '80-100'
+		END AS bucket,
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN t.realized_pnl_sol>0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN t.realized_pnl_sol<0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(t.realized_pnl_sol),0),
+		COALESCE(SUM(t.fees_sol),0)
+		FROM trades t
+		WHERE t.side='sell' AND t.state IN ('simulated','confirmed','finalized')
+		AND t.realized_pnl_sol IS NOT NULL
+		AND EXISTS (SELECT 1 FROM positions p WHERE p.mint=t.mint AND p.status='closed')
+		GROUP BY bucket`), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	index := make(map[string]int, len(buckets))
+	for i, b := range buckets {
+		index[b.Bucket] = i
+	}
+	for rows.Next() {
+		var bucket string
+		var trades, winners, losers int
+		var netPnl, fees float64
+		if err := rows.Scan(&bucket, &trades, &winners, &losers, &netPnl, &fees); err != nil {
+			return nil, err
+		}
+		i, ok := index[bucket]
+		if !ok {
+			continue
+		}
+		buckets[i].Trades = trades
+		buckets[i].Winners = winners
+		buckets[i].Losers = losers
+		buckets[i].NetPnlSOL = netPnl
+		buckets[i].FeesSOL = fees
+		if trades > 0 {
+			buckets[i].WinRatePct = float64(winners) * 100 / float64(trades)
+		}
+		if simulation {
+			buckets[i].NetPnlSOL -= fees
+		} else {
+			buckets[i].NetPnlSOL += fees
+		}
+	}
+	return buckets, rows.Err()
+}
+
 func (d *DB) RiskAssessmentCount() (int, error) {
 	var count int
 	err := d.QueryRow(`SELECT COUNT(*) FROM risk_assessments`).Scan(&count)
@@ -1465,27 +1573,27 @@ func (d *DB) OpenPositionMints() ([]string, error) {
 	return mints, rows.Err()
 }
 func (d *DB) OpenPositionMintsWithStaleMarks(simulation bool, staleBefore time.Time) ([]string, error) {
-marks := "live_marks"
-if simulation {
-marks = "paper_marks"
-}
-rows, err := d.Query(d.bind(`SELECT p.mint FROM positions p
-LEFT JOIN `+marks+` m ON m.mint=p.mint
+	marks := "live_marks"
+	if simulation {
+		marks = "paper_marks"
+	}
+	rows, err := d.Query(d.bind(`SELECT p.mint FROM positions p
+		LEFT JOIN `+marks+` m ON m.mint=p.mint
 		WHERE p.status='open' AND (m.mint IS NULL OR m.price_source<>? OR m.updated_at<=?)
 		ORDER BY p.updated_at`), VerifiedPositionPriceSource, staleBefore)
-if err != nil {
-return nil, err
-}
-defer rows.Close()
-mints := make([]string, 0)
-for rows.Next() {
-var mint string
-if err := rows.Scan(&mint); err != nil {
-return nil, err
-}
-mints = append(mints, mint)
-}
-return mints, rows.Err()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	mints := make([]string, 0)
+	for rows.Next() {
+		var mint string
+		if err := rows.Scan(&mint); err != nil {
+			return nil, err
+		}
+		mints = append(mints, mint)
+	}
+	return mints, rows.Err()
 }
 func (d *DB) OpenPositionCount() (int, error) {
 	var n int
@@ -1511,10 +1619,6 @@ func (d *DB) PositionOpenedAt(mint string) (time.Time, bool, error) {
 	return opened, e == nil, e
 }
 
-// ================= ALTERAÇÃO 1: UnknownTradeCount só conta COMPRAS =================
-// A trava de reconciliação só deve bloquear novas compras se existir uma COMPRA
-// (side='buy') por resolver. Vendas unknown não bloqueiam compras novas — só
-// bloqueiam novas vendas do mesmo mint (via ActiveForMint).
 func (d *DB) UnknownTradeCount() (int, error) {
 	var n int
 	query := `SELECT COUNT(*) FROM trades WHERE side='buy' AND (state='unknown' OR reconciliation_needed=1)`
@@ -1525,10 +1629,6 @@ func (d *DB) UnknownTradeCount() (int, error) {
 	return n, e
 }
 
-// ================= ALTERAÇÃO 2: PurchasesBlocked devolve o tradeId =================
-// PurchasesBlocked devolve o tradeId da primeira compra por resolver, para que
-// o execution.go possa registar exactamente o que está a bloquear em vez de
-// uma mensagem genérica.
 func (d *DB) PurchasesBlocked() (string, bool, error) {
 	var id string
 	query := `SELECT id FROM trades WHERE side='buy' AND (state='unknown' OR reconciliation_needed=1) ORDER BY created_at ASC LIMIT 1`
@@ -1577,9 +1677,6 @@ func (d *DB) DailyRealizedLossSOL(simulationMode ...bool) (float64, error) {
 	return n.Float64, e
 }
 
-// ================= ALTERAÇÃO 3: ReconciliationRequired mantém-se =================
-// Usado por Reconcile() no arranque (reconcilia trades pendentes). Continua
-// a usar o UnknownTradeCount (agora só compras).
 func (d *DB) ReconciliationRequired() (bool, error) {
 	n, e := d.UnknownTradeCount()
 	return n > 0, e

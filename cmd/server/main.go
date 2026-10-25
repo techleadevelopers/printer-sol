@@ -33,6 +33,40 @@ func (c rpcSellConfirmer) ConfirmSellState(ctx context.Context, signature string
 	return c.rpcs.Status(ctx, signature)
 }
 
+// executionEntrier adapta *execution.Engine à interface tokenmonitor.Entrier.
+// O único ponto de incompatibilidade é o tipo de retorno de ResolveMarketRoute
+// (execution.MarketDecision vs tokenmonitor.MarketDecisionLike). Este adapter
+// converte um no outro sem tocar em nenhum dos dois pacotes.
+type executionEntrier struct {
+	engine *execution.Engine
+}
+
+func (e executionEntrier) ResolveMarketRoute(ctx context.Context, mint string) (tokenmonitor.MarketDecisionLike, error) {
+	decision, err := e.engine.ResolveMarketRoute(ctx, mint)
+	if err != nil {
+		return tokenmonitor.MarketDecisionLike{}, err
+	}
+	return tokenmonitor.MarketDecisionLike{
+		Kind:   string(decision.Kind),
+		Pool:   decision.Pool,
+		Reason: decision.Reason,
+	}, nil
+}
+
+// Os restantes métodos de Entrier delegam diretamente no engine.
+
+func (e executionEntrier) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage, priorityFee float64, pool, reason string) (string, error) {
+	return e.engine.BuyNewTokenUSD(ctx, mint, usd, slippage, priorityFee, pool, reason)
+}
+
+func (e executionEntrier) ClosePaperPosition(ctx context.Context, mint string, returnPct float64, reason string) (string, error) {
+	return e.engine.ClosePaperPosition(ctx, mint, returnPct, reason)
+}
+
+func (e executionEntrier) CloseLivePosition(ctx context.Context, mint string, slippage, priorityFee float64, reason string) (string, error) {
+	return e.engine.CloseLivePosition(ctx, mint, slippage, priorityFee, reason)
+}
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -52,8 +86,6 @@ func main() {
 		if migrateErr := paperDB.Migrate(); migrateErr != nil {
 			log.Fatal("paper live-unlock migrations", logging.Err(migrateErr))
 		}
-		// BYPASS: em vez de log.Fatal, apenas avisamos e deixamos o Live arrancar.
-		// Remova este bypass e volte a colocar log.Fatal se quiser exigir os 30 trades.
 		if _, unlockErr := paperDB.RequireLiveUnlock(); unlockErr != nil {
 			log.Warn("live trading bypassed paper evidence", logging.Err(unlockErr))
 		} else {
@@ -101,7 +133,9 @@ func main() {
 		MaxLossPerTradePct: cfg.StopLossPct, MaxPriorityFeeSOL: cfg.MaxPriorityFeeSOL, FeeReserveSOL: cfg.FeeReserveSOL,
 		SimulationBaseFeeSOL: cfg.SimulationBaseFeeSOL, MaxOpenPositions: cfg.MaxOpenPositions,
 		MaxWaitSeconds: cfg.MaxConfirmationWaitSeconds, MaxAttempts: cfg.MaxSubmissionAttempts,
-		SkipPreflight: cfg.SkipPreflight,
+		SkipPreflight:          cfg.SkipPreflight,
+		MinEntryScoreFirstPump: cfg.MinEntryScoreFirstPump,
+		MinEntryScoreMomentum:  cfg.MinEntryScoreMomentum,
 	}
 	prices := pricefeed.New(cfg.SOLUSDPriceURL)
 	engine := execution.New(db, w, portal, rpcs, prices, log, cfg.Simulation, simulationBalanceSOL, controller, bus, limits)
@@ -110,8 +144,48 @@ func main() {
 		strat.SetScreen(screener.RugCheck)
 	}
 
+	profiles := tokenmonitor.DefaultProfiles()
+	profiles.Mode = tokenmonitor.EntryProfileMode(cfg.EntryProfileMode)
+	profiles.FirstPump.Enabled = cfg.FirstPumpEnabled
+	profiles.FirstPump.MaxTokenAge = time.Duration(cfg.FirstPumpMaxTokenAgeSecs) * time.Second
+	profiles.FirstPump.MinMarketCapSOL = cfg.FirstPumpMinMarketCapSOL
+	profiles.FirstPump.MaxMarketCapSOL = cfg.FirstPumpMaxMarketCapSOL
+	profiles.FirstPump.MinVolumeBeforeBuySOL = cfg.FirstPumpMinVolumeSOL
+	profiles.FirstPump.MaxVolumeBeforeBuySOL = cfg.FirstPumpMaxVolumeSOL
+	profiles.FirstPump.ScoreWeightVolume = cfg.FirstPumpScoreWeightVolume
+	profiles.FirstPump.ScoreWeightBuyRatio = cfg.FirstPumpScoreWeightBuyRatio
+	profiles.FirstPump.ScoreWeightBuyers = cfg.FirstPumpScoreWeightBuyers
+	profiles.FirstPump.ScoreWeightAccel = cfg.FirstPumpScoreWeightAccel
+	profiles.FirstPump.ScoreVolumeCapSOL = cfg.FirstPumpScoreVolumeCapSOL
+	profiles.FirstPump.ScoreBuyersCap = cfg.FirstPumpScoreBuyersCap
+
+	profiles.Momentum.Enabled = cfg.MomentumProfileEnabled
+	profiles.Momentum.MaxTokenAge = time.Duration(cfg.MomentumProfileMaxAgeSecs) * time.Second
+	profiles.Momentum.MinMarketCapSOL = cfg.MomentumProfileMinMcapSOL
+	profiles.Momentum.MaxMarketCapSOL = cfg.MomentumProfileMaxMcapSOL
+	profiles.Momentum.MinVolumeBeforeBuySOL = cfg.MomentumProfileMinVolSOL
+	profiles.Momentum.MaxVolumeBeforeBuySOL = cfg.MomentumProfileMaxVolSOL
+	profiles.Momentum.MinHolders = cfg.MomentumProfileMinHolders
+	profiles.Momentum.RequireMomentum = cfg.MomentumProfileRequireMom
+	profiles.Momentum.ScoreWeightVolume = cfg.MomentumScoreWeightVolume
+	profiles.Momentum.ScoreWeightBuyRatio = cfg.MomentumScoreWeightBuyRatio
+	profiles.Momentum.ScoreWeightBuyers = cfg.MomentumScoreWeightBuyers
+	profiles.Momentum.ScoreWeightAccel = cfg.MomentumScoreWeightAccel
+	profiles.Momentum.ScoreVolumeCapSOL = cfg.MomentumScoreVolumeCapSOL
+	profiles.Momentum.ScoreBuyersCap = cfg.MomentumScoreBuyersCap
+
+	var holders tokenmonitor.HolderSource = tokenmonitor.NoopHolderSource{}
+	if cfg.SolscanAPIKey != "" {
+		holders = tokenmonitor.NewCachedHolderSource(
+			tokenmonitor.NewSolscanHolderSource(cfg.SolscanAPIKey),
+			time.Duration(cfg.HoldersCacheSeconds)*time.Second,
+		)
+	}
+
+	// Aqui está a correção: passamos executionEntrier{engine} em vez de engine.
 	monitor := tokenmonitor.New(
-		cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat, engine,
+		cfg.PumpPortalWS, cfg.PumpPortalKey, cfg.TokenQueueSize, db, strat,
+		executionEntrier{engine: engine},
 		cfg.TradeUSD, float64(cfg.MaxSlippageBPS)/100, cfg.MaxPriorityFeeSOL,
 		cfg.TakeProfitGrossPct, cfg.StopLossPct,
 		time.Duration(cfg.MaxHoldSeconds)*time.Second, cfg.Simulation, bus, log,
@@ -132,6 +206,9 @@ func main() {
 			DedupeTTL:             time.Duration(cfg.DedupeTTLMS) * time.Millisecond,
 			BondingCurve:          rpcs,
 			CreationResolver:      rpcs,
+			Profiles:              profiles,
+			Holders:               holders,
+			MaxOpenPositions:      cfg.MaxOpenPositions, // NOVO: vem de MAX_OPEN_POSITIONS
 		},
 	)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

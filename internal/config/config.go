@@ -13,6 +13,7 @@ import (
 
 type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
+	SolscanAPIKey                                                                                                                                                                                        string
 	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, SkipPreflight, EnableRugCheck                                                                                                                  bool
 	UseWSMarketCap                                                                                                                                                                                        bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
@@ -23,6 +24,54 @@ type Config struct {
 	MinVolumeBeforeBuySOL, MaxVolumeBeforeBuySOL, MinMarketCapSOL, MaxMarketCapSOL                                                             float64
 	TrailingStopArmPct, ExitTriggerBufferPct                                                                                                                                                               float64
 	RPCEndpoints                                                                                                                                                                                            []string
+
+	// Momentum recente (filtro de atividade)
+	MomentumEnabled             bool
+	MomentumShortWindowSeconds  int
+	MomentumMediumWindowSeconds int
+	MomentumLongWindowSeconds   int
+	MomentumMinVolumeSOL        float64
+	MomentumMinBuyRatio         float64
+	MomentumMinUniqueBuyers     int
+	MomentumMinAcceleration     float64
+	MomentumMaxTradeAgeSeconds  int
+
+	// Seleção de perfil de entrada
+	EntryProfileMode          string
+	HoldersCacheSeconds       int
+	FirstPumpEnabled          bool
+	FirstPumpMaxTokenAgeSecs  int
+	FirstPumpMinMarketCapSOL  float64
+	FirstPumpMaxMarketCapSOL  float64
+	FirstPumpMinVolumeSOL     float64
+	FirstPumpMaxVolumeSOL     float64
+	MomentumProfileEnabled    bool
+	MomentumProfileMaxAgeSecs int
+	MomentumProfileMinMcapSOL float64
+	MomentumProfileMaxMcapSOL float64
+	MomentumProfileMinVolSOL  float64
+	MomentumProfileMaxVolSOL  float64
+	MomentumProfileMinHolders int
+	MomentumProfileRequireMom bool
+
+	// Pesos do score (Patch 3)
+	FirstPumpScoreWeightVolume   float64
+	FirstPumpScoreWeightBuyRatio float64
+	FirstPumpScoreWeightBuyers   float64
+	FirstPumpScoreWeightAccel    float64
+	FirstPumpScoreVolumeCapSOL   float64
+	FirstPumpScoreBuyersCap      float64
+
+	MomentumScoreWeightVolume   float64
+	MomentumScoreWeightBuyRatio float64
+	MomentumScoreWeightBuyers   float64
+	MomentumScoreWeightAccel    float64
+	MomentumScoreVolumeCapSOL   float64
+	MomentumScoreBuyersCap      float64
+
+	// Bloqueio por score (Patch 4) — 0 = não bloqueia.
+	MinEntryScoreFirstPump float64
+	MinEntryScoreMomentum  float64
 }
 
 func Load() (Config, error) {
@@ -36,6 +85,7 @@ func Load() (Config, error) {
 		KeyProviderRef:        os.Getenv("KEY_PROVIDER_REF"),
 		WalletPublicAddress:   os.Getenv("WALLET_PUBLIC_ADDRESS"),
 		PumpPortalKey:         os.Getenv("PUMPPORTAL_API_KEY"),
+		SolscanAPIKey:         strings.TrimSpace(os.Getenv("SOLSCAN_API_KEY")),
 		AdminPassword:         os.Getenv("ADMIN_PASSWORD"),
 		PumpPortalURL:         env("PUMPPORTAL_URL", "https://pumpportal.fun/api/trade-local"),
 		PumpPortalWS:          env("PUMPPORTAL_WS", "wss://pumpportal.fun/api/data"),
@@ -188,6 +238,138 @@ func Load() (Config, error) {
 	if c.ExitTriggerBufferPct, err = floatEnv("EXIT_TRIGGER_BUFFER_PCT", .5); err != nil {
 		return c, err
 	}
+
+	// Momentum recente
+	if c.MomentumEnabled, err = boolEnv("MOMENTUM_ENABLED", false); err != nil {
+		return c, err
+	}
+	if c.MomentumShortWindowSeconds, err = intEnv("MOMENTUM_SHORT_WINDOW_SECONDS", 10); err != nil {
+		return c, err
+	}
+	if c.MomentumMediumWindowSeconds, err = intEnv("MOMENTUM_MEDIUM_WINDOW_SECONDS", 30); err != nil {
+		return c, err
+	}
+	if c.MomentumLongWindowSeconds, err = intEnv("MOMENTUM_LONG_WINDOW_SECONDS", 60); err != nil {
+		return c, err
+	}
+	if c.MomentumMinVolumeSOL, err = floatEnv("MOMENTUM_MIN_VOLUME_SOL", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumMinBuyRatio, err = floatEnv("MOMENTUM_MIN_BUY_RATIO", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumMinUniqueBuyers, err = intEnv("MOMENTUM_MIN_UNIQUE_BUYERS", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumMinAcceleration, err = floatEnv("MOMENTUM_MIN_ACCELERATION", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumMaxTradeAgeSeconds, err = intEnv("MOMENTUM_MAX_TRADE_AGE_SECONDS", 120); err != nil {
+		return c, err
+	}
+
+	// Perfis de entrada
+	if c.EntryProfileMode, err = stringEnv("ENTRY_PROFILE_MODE", "auto"); err != nil {
+		return c, err
+	}
+	c.EntryProfileMode = strings.ToLower(strings.TrimSpace(c.EntryProfileMode))
+	switch c.EntryProfileMode {
+	case "auto", "first_pump_only", "momentum_only", "both":
+	default:
+		return c, fmt.Errorf("ENTRY_PROFILE_MODE must be one of auto, first_pump_only, momentum_only, both")
+	}
+	if c.HoldersCacheSeconds, err = intEnv("HOLDERS_CACHE_SECONDS", 30); err != nil {
+		return c, err
+	}
+	if c.FirstPumpEnabled, err = boolEnv("FIRST_PUMP_ENABLED", true); err != nil {
+		return c, err
+	}
+	if c.FirstPumpMaxTokenAgeSecs, err = intEnv("FIRST_PUMP_MAX_TOKEN_AGE_SECONDS", 30); err != nil {
+		return c, err
+	}
+	if c.FirstPumpMinMarketCapSOL, err = floatEnv("FIRST_PUMP_MIN_MARKET_CAP_SOL", 0); err != nil {
+		return c, err
+	}
+	if c.FirstPumpMaxMarketCapSOL, err = floatEnv("FIRST_PUMP_MAX_MARKET_CAP_SOL", 4); err != nil {
+		return c, err
+	}
+	if c.FirstPumpMinVolumeSOL, err = floatEnv("FIRST_PUMP_MIN_VOLUME_SOL", 0); err != nil {
+		return c, err
+	}
+	if c.FirstPumpMaxVolumeSOL, err = floatEnv("FIRST_PUMP_MAX_VOLUME_SOL", 1.5); err != nil {
+		return c, err
+	}
+	if c.MomentumProfileEnabled, err = boolEnv("MOMENTUM_PROFILE_ENABLED", true); err != nil {
+		return c, err
+	}
+	if c.MomentumProfileMaxAgeSecs, err = intEnv("MOMENTUM_PROFILE_MAX_TOKEN_AGE_SECONDS", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumProfileMinMcapSOL, err = floatEnv("MOMENTUM_PROFILE_MIN_MARKET_CAP_SOL", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumProfileMaxMcapSOL, err = floatEnv("MOMENTUM_PROFILE_MAX_MARKET_CAP_SOL", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumProfileMinVolSOL, err = floatEnv("MOMENTUM_PROFILE_MIN_VOLUME_SOL", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumProfileMaxVolSOL, err = floatEnv("MOMENTUM_PROFILE_MAX_VOLUME_SOL", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumProfileMinHolders, err = intEnv("MOMENTUM_PROFILE_MIN_HOLDERS", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumProfileRequireMom, err = boolEnv("MOMENTUM_PROFILE_REQUIRE_MOMENTUM", true); err != nil {
+		return c, err
+	}
+
+	// Pesos do score (Patch 3)
+	if c.FirstPumpScoreWeightVolume, err = floatEnv("FIRST_PUMP_SCORE_WEIGHT_VOLUME", 0); err != nil {
+		return c, err
+	}
+	if c.FirstPumpScoreWeightBuyRatio, err = floatEnv("FIRST_PUMP_SCORE_WEIGHT_BUY_RATIO", 0); err != nil {
+		return c, err
+	}
+	if c.FirstPumpScoreWeightBuyers, err = floatEnv("FIRST_PUMP_SCORE_WEIGHT_BUYERS", 0); err != nil {
+		return c, err
+	}
+	if c.FirstPumpScoreWeightAccel, err = floatEnv("FIRST_PUMP_SCORE_WEIGHT_ACCEL", 0); err != nil {
+		return c, err
+	}
+	if c.FirstPumpScoreVolumeCapSOL, err = floatEnv("FIRST_PUMP_SCORE_VOLUME_CAP_SOL", 0); err != nil {
+		return c, err
+	}
+	if c.FirstPumpScoreBuyersCap, err = floatEnv("FIRST_PUMP_SCORE_BUYERS_CAP", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumScoreWeightVolume, err = floatEnv("MOMENTUM_SCORE_WEIGHT_VOLUME", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumScoreWeightBuyRatio, err = floatEnv("MOMENTUM_SCORE_WEIGHT_BUY_RATIO", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumScoreWeightBuyers, err = floatEnv("MOMENTUM_SCORE_WEIGHT_BUYERS", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumScoreWeightAccel, err = floatEnv("MOMENTUM_SCORE_WEIGHT_ACCEL", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumScoreVolumeCapSOL, err = floatEnv("MOMENTUM_SCORE_VOLUME_CAP_SOL", 0); err != nil {
+		return c, err
+	}
+	if c.MomentumScoreBuyersCap, err = floatEnv("MOMENTUM_SCORE_BUYERS_CAP", 0); err != nil {
+		return c, err
+	}
+
+	// Bloqueio por score (Patch 4)
+	if c.MinEntryScoreFirstPump, err = floatEnv("MIN_ENTRY_SCORE_FIRST_PUMP", 0); err != nil {
+		return c, err
+	}
+	if c.MinEntryScoreMomentum, err = floatEnv("MIN_ENTRY_SCORE_MOMENTUM", 0); err != nil {
+		return c, err
+	}
+
 	if strings.TrimSpace(c.HTTPAddr) == "" || (c.DatabaseURL == "" && strings.TrimSpace(c.DatabasePath) == "") || strings.TrimSpace(c.PumpPortalURL) == "" || strings.TrimSpace(c.PumpPortalWS) == "" || len(c.RPCEndpoints) == 0 {
 		return c, fmt.Errorf("HTTP_ADDR, DATABASE_URL (or DATABASE_PATH locally), PumpPortal URLs and at least one RPC endpoint are required")
 	}
@@ -214,7 +396,6 @@ func Load() (Config, error) {
 	if c.TokenQueueSize < 1 || c.MaxOpenPositions < 1 || c.MaxSubmissionAttempts < 1 || c.MaxSubmissionAttempts > 6 || c.MaxConfirmationWaitSeconds < 1 || c.RPCHealthCheckIntervalSeconds < 1 || c.TokenMaxAgeSeconds < 0 || c.MaxHoldSeconds < 0 || c.StuckExitQuarantineSeconds < 1 || c.EntryDelaySeconds < 1 || c.EntryDelaySeconds >= 300 || c.PricePollSeconds < 1 {
 		return c, fmt.Errorf("queue, position, and timing values must be positive (TOKEN_MAX_AGE_SECONDS may be zero); entry delay must be under five minutes; submission attempts must be 1-6")
 	}
-	// ALTERADO: aceita 0 no MinVolumeBeforeBuySOL e MinMarketCapSOL (antes era <= 0)
 	if c.MinVolumeBeforeBuySOL < 0 || c.MaxVolumeBeforeBuySOL <= 0 || c.MinMarketCapSOL < 0 {
 		return c, fmt.Errorf("MIN_VOLUME_BEFORE_BUY and MIN_MARKET_CAP_SOL must be non-negative; MAX_VOLUME_BEFORE_BUY must be positive")
 	}
@@ -222,7 +403,7 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("MAX_VOLUME_BEFORE_BUY must be greater than or equal to MIN_VOLUME_BEFORE_BUY")
 	}
 	for name, value := range map[string]float64{
-		"TRAILING_STOP_ARM_PCT":  c.TrailingStopArmPct,
+		"TRAILING_STOP_ARM_PCT":   c.TrailingStopArmPct,
 		"EXIT_TRIGGER_BUFFER_PCT": c.ExitTriggerBufferPct,
 	} {
 		if value > 100 {
@@ -232,7 +413,7 @@ func Load() (Config, error) {
 	if c.SnipeConcurrency < 1 || c.SnipeConcurrency > 10 || c.SnipeTimeoutMS < 1 || c.SnipeTimeoutMS > 120000 || c.DedupeTTLMS < 1 || c.DedupeTTLMS > 3600000 {
 		return c, fmt.Errorf("SNIPE_CONCURRENCY must be 1-10, SNIPE_TIMEOUT_MS must be 1-120000, and DEDUPE_TTL_MS must be 1-3600000")
 	}
-	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuySOL, c.MaxVolumeBeforeBuySOL, c.MinMarketCapSOL, c.MaxMarketCapSOL, c.TrailingStopArmPct, c.ExitTriggerBufferPct} {
+	for _, value := range []float64{c.MaxTradeSOL, c.MaxDailyLossSOL, c.FeeReserveSOL, c.MaxExposureSOL, c.MaxSlippagePct, c.MaxPriorityFeeSOL, c.TradeUSD, c.SimulationBalanceSOL, c.SimulationBaseFeeSOL, c.TakeProfitGrossPct, c.StopLossPct, c.TrailingStopPct, c.MinVolumeBeforeBuySOL, c.MaxVolumeBeforeBuySOL, c.MinMarketCapSOL, c.MaxMarketCapSOL, c.TrailingStopArmPct, c.ExitTriggerBufferPct, c.MomentumMinVolumeSOL, c.MomentumMinBuyRatio, c.MomentumMinAcceleration, c.FirstPumpMinMarketCapSOL, c.FirstPumpMaxMarketCapSOL, c.FirstPumpMinVolumeSOL, c.FirstPumpMaxVolumeSOL, c.MomentumProfileMinMcapSOL, c.MomentumProfileMaxMcapSOL, c.MomentumProfileMinVolSOL, c.MomentumProfileMaxVolSOL, c.FirstPumpScoreWeightVolume, c.FirstPumpScoreWeightBuyRatio, c.FirstPumpScoreWeightBuyers, c.FirstPumpScoreWeightAccel, c.FirstPumpScoreVolumeCapSOL, c.FirstPumpScoreBuyersCap, c.MomentumScoreWeightVolume, c.MomentumScoreWeightBuyRatio, c.MomentumScoreWeightBuyers, c.MomentumScoreWeightAccel, c.MomentumScoreVolumeCapSOL, c.MomentumScoreBuyersCap, c.MinEntryScoreFirstPump, c.MinEntryScoreMomentum} {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return c, fmt.Errorf("financial limits must be finite and non-negative")
 		}
@@ -248,6 +429,43 @@ func Load() (Config, error) {
 	}
 	if c.MaxCurveImpactBPS < 1 || c.MaxCurveImpactBPS > 10000 {
 		return c, fmt.Errorf("MAX_CURVE_IMPACT_BPS must be between 1 and 10000")
+	}
+	if c.MomentumShortWindowSeconds < 1 || c.MomentumShortWindowSeconds > 300 ||
+		c.MomentumMediumWindowSeconds < c.MomentumShortWindowSeconds || c.MomentumMediumWindowSeconds > 600 ||
+		c.MomentumLongWindowSeconds < c.MomentumMediumWindowSeconds || c.MomentumLongWindowSeconds > 1800 ||
+		c.MomentumMaxTradeAgeSeconds < c.MomentumLongWindowSeconds || c.MomentumMaxTradeAgeSeconds > 3600 {
+		return c, fmt.Errorf("momentum windows must be positive, ordered (short<=medium<=long), and max trade age must cover the long window")
+	}
+	if c.MomentumMinBuyRatio > 1 {
+		return c, fmt.Errorf("MOMENTUM_MIN_BUY_RATIO must be between 0 and 1")
+	}
+	if c.HoldersCacheSeconds < 1 || c.HoldersCacheSeconds > 3600 {
+		return c, fmt.Errorf("HOLDERS_CACHE_SECONDS must be between 1 and 3600")
+	}
+	if c.FirstPumpEnabled {
+		if c.FirstPumpMaxTokenAgeSecs < 1 || c.FirstPumpMaxTokenAgeSecs > 600 {
+			return c, fmt.Errorf("FIRST_PUMP_MAX_TOKEN_AGE_SECONDS must be between 1 and 600")
+		}
+		if c.FirstPumpMinMarketCapSOL < 0 || c.FirstPumpMaxMarketCapSOL < c.FirstPumpMinMarketCapSOL {
+			return c, fmt.Errorf("FIRST_PUMP market cap limits must be non-negative and ordered")
+		}
+		if c.FirstPumpMinVolumeSOL < 0 || c.FirstPumpMaxVolumeSOL < c.FirstPumpMinVolumeSOL {
+			return c, fmt.Errorf("FIRST_PUMP volume limits must be non-negative and ordered")
+		}
+	}
+	if c.MomentumProfileEnabled {
+		if c.MomentumProfileMinMcapSOL < 0 || (c.MomentumProfileMaxMcapSOL > 0 && c.MomentumProfileMaxMcapSOL < c.MomentumProfileMinMcapSOL) {
+			return c, fmt.Errorf("MOMENTUM_PROFILE market cap limits must be non-negative and ordered")
+		}
+		if c.MomentumProfileMinVolSOL < 0 || (c.MomentumProfileMaxVolSOL > 0 && c.MomentumProfileMaxVolSOL < c.MomentumProfileMinVolSOL) {
+			return c, fmt.Errorf("MOMENTUM_PROFILE volume limits must be non-negative and ordered")
+		}
+		if c.MomentumProfileMinHolders < 0 {
+			return c, fmt.Errorf("MOMENTUM_PROFILE_MIN_HOLDERS must be non-negative")
+		}
+	}
+	if c.MinEntryScoreFirstPump > 100 || c.MinEntryScoreMomentum > 100 {
+		return c, fmt.Errorf("MIN_ENTRY_SCORE_* must be between 0 and 100")
 	}
 	if !c.Simulation && (!c.EnableLiveTrading || c.PrivateKey == "" || c.KeyProviderRef == "" || c.WalletPublicAddress == "" || c.PumpPortalKey == "") {
 		return c, fmt.Errorf("live trading requires ENABLE_LIVE_TRADING=true, BOT_PRIVATE_KEY via KEY_PROVIDER_REF, WALLET_PUBLIC_ADDRESS and PUMPPORTAL_API_KEY")
@@ -273,13 +491,6 @@ func Load() (Config, error) {
 	if c.Simulation && c.SimulationBalanceSOL <= 0 {
 		return c, fmt.Errorf("SIMULATION_BALANCE_SOL must be positive when SIMULATION=true")
 	}
-	// BYPASS: avisa em vez de bloquear o Live por falta de paper evidence.
-	// Para reativar a exigência de 30 trades, descomente o bloco original:
-	// if !c.Simulation && c.LiveUnlockRequiresPaper {
-	//     if err := validatePaperLiveUnlock(c.SimulationDatabaseURL); err != nil {
-	//         return c, fmt.Errorf("live trading blocked by paper evidence: %w", err)
-	//     }
-	// }
 	if !c.Simulation && c.LiveUnlockRequiresPaper {
 		fmt.Fprintln(os.Stderr, "warning: live trading bypassed paper evidence (config.Load)")
 	}
@@ -340,6 +551,13 @@ func intEnv(k string, d int) (int, error) {
 		return 0, fmt.Errorf("%s must be an integer (got %q): %w", k, v, err)
 	}
 	return parsed, nil
+}
+func stringEnv(k, d string) (string, error) {
+	v := cleanScalar(env(k, d))
+	if v == "" {
+		return "", fmt.Errorf("%s must not be empty", k)
+	}
+	return v, nil
 }
 
 func requiredIntEnv(k string) (int, error) {

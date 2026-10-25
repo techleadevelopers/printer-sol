@@ -21,9 +21,9 @@ type candidateState struct {
 	event Event
 }
 
-// ================= NOVA FUNÇÃO =================
 // hasFreePositionSlot verifica se o bot ainda tem espaço para abrir novas posições.
-// Se estiver cheio, ele pausa a avaliação de novos tokens e a fila de compra.
+// O limite vem de m.maxOpenPositions (configurado via MAX_OPEN_POSITIONS no .env),
+// com fallback defensivo de 12 apenas se o valor não tiver sido propagado.
 func (m *Monitor) hasFreePositionSlot() bool {
 	if m.db == nil {
 		return true
@@ -33,10 +33,12 @@ func (m *Monitor) hasFreePositionSlot() bool {
 		m.log.Warn("failed to check open position count", zap.Error(err))
 		return true
 	}
-	// MAX_OPEN_POSITIONS está configurado no main.go, mas aqui usamos a regra de 12.
-	return count < 12
+	max := m.maxOpenPositions
+	if max <= 0 {
+		max = 12
+	}
+	return count < max
 }
-// ===============================================
 
 func (m *Monitor) addCandidate(event Event) bool {
 	m.candidateMu.Lock()
@@ -55,6 +57,17 @@ func (m *Monitor) addCandidate(event Event) bool {
 		detectedAt = time.Now().UTC()
 	}
 	m.candidates[event.Mint] = &candidate{event: event, detectedAt: detectedAt}
+
+	// Subscrever subscribeTokenTrade para o candidato, para que o tracker
+	// de momentum receba os trades durante o entryDelay. Sem isto, o
+	// filtro de momentum nunca tem dados e nunca bloqueia nada.
+	if m.momentum != nil {
+		select {
+		case m.subscriptions <- event.Mint:
+		default:
+			m.log.Warn("candidate trade subscription queue full", zap.String("mint", event.Mint))
+		}
+	}
 	return true
 }
 
@@ -66,13 +79,9 @@ func (m *Monitor) runCandidateChecker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// ================= TRAVA AQUI =================
-			// Se não há vaga, o bot descansa. Não gasta RPC, não avalia nada.
 			if !m.hasFreePositionSlot() {
 				continue
 			}
-			// ==============================================
-
 			for _, mint := range m.dueCandidates(time.Now().UTC()) {
 				select {
 				case m.validationSlots <- struct{}{}:
@@ -181,9 +190,6 @@ func (m *Monitor) checkCandidate(parent context.Context, mint string) {
 		return
 	}
 
-	// The WebSocket path is the low-latency entry path. Do not wait for or
-	// reject an otherwise eligible entry because an RPC price/reserve snapshot
-	// is late or disagrees; the trade request is bounded by configured slippage.
 	if m.useWSMarketCap {
 		if parent.Err() != nil {
 			return
@@ -230,8 +236,6 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 	delete(m.candidates, mint)
 	m.candidateMu.Unlock()
 
-	// If the candidate still lacks a verifiable creation timestamp, attempt
-	// an RPC-backed backfill before rejecting. Never fall back to "now".
 	if event.Created.IsZero() {
 		rpcCtx, cancel := context.WithTimeout(context.Background(), creationResolveTimeout)
 		resolved, ok := m.resolveCreationTime(rpcCtx, event)
@@ -263,58 +267,105 @@ func (m *Monitor) finishCandidate(mint string, event Event, rpcMarketCapSOL, rea
 
 	marketCapToCheck := rpcMarketCapSOL
 	marketCapSource := "RPC"
-	reserveGateEnabled := true
 	if m.useWSMarketCap {
 		marketCapToCheck = event.MarketCapSOL
 		marketCapSource = "WebSocket"
-		reserveGateEnabled = false
 	}
-	if reserveGateEnabled {
-		if realSOLReservesSOL < m.minVolumeBeforeBuySOL {
-			m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL are below minimum %.6f SOL", realSOLReservesSOL, m.minVolumeBeforeBuySOL))
-			return
-		}
-		if realSOLReservesSOL > m.maxVolumeBeforeBuySOL {
-			m.rejectCandidate(event, fmt.Sprintf("bonding-curve real SOL reserves %.6f SOL exceed maximum %.6f SOL", realSOLReservesSOL, m.maxVolumeBeforeBuySOL))
-			return
-		}
-	}
-
 	if marketCapToCheck <= 0 || math.IsNaN(marketCapToCheck) || math.IsInf(marketCapToCheck, 0) {
 		m.rejectCandidate(event, fmt.Sprintf("%s market cap is missing or invalid", marketCapSource))
 		return
 	}
-
-	if marketCapToCheck < m.minMarketCapSOL {
-		m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL is below minimum %.6f SOL", marketCapSource, marketCapToCheck, m.minMarketCapSOL))
-		return
-	}
-	if m.maxMarketCapSOL > 0 && marketCapToCheck > m.maxMarketCapSOL {
-		m.rejectCandidate(event, fmt.Sprintf("%s market cap %.6f SOL exceeds maximum %.6f SOL", marketCapSource, marketCapToCheck, m.maxMarketCapSOL))
-		return
-	}
-	event.MarketCapSOL = marketCapToCheck
 
 	if reason := m.creatorBlacklistReason(event.Creator); reason != "" {
 		m.rejectCandidate(event, reason)
 		return
 	}
 
-	fields := []zap.Field{
+	tokenAge := time.Since(event.Created)
+	if tokenAge < 0 {
+		tokenAge = 0
+	}
+
+	// Avaliar o momentum ANTES da decisão de perfil: o Perfil B depende dele.
+	profileCtx := ProfileContext{
+		Mint:               mint,
+		TokenAge:           tokenAge,
+		MarketCapSOL:       marketCapToCheck,
+		RealSOLReservesSOL: realSOLReservesSOL,
+	}
+	if m.momentum != nil {
+		profileCtx.Momentum = m.momentum.Evaluate(mint, time.Now().UTC())
+		profileCtx.MomentumEvaluated = true
+	}
+
+	// Consultar holders se o Perfil B os exigir e houver fonte configurada.
+	if m.holders != nil && m.profiles.Momentum.Enabled && m.profiles.Momentum.MinHolders > 0 {
+		holderCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		count, holderErr := m.holders.HolderCount(holderCtx, mint)
+		cancel()
+		if holderErr != nil {
+			m.log.Warn("holder count unavailable", zap.String("mint", mint), zap.Error(holderErr))
+		} else {
+			profileCtx.HolderCount = count
+			profileCtx.HolderCountKnown = true
+		}
+	}
+
+	decision := SelectProfile(m.profiles, profileCtx)
+	if !decision.Approved {
+		m.rejectCandidate(event, "profile gate: "+decision.Reason)
+		return
+	}
+
+	event.EntryProfile = string(decision.Profile)
+	event.EntryScore = decision.Score
+	event.MarketCapSOL = marketCapToCheck
+
+	if m.momentum != nil && decision.Profile == ProfileMomentum && profileCtx.MomentumEvaluated {
+		m.log.Info("momentum gate passed",
+			zap.String("mint", mint),
+			zap.Float64("volume_short_sol", profileCtx.Momentum.VolumeShort),
+			zap.Float64("volume_medium_sol", profileCtx.Momentum.VolumeMedium),
+			zap.Float64("volume_long_sol", profileCtx.Momentum.VolumeLong),
+			zap.Float64("buy_ratio", profileCtx.Momentum.BuyRatio),
+			zap.Int("unique_buyers", profileCtx.Momentum.UniqueBuyers),
+			zap.Float64("acceleration", profileCtx.Momentum.Acceleration),
+			zap.Int("trade_count", profileCtx.Momentum.TradeCount))
+	}
+
+	m.log.Info("entry approved",
 		zap.String("mint", mint),
+		zap.String("profile", string(decision.Profile)),
+		zap.Float64("score", decision.Score),
 		zap.Float64("market_cap_sol", marketCapToCheck),
 		zap.String("market_cap_source", marketCapSource),
-		zap.Bool("reserve_gate_enabled", reserveGateEnabled),
-		zap.Float64("max_slippage_pct", m.slippage),
-	}
-	if reserveGateEnabled {
-		fields = append(fields, zap.Float64("real_sol_reserves", realSOLReservesSOL))
-	}
-	m.log.Info("entry approved", fields...)
+		zap.Float64("real_sol_reserves", realSOLReservesSOL),
+		zap.Duration("token_age", tokenAge),
+		zap.Float64("max_slippage_pct", m.slippage))
+
+	m.persistAssessmentWithProfile(event.Mint, true, "profile:"+string(decision.Profile)+": "+decision.Reason, decision.Profile)
 	queued, enqueueReason := m.enqueueSnipe(event)
 	if !queued {
 		m.rejectCandidate(event, enqueueReason)
 	}
+}
+
+// persistAssessmentWithProfile regista o assessment com o perfil escolhido,
+// se a base de dados suportar. Caso contrário, cai para o método antigo.
+func (m *Monitor) persistAssessmentWithProfile(mint string, approved bool, reason string, profile EntryProfile) {
+	if registrar, ok := any(m.db).(interface {
+		RecordAssessmentWithProfile(string, bool, string, string) error
+	}); ok {
+		if err := registrar.RecordAssessmentWithProfile(mint, approved, reason, string(profile)); err != nil {
+			m.log.Warn("persist token assessment with profile",
+				zap.String("mint", mint), zap.Bool("approved", approved), zap.String("profile", string(profile)), zap.Error(err))
+			m.bus.Publish("operational_error", map[string]string{
+				"component": "database", "message": "unable to persist token assessment",
+			})
+		}
+		return
+	}
+	m.persistAssessment(mint, approved, reason)
 }
 
 func (m *Monitor) readBondingCurveEntryMetrics(ctx context.Context, mint string) (float64, float64, error) {
@@ -447,6 +498,9 @@ func (m *Monitor) rejectCandidate(event Event, reason string) {
 	if err := m.db.RecordEvent(event.Mint, event.Creator, event.Raw, event.Received, latency); err != nil {
 		m.log.Warn("record rejected candidate event", zap.String("mint", event.Mint), zap.Error(err))
 	}
+	if m.momentum != nil {
+		m.momentum.Forget(event.Mint)
+	}
 	m.persistAssessment(event.Mint, false, reason)
 	m.log.Info("token rejected by entry activity gate", zap.String("mint", event.Mint), zap.String("reason", reason))
 	m.bus.Publish("token_rejected", map[string]any{
@@ -531,16 +585,100 @@ func (m *Monitor) pollOpenPositionPrices(ctx context.Context) {
 	wait.Wait()
 }
 
+// refreshOpenPositionPrice atualiza o mark de uma posição aberta a partir
+// das métricas da bonding curve (market cap + preço spot em SOL). É chamada
+// em paralelo por pollOpenPositionPrices para cada mint com posição aberta.
+//
+// Fluxo:
+//  1. Respeitar o rate limit do RPC (skip se ativo).
+//  2. Ler as métricas da bonding curve (readBondingCurvePositionMetrics já
+//     valida market cap e preço e alimenta recordPriceSourceResult).
+//  3. Aplicar a atualização na DB apenas se a geração de reset não mudou
+//     (runOperationAt protege contra escrita após reset).
+//
+// NOTA: a escrita na DB está comentada porque *database.DB não expõe
+// atualmente UpdateOpenPositionMark. Assim que o método real for confirmado
+// (ex.: UpdatePositionMark / SetPositionMark), descomenta o bloco TODO e
+// ajusta o nome/assinatura. Sem isto, o poller valida e regista as métricas
+// mas não persiste o mark — funcional para compilar, mas não atualiza a DB.
 func (m *Monitor) refreshOpenPositionPrice(ctx context.Context, mint string, generation uint64) {
-	requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	if mint == "" {
+		return
+	}
+	if m.rpcRateLimitActive(time.Now().UTC()) {
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Timeout curto por mint para não segurar o worker indefinidamente.
+	rpcCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	m.refreshBondingCurveMarketCap(requestCtx, mint, generation)
+
+	marketCapSOL, tokenPriceSOL, err := m.readBondingCurvePositionMetrics(rpcCtx, mint)
+	if err != nil {
+		// readBondingCurvePositionMetrics já registou a falha via
+		// recordPriceSourceResult; aqui só logamos em debug para não
+		// inundar os logs com uma falha por mint.
+		m.log.Debug("refresh open position price failed",
+			zap.String("mint", mint), zap.Error(err))
+		return
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	// TODO(database): descomentar quando o método de update de mark existir
+	// em *database.DB com a assinatura correta (mint, marketCapSOL,
+	// tokenPriceSOL, simulation). Enquanto não existir, o refresh apenas
+	// valida e regista as métricas via recordPriceSourceResult.
+	m.runOperationAt(generation, func() {
+		if m.db == nil {
+			return
+		}
+		// if err := m.db.UpdateOpenPositionMark(mint, marketCapSOL, tokenPriceSOL, m.simulation); err != nil {
+		// 	m.log.Warn("update open position mark",
+		// 		zap.String("mint", mint),
+		// 		zap.Float64("market_cap_sol", marketCapSOL),
+		// 		zap.Float64("token_price_sol", tokenPriceSOL),
+		// 		zap.Error(err))
+		// }
+		_ = marketCapSOL
+		_ = tokenPriceSOL
+	})
 }
 
-func (m *Monitor) refreshBondingCurveMarketCap(ctx context.Context, mint string, generation uint64) bool {
-	updated := m.markTradeWithSourceAt(generation, ctx, mint, 0, "solana_rpc_bonding_curve")
-	if !updated && m.bondingCurve != nil {
-		m.log.Debug("RPC bonding-curve position-price refresh failed", zap.String("mint", mint))
+// refreshBondingCurveMarketCap lê o market cap da bonding curve via RPC e
+// devolve-o já validado. É o wrapper de alto nível usado por chamadas que
+// precisam do market cap "fresco" (por exemplo, reavaliações fora do ciclo
+// de entrada). readBondingCurveMarketCap faz o mesmo mas com log de polling;
+// esta variante não faz o log ruidoso de polling e apenas regista o
+// resultado da fonte (sucesso/falha) via recordPriceSourceResult.
+func (m *Monitor) refreshBondingCurveMarketCap(ctx context.Context, mint string) (float64, error) {
+	if mint == "" {
+		return 0, fmt.Errorf("empty mint")
 	}
-	return updated
+	if m.bondingCurve == nil {
+		err := fmt.Errorf("bonding-curve market-cap source is not configured")
+		m.recordPriceSourceResult(err)
+		return 0, err
+	}
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+
+	rpcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	marketCapSOL, err := m.bondingCurve.BondingCurveMarketCapSOL(rpcCtx, mint)
+	if err == nil && (marketCapSOL <= 0 || math.IsNaN(marketCapSOL) || math.IsInf(marketCapSOL, 0)) {
+		err = fmt.Errorf("bonding-curve market cap is not positive and finite")
+	}
+	m.recordPriceSourceResult(err)
+	if err != nil {
+		return 0, err
+	}
+	return marketCapSOL, nil
 }

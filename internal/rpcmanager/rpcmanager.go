@@ -631,7 +631,6 @@ func (m *Manager) blockTimeOf(ctx context.Context, signature string) (time.Time,
 	return time.Unix(*r.BlockTime, 0).UTC(), nil
 }
 
-// ================= NOVO MÉTODO =================
 // AccountInfoResult mirrors the getAccountInfo RPC response. The Data field
 // keeps the raw base64 payload so callers can decode it for ALT resolution.
 type AccountInfoResult struct {

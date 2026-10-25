@@ -26,12 +26,18 @@ import (
 	"solana-sniper-backend/internal/wallet"
 )
 
+// pumpSwapProgramID é o program ID on-chain do PumpSwap AMM (pump-amm).
+// Usado por validatePumpSwapTransaction para confirmar a rota antes de assinar.
+const pumpSwapProgramID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+
 type Request struct {
 	Mint, Side            string
 	Amount                float64
 	DenominatedInSOL      bool
 	Slippage, PriorityFee float64
 	Pool, Reason          string
+	EntryProfile          string
+	EntryScore            float64
 	SellAll               bool
 	RequestedValueSOL     float64
 }
@@ -42,6 +48,8 @@ type Limits struct {
 	SimulationBaseFeeSOL                                                                           float64
 	MaxOpenPositions, MaxWaitSeconds, MaxAttempts                                                  int
 	SkipPreflight                                                                                  bool
+	MinEntryScoreFirstPump                                                                         float64
+	MinEntryScoreMomentum                                                                          float64
 }
 type Engine struct {
 	db                *database.DB
@@ -72,6 +80,7 @@ type livePreparation struct {
 	curveImpactBPS    float64
 	minimumOutputSOL  float64
 	requestedValueSOL float64
+	market            MarketDecision
 }
 
 func New(db *database.DB, w *wallet.Wallet, p *pumpportal.Client, r *rpcmanager.Manager, prices pricefeed.Provider, l *zap.Logger, sim bool, simulationBalanceSOL float64, c *bot.Controller, b *events.Bus, limits Limits) *Engine {
@@ -128,6 +137,39 @@ func (e *Engine) emit(kind string, data any) {
 	}
 }
 
+// extractEntryProfile devolve o perfil de entrada e o score a partir do
+// prefixo "profile:<kind>:score=<float>:" no reason. Se não houver prefixo,
+// devolve "", reason, 0.
+func extractEntryProfile(reason string) (profile, cleaned string, score float64) {
+	const prefix = "profile:"
+	if !strings.HasPrefix(reason, prefix) {
+		return "", reason, 0
+	}
+	rest := reason[len(prefix):]
+	idx := strings.Index(rest, ":")
+	if idx <= 0 {
+		return "", reason, 0
+	}
+	profile = strings.TrimSpace(rest[:idx])
+	rest = rest[idx+1:]
+
+	if strings.HasPrefix(rest, "score=") {
+		rest = rest[len("score="):]
+		if j := strings.Index(rest, ":"); j >= 0 {
+			if v, err := strconv.ParseFloat(strings.TrimSpace(rest[:j]), 64); err == nil {
+				score = v
+			}
+			rest = rest[j+1:]
+		}
+	}
+
+	cleaned = strings.TrimSpace(rest)
+	if cleaned == "" {
+		cleaned = reason
+	}
+	return profile, cleaned, score
+}
+
 func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage, priorityFee float64, pool, reason string) (string, error) {
 	if usd <= 0 || e.prices == nil {
 		return "", fmt.Errorf("USD sizing is unavailable")
@@ -160,7 +202,12 @@ func (e *Engine) BuyNewTokenUSD(ctx context.Context, mint string, usd, slippage,
 	if err := e.reserve(ctx, mint, spend+fee); err != nil {
 		return "", err
 	}
-	id, err := e.Execute(ctx, Request{Mint: mint, Side: "buy", Amount: amount, DenominatedInSOL: true, Slippage: slippage, PriorityFee: priorityFee, Pool: pool, Reason: reason})
+	profile, cleanedReason, score := extractEntryProfile(reason)
+	id, err := e.Execute(ctx, Request{
+		Mint: mint, Side: "buy", Amount: amount, DenominatedInSOL: true,
+		Slippage: slippage, PriorityFee: priorityFee, Pool: pool,
+		Reason: cleanedReason, EntryProfile: profile, EntryScore: score,
+	})
 	if err != nil {
 		e.release(mint)
 		return id, err
@@ -196,10 +243,6 @@ func (e *Engine) CloseLivePosition(ctx context.Context, mint string, slippage, p
 	return e.Execute(ctx, Request{Mint: mint, Side: "sell", Amount: 100, DenominatedInSOL: false, Slippage: slippage, PriorityFee: priorityFee, Pool: "auto", Reason: reason, SellAll: true})
 }
 
-// reserve guarda o valor necessário para uma compra. O `balance` já vem da
-// blockchain e já reflecte o SOL gasto nas posições abertas; NÃO somar
-// OpenExposureSOL() de novo (isso contava a exposição duas vezes e bloqueava
-// compras mesmo com saldo disponível).
 func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error {
 	var balance uint64
 	if e.simulation {
@@ -233,8 +276,6 @@ func (e *Engine) reserve(ctx context.Context, mint string, needed uint64) error 
 	for _, v := range e.reserved {
 		reserved += v
 	}
-	// O saldo do RPC já desconta o SOL das posições abertas. Somar
-	// OpenExposureSOL() aqui contava a exposição duas vezes.
 	required := reserve + reserved + needed
 	if balance < required {
 		return fmt.Errorf(
@@ -479,7 +520,14 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	if r.RequestedValueSOL > 0 {
 		requestedValue = r.RequestedValueSOL
 	}
-	t := database.Trade{ID: id, Mint: r.Mint, Side: r.Side, Quantity: fmt.Sprint(r.Amount), Requested: requestedValue, Fees: simulationFees, Slippage: r.Slippage, State: "prepared", EntryReason: r.Reason, ExitReason: r.Reason}
+	entryProfile := strings.TrimSpace(r.EntryProfile)
+	entryScore := r.EntryScore
+	t := database.Trade{
+		ID: id, Mint: r.Mint, Side: r.Side, Quantity: fmt.Sprint(r.Amount),
+		Requested: requestedValue, Fees: simulationFees, Slippage: r.Slippage,
+		State: "prepared", EntryReason: r.Reason, ExitReason: r.Reason,
+		EntryProfile: entryProfile, EntryScore: entryScore,
+	}
 	if err := e.db.InsertTrade(t); err != nil {
 		return "", err
 	}
@@ -495,8 +543,8 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 				}
 			}
 		}
-		e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "simulation": true})
-		e.emit("position_updated", map[string]any{"mint": r.Mint, "sourceTradeId": id, "action": r.Side, "state": "simulated"})
+		e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "simulation": true, "profile": entryProfile, "score": entryScore})
+		e.emit("position_updated", map[string]any{"mint": r.Mint, "sourceTradeId": id, "action": r.Side, "state": "simulated", "profile": entryProfile, "score": entryScore})
 		return id, nil
 	}
 	prepared, err := e.prepareLiveRequest(ctx, id, r)
@@ -507,7 +555,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	if prepared.denominatedInSOL {
 		amount = r.Amount
 	}
-	txBytes, err := e.portal.Prepare(ctx, pumpportal.Request{PublicKey: e.wallet.Address(), Action: r.Side, Mint: r.Mint, Amount: amount, DenominatedInSOL: fmt.Sprint(prepared.denominatedInSOL), Slippage: prepared.slippage, PriorityFee: r.PriorityFee, Pool: r.Pool})
+	txBytes, err := e.portal.Prepare(ctx, pumpportal.Request{PublicKey: e.wallet.Address(), Action: r.Side, Mint: r.Mint, Amount: amount, DenominatedInSOL: fmt.Sprint(prepared.denominatedInSOL), Slippage: prepared.slippage, PriorityFee: r.PriorityFee, Pool: prepared.market.Pool})
 	if err != nil {
 		return id, e.failPreparedTrade(id, err)
 	}
@@ -516,9 +564,6 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 		return id, e.failPreparedTrade(id, fmt.Errorf("unsupported PumpPortal transaction encoding: %w", err))
 	}
 
-	// ORDEM CORRETA: resolver ALT → validar → sanitizar → assinar → enviar.
-	// O Sanitize() é chamado DEPOIS da resolução das ALT, porque a mensagem
-	// só está completa depois de expandir os lookups.
 	if err = e.resolveAddressLookupTables(tx); err != nil {
 		return id, e.failPreparedTrade(id, fmt.Errorf("resolve address lookup tables: %w", err))
 	}
@@ -531,7 +576,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	if prepared.quoteAgeLimit > 0 {
 		quoteAge := time.Since(prepared.quotedAt)
 		if quoteAge < 0 || quoteAge > time.Duration(prepared.quoteAgeLimit)*time.Millisecond {
-			return id, e.failPreparedTrade(id, fmt.Errorf("bonding-curve quote exceeded MAX_QUOTE_AGE_MS before submission"))
+			return id, e.failPreparedTrade(id, fmt.Errorf("quote exceeded MAX_QUOTE_AGE_MS before submission"))
 		}
 		if err = e.db.UpdateTradeQuote(id, prepared.quotedAt, quoteAge.Milliseconds(), prepared.curveImpactBPS, prepared.minimumOutputSOL, prepared.requestedValueSOL, prepared.tokenQuantity); err != nil {
 			return id, e.failPreparedTrade(id, fmt.Errorf("persist execution quote: %w", err))
@@ -540,8 +585,6 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	if !tx.IsSigner(e.wallet.PublicKey()) {
 		return id, e.failPreparedTrade(id, fmt.Errorf("prepared transaction does not require operational wallet"))
 	}
-	// ASSINATURA: a mensagem validada é a mesma que será serializada. Não há
-	// alterações à Message depois deste ponto.
 	if err = e.wallet.Sign(tx); err != nil {
 		return id, e.failPreparedTrade(id, err)
 	}
@@ -561,32 +604,18 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	submitted, err := e.rpcs.SendWithMaxRetries(ctx, raw, attempts-1, limits.SkipPreflight)
 	if err != nil {
 		_ = e.db.UpdateTradeState(id, "unknown", signature, false)
-		e.emit(r.Side+"_failed", map[string]any{"tradeId": id, "mint": r.Mint, "reason": "submission outcome unknown"})
+		e.emit(r.Side+"_failed", map[string]any{"tradeId": id, "mint": r.Mint, "reason": "submission outcome unknown", "profile": entryProfile, "score": entryScore})
 		return id, fmt.Errorf("submission outcome unknown; reconcile before retry: %w", err)
 	}
 	if submitted != "" && submitted != signature {
 		_ = e.db.UpdateTradeState(id, "unknown", signature, false)
-		e.emit(r.Side+"_failed", map[string]any{"tradeId": id, "mint": r.Mint, "reason": "RPC signature mismatch"})
+		e.emit(r.Side+"_failed", map[string]any{"tradeId": id, "mint": r.Mint, "reason": "RPC signature mismatch", "profile": entryProfile, "score": entryScore})
 		return id, fmt.Errorf("RPC returned a different signature")
 	}
 	_ = e.db.UpdateTradeState(id, "submitted", signature, false)
-	e.emit(r.Side+"_sent", map[string]any{"tradeId": id, "mint": r.Mint, "signature": signature})
+	e.emit(r.Side+"_sent", map[string]any{"tradeId": id, "mint": r.Mint, "signature": signature, "profile": entryProfile, "score": entryScore})
 	go e.confirm(id, signature, r)
 	return id, nil
-}
-
-// validateSOLQuoteMint blocks direct SOL-denominated execution for bonding
-// curves whose quote mint is not SOL (zero public key). Those tokens may
-// require a multi-hop route; until that route is implemented and validated,
-// they must not reach PumpPortal preparation.
-func validateSOLQuoteMint(quoteMint solana.PublicKey) error {
-	if quoteMint != (solana.PublicKey{}) {
-		return fmt.Errorf(
-			"unsupported non-SOL quote mint %s; live execution blocked",
-			quoteMint.String(),
-		)
-	}
-	return nil
 }
 
 func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Request) (livePreparation, error) {
@@ -597,18 +626,53 @@ func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Requ
 	if request.Slippage*100 > float64(limits.MaxSlippageBPS) {
 		return livePreparation{}, fmt.Errorf("requested slippage exceeds MAX_SLIPPAGE_BPS")
 	}
+
+	// Bloqueio por score (Patch 4) — só activo quando o limite > 0.
+	// Não recalcula o score: usa o valor propagado no Request.
+	if request.Side == "buy" {
+		switch request.EntryProfile {
+		case "first_pump":
+			if limits.MinEntryScoreFirstPump > 0 && request.EntryScore < limits.MinEntryScoreFirstPump {
+				return livePreparation{}, fmt.Errorf(
+					"entry score %.1f is below first-pump minimum %.1f",
+					request.EntryScore, limits.MinEntryScoreFirstPump)
+			}
+		case "momentum":
+			if limits.MinEntryScoreMomentum > 0 && request.EntryScore < limits.MinEntryScoreMomentum {
+				return livePreparation{}, fmt.Errorf(
+					"entry score %.1f is below momentum minimum %.1f",
+					request.EntryScore, limits.MinEntryScoreMomentum)
+			}
+		}
+	}
+
+	market, err := e.ResolveMarketRoute(ctx, request.Mint)
+	if err != nil {
+		return livePreparation{}, fmt.Errorf("market route resolution failed: %w", err)
+	}
+	if err := validateMarketDecision(market, request.Side); err != nil {
+		return livePreparation{}, err
+	}
+
+	switch market.Kind {
+	case MarketBondingCurve:
+		return e.prepareBondingCurveRequest(ctx, request, market, limits)
+	case MarketPumpSwap:
+		return e.preparePumpSwapRequest(ctx, request, market, limits)
+	default:
+		return livePreparation{}, fmt.Errorf("market route is not supported for preparation")
+	}
+}
+
+func (e *Engine) prepareBondingCurveRequest(ctx context.Context, request Request, market MarketDecision, limits Limits) (livePreparation, error) {
 	state, err := e.rpcs.GetBondingCurveStateWithContext(ctx, request.Mint)
 	if err != nil {
 		return livePreparation{}, fmt.Errorf("fresh bonding-curve quote required: %w", err)
 	}
-	// Bloqueio conservador: se a bonding curve não for cotada em SOL, a
-	// compra directa com pool "pump" pode devolver UnsupportedQuoteMint (6063).
-	// Tokens que exigem rota multi-hop ficam bloqueados até essa rota estar
-	// implementada e validada.
-	if err := validateSOLQuoteMint(state.QuoteMint); err != nil {
-		return livePreparation{}, err
+	if state.QuoteMint != (solana.PublicKey{}) {
+		return livePreparation{}, fmt.Errorf("unsupported non-SOL quote mint %s; live execution blocked", state.QuoteMint.String())
 	}
-	if state.Complete || state.VirtualSOLReserves == 0 || state.VirtualTokenReserves == 0 || state.ObservedAt.IsZero() {
+	if state.VirtualSOLReserves == 0 || state.VirtualTokenReserves == 0 || state.ObservedAt.IsZero() {
 		return livePreparation{}, fmt.Errorf("bonding-curve quote is not usable for protected execution")
 	}
 	prepared := livePreparation{
@@ -617,10 +681,10 @@ func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Requ
 		quotedAt:          state.ObservedAt,
 		quoteAgeLimit:     limits.MaxQuoteAgeMS,
 		requestedValueSOL: request.Amount,
+		market:            market,
 	}
 	virtualSOL := float64(state.VirtualSOLReserves) / 1e9
 	virtualTokens := float64(state.VirtualTokenReserves) / 1e6
-	expectedSOL := 0.0
 
 	if request.Side == "buy" {
 		if request.Amount <= 0 || virtualSOL <= 0 {
@@ -632,63 +696,128 @@ func (e *Engine) prepareLiveRequest(ctx context.Context, id string, request Requ
 		if expectedTokens <= 0 || math.IsNaN(expectedTokens) || math.IsInf(expectedTokens, 0) {
 			return livePreparation{}, fmt.Errorf("bonding-curve buy quote is invalid")
 		}
-	} else {
-		raw, decimals, balanceErr := e.rpcs.TokenBalance(ctx, e.wallet.PublicKey(), request.Mint)
-		if balanceErr != nil {
-			return livePreparation{}, fmt.Errorf("confirmed wallet token balance required before selling: %w", balanceErr)
-		}
-		if raw == 0 {
-			return livePreparation{}, fmt.Errorf("wallet holds no confirmed tokens to sell")
-		}
-		if decimals != 6 {
-			return livePreparation{}, fmt.Errorf("unsupported token decimals for bonding-curve quote: %d", decimals)
-		}
-		tokenAmount := float64(raw) / math.Pow10(int(decimals))
-		if tokenAmount <= 0 || virtualTokens <= 0 {
-			return livePreparation{}, fmt.Errorf("invalid token amount or bonding-curve reserves")
-		}
-		prepared.amount = formatRawTokenAmount(raw, decimals)
-		prepared.tokenQuantity = fmt.Sprint(prepared.amount)
-		prepared.tokenQuantityRaw = strconv.FormatUint(raw, 10)
-		prepared.curveImpactBPS = tokenAmount / (virtualTokens + tokenAmount) * 10000
-		expectedSOL = virtualSOL * tokenAmount / (virtualTokens + tokenAmount)
-		if expectedSOL <= 0 || math.IsNaN(expectedSOL) || math.IsInf(expectedSOL, 0) {
-			return livePreparation{}, fmt.Errorf("bonding-curve sell quote is invalid")
-		}
-		prepared.requestedValueSOL = expectedSOL
-
-		cost, costErr := e.db.PositionCost(request.Mint)
-		if costErr != nil {
-			return livePreparation{}, fmt.Errorf("confirmed entry cost required to protect the sell: %w", costErr)
-		}
-		if cost <= 0 {
-			return livePreparation{}, fmt.Errorf("confirmed entry cost must be positive to protect the sell")
-		}
-		maxLossFloor := cost * (1 - limits.MaxLossPerTradePct/100)
-		entryFees, feesErr := e.db.PositionFeesSOL(request.Mint)
-		if feesErr != nil {
-			return livePreparation{}, fmt.Errorf("confirmed entry fees required to protect the sell: %w", feesErr)
-		}
-		maxLossFloor += entryFees + limits.MaxPriorityFeeSOL + 0.000005
-		maxSlipBPS := math.Min(request.Slippage*100, float64(limits.MaxSlippageBPS))
-		minimumOutput := expectedSOL * (1 - maxSlipBPS/10000)
-		if maxLossFloor > minimumOutput {
-			minimumOutput = maxLossFloor
-		}
-		if minimumOutput <= 0 || minimumOutput >= expectedSOL {
-			return livePreparation{}, fmt.Errorf("quoted sale cannot satisfy the per-trade loss floor; position remains open")
-		}
-		prepared.minimumOutputSOL = minimumOutput
-		prepared.slippage = (expectedSOL - minimumOutput) / expectedSOL * 100
-		if prepared.slippage*100 > float64(limits.MaxSlippageBPS)+1e-6 {
-			return livePreparation{}, fmt.Errorf("loss floor would require slippage above MAX_SLIPPAGE_BPS")
-		}
+		return prepared, e.checkCurveImpact(prepared, limits)
 	}
 
-	if prepared.curveImpactBPS > float64(limits.MaxCurveImpactBPS) {
-		return livePreparation{}, fmt.Errorf("estimated curve impact %.1f bps exceeds MAX_CURVE_IMPACT_BPS", prepared.curveImpactBPS)
+	raw, decimals, balanceErr := e.rpcs.TokenBalance(ctx, e.wallet.PublicKey(), request.Mint)
+	if balanceErr != nil {
+		return livePreparation{}, fmt.Errorf("confirmed wallet token balance required before selling: %w", balanceErr)
+	}
+	if raw == 0 {
+		return livePreparation{}, fmt.Errorf("wallet holds no confirmed tokens to sell")
+	}
+	if decimals != 6 {
+		return livePreparation{}, fmt.Errorf("unsupported token decimals for bonding-curve quote: %d", decimals)
+	}
+	tokenAmount := float64(raw) / math.Pow10(int(decimals))
+	if tokenAmount <= 0 || virtualTokens <= 0 {
+		return livePreparation{}, fmt.Errorf("invalid token amount or bonding-curve reserves")
+	}
+	prepared.amount = formatRawTokenAmount(raw, decimals)
+	prepared.tokenQuantity = fmt.Sprint(prepared.amount)
+	prepared.tokenQuantityRaw = strconv.FormatUint(raw, 10)
+	prepared.curveImpactBPS = tokenAmount / (virtualTokens + tokenAmount) * 10000
+	expectedSOL := virtualSOL * tokenAmount / (virtualTokens + tokenAmount)
+	if expectedSOL <= 0 || math.IsNaN(expectedSOL) || math.IsInf(expectedSOL, 0) {
+		return livePreparation{}, fmt.Errorf("bonding-curve sell quote is invalid")
+	}
+	prepared.requestedValueSOL = expectedSOL
+	if err := e.applyLossFloor(&prepared, request, limits, expectedSOL); err != nil {
+		return livePreparation{}, err
+	}
+	return prepared, e.checkCurveImpact(prepared, limits)
+}
+
+func (e *Engine) preparePumpSwapRequest(ctx context.Context, request Request, market MarketDecision, limits Limits) (livePreparation, error) {
+	pool, poolErr := e.rpcs.FindPumpSwapPool(ctx, request.Mint)
+	if poolErr != nil {
+		return livePreparation{}, fmt.Errorf("resolve PumpSwap pool: %w", poolErr)
+	}
+	if pool == nil {
+		return livePreparation{}, fmt.Errorf("PumpSwap pool is not available")
+	}
+	if pool.QuoteMint != (solana.PublicKey{}) && pool.QuoteMint != solana.WrappedSol {
+		return livePreparation{}, fmt.Errorf("PumpSwap pool quote mint %s is not SOL; live execution blocked", pool.QuoteMint.String())
+	}
+
+	prepared := livePreparation{
+		denominatedInSOL:  false,
+		slippage:          request.Slippage,
+		quotedAt:          time.Now().UTC(),
+		quoteAgeLimit:     limits.MaxQuoteAgeMS,
+		requestedValueSOL: request.Amount,
+		market:            market,
+	}
+
+	if request.Side == "buy" {
+		return livePreparation{}, fmt.Errorf("PumpSwap buy route is not implemented; live execution blocked")
+	}
+
+	raw, decimals, balanceErr := e.rpcs.TokenBalance(ctx, e.wallet.PublicKey(), request.Mint)
+	if balanceErr != nil {
+		return livePreparation{}, fmt.Errorf("confirmed wallet token balance required before selling: %w", balanceErr)
+	}
+	if raw == 0 {
+		return livePreparation{}, fmt.Errorf("wallet holds no confirmed tokens to sell")
+	}
+	if decimals != 6 {
+		return livePreparation{}, fmt.Errorf("unsupported token decimals for PumpSwap quote: %d", decimals)
+	}
+
+	expectedLamports, quoteErr := e.rpcs.QuotePumpSwapSell(ctx, pool, raw)
+	if quoteErr != nil {
+		return livePreparation{}, fmt.Errorf("PumpSwap sell quote: %w", quoteErr)
+	}
+	expectedSOL := float64(expectedLamports) / 1e9
+	if expectedSOL <= 0 || math.IsNaN(expectedSOL) || math.IsInf(expectedSOL, 0) {
+		return livePreparation{}, fmt.Errorf("PumpSwap sell quote is invalid")
+	}
+
+	prepared.amount = formatRawTokenAmount(raw, decimals)
+	prepared.tokenQuantity = fmt.Sprint(prepared.amount)
+	prepared.tokenQuantityRaw = strconv.FormatUint(raw, 10)
+	prepared.requestedValueSOL = expectedSOL
+	if err := e.applyLossFloor(&prepared, request, limits, expectedSOL); err != nil {
+		return livePreparation{}, err
 	}
 	return prepared, nil
+}
+
+func (e *Engine) applyLossFloor(prepared *livePreparation, request Request, limits Limits, expectedSOL float64) error {
+	cost, costErr := e.db.PositionCost(request.Mint)
+	if costErr != nil {
+		return fmt.Errorf("confirmed entry cost required to protect the sell: %w", costErr)
+	}
+	if cost <= 0 {
+		return fmt.Errorf("confirmed entry cost must be positive to protect the sell")
+	}
+	maxLossFloor := cost * (1 - limits.MaxLossPerTradePct/100)
+	entryFees, feesErr := e.db.PositionFeesSOL(request.Mint)
+	if feesErr != nil {
+		return fmt.Errorf("confirmed entry fees required to protect the sell: %w", feesErr)
+	}
+	maxLossFloor += entryFees + limits.MaxPriorityFeeSOL + 0.000005
+	maxSlipBPS := math.Min(request.Slippage*100, float64(limits.MaxSlippageBPS))
+	minimumOutput := expectedSOL * (1 - maxSlipBPS/10000)
+	if maxLossFloor > minimumOutput {
+		minimumOutput = maxLossFloor
+	}
+	if minimumOutput <= 0 || minimumOutput >= expectedSOL {
+		return fmt.Errorf("quoted sale cannot satisfy the per-trade loss floor; position remains open")
+	}
+	prepared.minimumOutputSOL = minimumOutput
+	prepared.slippage = (expectedSOL - minimumOutput) / expectedSOL * 100
+	if prepared.slippage*100 > float64(limits.MaxSlippageBPS)+1e-6 {
+		return fmt.Errorf("loss floor would require slippage above MAX_SLIPPAGE_BPS")
+	}
+	return nil
+}
+
+func (e *Engine) checkCurveImpact(prepared livePreparation, limits Limits) error {
+	if prepared.curveImpactBPS > float64(limits.MaxCurveImpactBPS) {
+		return fmt.Errorf("estimated curve impact %.1f bps exceeds MAX_CURVE_IMPACT_BPS", prepared.curveImpactBPS)
+	}
+	return nil
 }
 
 func formatRawTokenAmount(raw uint64, decimals uint8) string {
@@ -707,10 +836,6 @@ func formatRawTokenAmount(raw uint64, decimals uint8) string {
 	return whole + "." + fraction
 }
 
-// resolveAddressLookupTables busca cada ALT referenciada na transação,
-// descodifica os endereços, injeta-os na mensagem e resolve os índices.
-// Após isto, tx.Message.IsResolved() == true e a validação aceita a
-// transação V0 original. Não reconstruir a mensagem.
 func (e *Engine) resolveAddressLookupTables(tx *solana.Transaction) error {
 	if !tx.Message.IsVersioned() {
 		return nil
@@ -752,10 +877,6 @@ func (e *Engine) resolveAddressLookupTables(tx *solana.Transaction) error {
 	if err := tx.Message.ResolveLookups(); err != nil {
 		return fmt.Errorf("resolve lookups: %w", err)
 	}
-
-	// Preservar a mensagem V0 original. NÃO reconstruir.
-	// O ResolveLookups já expandiu os AccountKeys e corrigiu os índices.
-	// A validação seguinte aceita V0 porque tx.Message.IsResolved() == true.
 	return nil
 }
 
@@ -1024,10 +1145,6 @@ func (e *Engine) confirm(id, sig string, r Request) {
 	}
 }
 
-// validatePreparedTransaction valida a transação preparada. Aceita
-// AddressTableLookups APENAS se a mensagem já tiver sido resolvida
-// (tx.Message.IsResolved() == true), garantindo que as ALT foram
-// efectivamente carregadas antes da assinatura.
 func (e *Engine) validatePreparedTransaction(tx *solana.Transaction, request Request, prepared livePreparation) error {
 	if len(tx.Message.AccountKeys) == 0 || tx.Message.AccountKeys[0] != e.wallet.PublicKey() {
 		return fmt.Errorf("operational wallet is not the fee payer")
@@ -1051,22 +1168,27 @@ func (e *Engine) validatePreparedTransaction(tx *solana.Transaction, request Req
 			}
 		}
 	}
-	if err := validateDirectPumpRoute(tx); err != nil {
-		return err
+
+	switch prepared.market.Kind {
+	case MarketBondingCurve:
+		if err := validateDirectPumpRoute(tx); err != nil {
+			return err
+		}
+		if request.Side == "sell" {
+			return validateProtectedPumpSell(tx, prepared)
+		}
+		return validateProtectedPumpBuy(tx, request.Mint)
+
+	case MarketPumpSwap:
+		return validatePumpSwapTransaction(tx, request, prepared, prepared.market)
+
+	default:
+		return fmt.Errorf("market route is not supported for transaction validation")
 	}
-	if request.Side == "sell" {
-		return validateProtectedPumpSell(tx, prepared)
-	}
-	return validateProtectedPumpBuy(tx, request.Mint)
 }
 
 const pumpFunProgramIDForExecution = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-// validateDirectPumpRoute deliberately permits only the programs needed by a
-// direct, SOL-quoted Pump.fun bonding-curve trade.  PumpPortal returns a
-// partially signed transaction, so treating it as trusted would allow an
-// unexpected router/program to spend the wallet's signing authority.  Market
-// migrations and AMM routes require their own separately reviewed validator.
 func validateDirectPumpRoute(tx *solana.Transaction) error {
 	allowed := map[string]bool{
 		"ComputeBudget111111111111111111111111111111": true,
@@ -1074,7 +1196,7 @@ func validateDirectPumpRoute(tx *solana.Transaction) error {
 		"ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL":  true,
 		"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":  true,
 		"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb":  true,
-		pumpFunProgramIDForExecution:                       true,
+		pumpFunProgramIDForExecution:                    true,
 	}
 	for _, ix := range tx.Message.Instructions {
 		if int(ix.ProgramIDIndex) >= len(tx.Message.AccountKeys) {
@@ -1084,6 +1206,124 @@ func validateDirectPumpRoute(tx *solana.Transaction) error {
 		if !allowed[program] {
 			return fmt.Errorf("unapproved program %s in direct Pump.fun route", program)
 		}
+	}
+	return nil
+}
+
+func validatePumpSwapTransaction(tx *solana.Transaction, request Request, prepared livePreparation, market MarketDecision) error {
+	pumpAmm, err := solana.PublicKeyFromBase58(pumpSwapProgramID)
+	if err != nil {
+		return fmt.Errorf("invalid PumpSwap program identifier: %w", err)
+	}
+	sellDiscriminator := [8]byte{51, 230, 133, 164, 1, 127, 131, 173}
+
+	allowed := map[string]bool{
+		"ComputeBudget111111111111111111111111111111": true,
+		"11111111111111111111111111111111":              true,
+		"ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL":  true,
+		"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":  true,
+		"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb":  true,
+		pumpSwapProgramID:                               true,
+		"pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ": true,
+	}
+
+	expectedAmount, err := strconv.ParseUint(prepared.tokenQuantityRaw, 10, 64)
+	if err != nil || expectedAmount == 0 {
+		return fmt.Errorf("PumpSwap sell has no valid confirmed token quantity")
+	}
+	minimumOutputLamports := math.Ceil(prepared.minimumOutputSOL * 1e9)
+	if prepared.minimumOutputSOL <= 0 || math.IsNaN(minimumOutputLamports) ||
+		math.IsInf(minimumOutputLamports, 0) || minimumOutputLamports > float64(^uint64(0)) {
+		return fmt.Errorf("PumpSwap sell has no valid minimum SOL output")
+	}
+	requiredOutput := uint64(minimumOutputLamports)
+
+	found := false
+	for _, ix := range tx.Message.Instructions {
+		if int(ix.ProgramIDIndex) >= len(tx.Message.AccountKeys) {
+			return fmt.Errorf("instruction program index out of range")
+		}
+		program := tx.Message.AccountKeys[ix.ProgramIDIndex].String()
+		if !allowed[program] {
+			return fmt.Errorf("unapproved program %s in PumpSwap route", program)
+		}
+		if tx.Message.AccountKeys[ix.ProgramIDIndex] != pumpAmm {
+			continue
+		}
+		if len(ix.Data) < 24 || !bytes.Equal(ix.Data[:8], sellDiscriminator[:]) {
+			continue
+		}
+		if found {
+			return fmt.Errorf("prepared transaction contains multiple PumpSwap sell instructions")
+		}
+		found = true
+
+		amount := binary.LittleEndian.Uint64(ix.Data[8:16])
+		minimumOutput := binary.LittleEndian.Uint64(ix.Data[16:24])
+		if amount != expectedAmount {
+			return fmt.Errorf("prepared PumpSwap sell quantity does not match the confirmed wallet balance")
+		}
+		if minimumOutput < requiredOutput {
+			return fmt.Errorf("prepared PumpSwap sell does not enforce the calculated minimum SOL output")
+		}
+
+		if len(ix.Accounts) < 21 {
+			return fmt.Errorf("PumpSwap sell instruction has %d accounts; want at least 21", len(ix.Accounts))
+		}
+		accountAt := func(i int) (solana.PublicKey, error) {
+			idx := int(ix.Accounts[i])
+			if idx >= len(tx.Message.AccountKeys) {
+				return solana.PublicKey{}, fmt.Errorf("PumpSwap sell account index %d out of range", i)
+			}
+			return tx.Message.AccountKeys[idx], nil
+		}
+		poolKey, err := accountAt(0)
+		if err != nil {
+			return err
+		}
+		baseMintKey, err := accountAt(3)
+		if err != nil {
+			return err
+		}
+		quoteMintKey, err := accountAt(4)
+		if err != nil {
+			return err
+		}
+		poolBaseVault, err := accountAt(7)
+		if err != nil {
+			return err
+		}
+		poolQuoteVault, err := accountAt(8)
+		if err != nil {
+			return err
+		}
+		coinCreatorVaultAta, err := accountAt(17)
+		if err != nil {
+			return err
+		}
+		coinCreatorVaultAuthority, err := accountAt(18)
+		if err != nil {
+			return err
+		}
+
+		if baseMintKey == (solana.PublicKey{}) || quoteMintKey == (solana.PublicKey{}) {
+			return fmt.Errorf("PumpSwap sell has zero base or quote mint")
+		}
+		if poolBaseVault == (solana.PublicKey{}) || poolQuoteVault == (solana.PublicKey{}) {
+			return fmt.Errorf("PumpSwap sell has zero pool vault account")
+		}
+		if poolBaseVault == poolQuoteVault {
+			return fmt.Errorf("PumpSwap sell uses the same vault for base and quote")
+		}
+		if coinCreatorVaultAta == (solana.PublicKey{}) || coinCreatorVaultAuthority == (solana.PublicKey{}) {
+			return fmt.Errorf("PumpSwap sell has zero coin creator vault account")
+		}
+		if poolKey == (solana.PublicKey{}) {
+			return fmt.Errorf("PumpSwap sell has zero pool account")
+		}
+	}
+	if !found {
+		return fmt.Errorf("prepared transaction has no verifiable PumpSwap sell instruction")
 	}
 	return nil
 }
@@ -1169,7 +1409,5 @@ func validateProtectedPumpSell(tx *solana.Transaction, prepared livePreparation)
 
 func anchorInstructionDiscriminator(name string) [8]byte {
 	hash := sha256.Sum256([]byte("global:" + name))
-	var discriminator [8]byte
-	copy(discriminator[:], hash[:8])
-	return discriminator
+	return [8]byte{hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]}
 }

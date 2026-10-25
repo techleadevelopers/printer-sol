@@ -30,21 +30,29 @@ type Event struct {
 	MarketCapSOL float64
 	Raw          string
 	queuedAt     time.Time
+	EntryProfile string
+	EntryScore   float64
 }
 
-// CreationTimeResolver is an optional RPC-backed source of truth for a token's
-// creation time. It is consulted only when the PumpPortal websocket payload
-// does not carry a usable timestamp AND a signature (or at least a mint) is
-// available. Returning (zero, nil) means "not resolvable now"; the caller
-// must still enforce the age gate and reject unverified tokens.
 type CreationTimeResolver interface {
 	ResolveCreationTime(ctx context.Context, mint, signature string) (time.Time, error)
+}
+
+type MarketRouter interface {
+	ResolveMarketRoute(ctx context.Context, mint string) (MarketDecisionLike, error)
+}
+
+type MarketDecisionLike struct {
+	Kind   string
+	Pool   string
+	Reason string
 }
 
 type Entrier interface {
 	BuyNewTokenUSD(context.Context, string, float64, float64, float64, string, string) (string, error)
 	ClosePaperPosition(context.Context, string, float64, string) (string, error)
 	CloseLivePosition(context.Context, string, float64, float64, string) (string, error)
+	ResolveMarketRoute(context.Context, string) (MarketDecisionLike, error)
 }
 type unknownTradeReconciler interface {
 	ReconcileUnknown(context.Context) error
@@ -73,6 +81,10 @@ type Settings struct {
 	DedupeTTL             time.Duration
 	BondingCurve          BondingCurveMarketCapSource
 	CreationResolver      CreationTimeResolver
+	Momentum              MomentumConfig
+	Profiles              Profiles
+	Holders               HolderSource
+	MaxOpenPositions      int // NOVO: limite de posições abertas (vem do MAX_OPEN_POSITIONS)
 }
 
 type candidate struct {
@@ -139,11 +151,15 @@ type Monitor struct {
 	dedupeTTL                       time.Duration
 	bondingCurve                    BondingCurveMarketCapSource
 	creationResolver                CreationTimeResolver
+	momentum                        *MomentumTracker
+	profiles                        Profiles
+	holders                         HolderSource
 	priceSourceStatusMu             sync.Mutex
 	priceSourceFailures             int
 	priceSourceAlerted              bool
 	rpcRateLimitFailures            int
 	rpcRateLimitUntil               time.Time
+	maxOpenPositions                int // NOVO
 }
 
 const exitRetryDelay = 5 * time.Second
@@ -152,9 +168,6 @@ const maxAutomaticLiveExitAttempts = 3
 const staleSimulationSellRecoveryAge = time.Minute
 const staleLiveSellRecoveryAge = time.Minute
 const defaultStuckExitQuarantineAge = 2 * time.Minute
-
-// creationResolveTimeout bounds the RPC round-trip used to backfill a token's
-// creation time. Kept short so it never stalls the fast entry path for long.
 const creationResolveTimeout = 3 * time.Second
 
 func (m *Monitor) runOperation(fn func()) bool {
@@ -241,6 +254,9 @@ func (m *Monitor) ResetInMemoryState() {
 	m.snipeMu.Lock()
 	m.snipePending = make(map[string]time.Time)
 	m.snipeMu.Unlock()
+	if m.momentum != nil {
+		m.momentum.Reset()
+	}
 	for {
 		select {
 		case <-m.q:
@@ -273,6 +289,10 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		SnipeConcurrency:      4,
 		SnipeTimeout:          15 * time.Second,
 		DedupeTTL:             30 * time.Minute,
+		Momentum:              DefaultMomentumConfig(),
+		Profiles:              DefaultProfiles(),
+		Holders:               NoopHolderSource{},
+		MaxOpenPositions:      12,
 	}
 	if len(options) > 0 {
 		option := options[0]
@@ -304,11 +324,25 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		if option.DedupeTTL > 0 {
 			settings.DedupeTTL = option.DedupeTTL
 		}
+		if option.MaxOpenPositions > 0 {
+			settings.MaxOpenPositions = option.MaxOpenPositions
+		}
 		settings.BondingCurve = option.BondingCurve
 		settings.CreationResolver = option.CreationResolver
+		settings.Momentum = option.Momentum
+		settings.Profiles = option.Profiles
+		if option.Holders != nil {
+			settings.Holders = option.Holders
+		}
 	}
 	if settings.SnipeConcurrency > 10 {
 		settings.SnipeConcurrency = 10
+	}
+	if settings.Holders == nil {
+		settings.Holders = NoopHolderSource{}
+	}
+	if settings.MaxOpenPositions <= 0 {
+		settings.MaxOpenPositions = 12
 	}
 	mon := &Monitor{
 		ws: ws, key: key, q: make(chan Event, size), db: db, strategy: s, entry: entry,
@@ -335,11 +369,13 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		snipeTimeout:          settings.SnipeTimeout, dedupeTTL: settings.DedupeTTL,
 		bondingCurve:     settings.BondingCurve,
 		creationResolver: settings.CreationResolver,
+		momentum:         NewMomentumTracker(settings.Momentum),
+		profiles:         settings.Profiles,
+		holders:          settings.Holders,
 		bus:              b, log: l,
+		maxOpenPositions: settings.MaxOpenPositions,
 	}
 	if mon.creationResolver == nil {
-		// Sem isto, qualquer token cujo payload não traga timestamp é rejeitado
-		// silenciosamente. Logamos no arranque para não voltar a passar despercebido.
 		l.Warn("tokenmonitor: CreationResolver is nil; tokens without a payload timestamp will be rejected by the age gate")
 	}
 	return mon
@@ -674,7 +710,7 @@ func (m *Monitor) expireOpenPositionsLocked(ctx context.Context) {
 			} else if priceErr != nil {
 				m.alertMissingMark(mint, priceErr)
 			} else {
-				m.alertMissingMark(mint, errors.New("fresh RPC-verified bonding-curve spot price is unavailable"))
+				m.alertMissingMark(mint, errors.New("fresh RPC-verified spot price is unavailable"))
 			}
 			continue
 		}
@@ -717,7 +753,7 @@ func (m *Monitor) restoreOpenPositions() {
 				markErr = priceErr
 			}
 			if markErr == nil {
-				markErr = errors.New("fresh RPC-verified bonding-curve spot price is unavailable")
+				markErr = errors.New("fresh RPC-verified spot price is unavailable")
 			}
 			m.alertMissingMark(mint, markErr)
 		}
@@ -731,7 +767,7 @@ func (m *Monitor) alertMissingMark(mint string, markErr error) {
 	if _, alreadyReported := m.missingMarks.LoadOrStore(mint, struct{}{}); alreadyReported {
 		return
 	}
-	reason := "open position has no fresh RPC-verified bonding-curve spot price; position remains open"
+	reason := "open position has no fresh RPC-verified spot price; position remains open"
 	payload, _ := json.Marshal(map[string]any{
 		"mint": mint, "simulation": m.simulation, "reason": reason,
 	})
@@ -847,6 +883,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 			Timestamp        json.RawMessage `json:"timestamp"`
 			BlockTime        json.RawMessage `json:"blockTime"`
 			MarketCapSol     float64         `json:"marketCapSol"`
+			SolAmount        float64         `json:"solAmount"`
 		}
 		if err = json.Unmarshal(b, &d); err != nil {
 			m.log.Warn("invalid PumpPortal websocket JSON",
@@ -881,19 +918,38 @@ func (m *Monitor) connect(ctx context.Context) error {
 			continue
 		}
 		_, tracked := m.tracked.Load(d.Mint)
+		m.candidateMu.Lock()
+		_, candidate := m.candidates[d.Mint]
+		m.candidateMu.Unlock()
 		switch strings.ToLower(strings.TrimSpace(d.TxType)) {
 		case "buy", "sell", "trade":
 			m.log.Info("PumpPortal websocket trade event received",
 				zap.String("mint", d.Mint),
 				zap.String("tx_type", d.TxType),
+				zap.Float64("sol_amount", d.SolAmount),
 				zap.Float64("mcap", d.MarketCapSol),
-				zap.Bool("tracked", tracked))
+				zap.Bool("tracked", tracked),
+				zap.Bool("candidate", candidate))
 		default:
 			m.log.Debug("PumpPortal websocket market-cap event",
 				zap.String("mint", d.Mint),
 				zap.String("tx_type", d.TxType),
 				zap.Float64("market_cap_sol", d.MarketCapSol),
-				zap.Bool("tracked", tracked))
+				zap.Bool("tracked", tracked),
+				zap.Bool("candidate", candidate))
+		}
+		if m.momentum != nil && (candidate || tracked) {
+			txType := strings.ToLower(strings.TrimSpace(d.TxType))
+			if txType == "" {
+				txType = "trade"
+			}
+			m.momentum.Record(TradeEvent{
+				Mint:      d.Mint,
+				TxType:    txType,
+				SOLAmount: d.SolAmount,
+				Trader:    d.TraderPublicKey,
+				At:        time.Now().UTC(),
+			})
 		}
 		if tracked {
 			if d.MarketCapSol > 0 {
@@ -904,6 +960,9 @@ func (m *Monitor) connect(ctx context.Context) error {
 					zap.Float64("mcap_sol", d.MarketCapSol),
 					zap.Bool("simulation", m.simulation))
 			}
+			continue
+		}
+		if candidate {
 			continue
 		}
 		creator := d.Creator
@@ -1046,7 +1105,6 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 	}
 
 	if e.Created.IsZero() {
-		// Backfill a verifiable creation time via RPC before giving up.
 		if resolved, ok := m.resolveCreationTime(ctx, e); ok {
 			e.Created = resolved
 		}
@@ -1101,11 +1159,36 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 		return
 	}
 
-	id, entryErr := m.entry.BuyNewTokenUSD(ctx, e.Mint, m.tradeUSD, m.slippage, m.priorityFee, "pump", reason)
+	decision, routeErr := m.entry.ResolveMarketRoute(ctx, e.Mint)
+	if routeErr != nil {
+		reason := fmt.Sprintf("market route resolution failed: %v", routeErr)
+		m.persistAssessment(e.Mint, false, reason)
+		m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": reason})
+		return
+	}
+	if decision.Kind != "pump_curve" {
+		reason := fmt.Sprintf("market route %s is not eligible for entry: %s", decision.Kind, decision.Reason)
+		m.persistAssessment(e.Mint, false, reason)
+		m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": reason})
+		m.log.Info("approved token not entered due to market route",
+			zap.String("mint", e.Mint),
+			zap.String("market_kind", decision.Kind),
+			zap.String("market_reason", decision.Reason))
+		return
+	}
+
+	profileReason := reason
+	if e.EntryProfile != "" {
+		profileReason = fmt.Sprintf("profile:%s:score=%.1f: %s", e.EntryProfile, e.EntryScore, reason)
+	}
+	id, entryErr := m.entry.BuyNewTokenUSD(ctx, e.Mint, m.tradeUSD, m.slippage, m.priorityFee, decision.Pool, profileReason)
 	if entryErr != nil {
 		m.persistAssessment(e.Mint, false, entryErr.Error())
 		m.bus.Publish("entry_rejected", map[string]any{"mint": e.Mint, "reason": entryErr.Error()})
 		m.log.Info("approved token not entered", zap.String("mint", e.Mint), zap.Error(entryErr))
+		if m.momentum != nil {
+			m.momentum.Forget(e.Mint)
+		}
 		return
 	}
 	m.persistAssessment(e.Mint, true, reason)
@@ -1130,10 +1213,6 @@ func (m *Monitor) consumeEvent(ctx context.Context, e Event) {
 	}
 }
 
-// resolveCreationTime consults the configured RPC-backed resolver to obtain a
-// trustworthy creation timestamp for an event whose payload did not carry one.
-// It never falls back to the local receive time; a token whose age cannot be
-// verified must remain rejected.
 func (m *Monitor) resolveCreationTime(ctx context.Context, e Event) (time.Time, bool) {
 	if m.creationResolver == nil {
 		return time.Time{}, false
@@ -1257,6 +1336,17 @@ func (m *Monitor) markTradeWithSourceAt(generation uint64, ctx context.Context, 
 }
 
 func (m *Monitor) markTradeLocked(ctx context.Context, mint string) bool {
+	decision, routeErr := m.entry.ResolveMarketRoute(ctx, mint)
+	if routeErr != nil {
+		m.log.Warn("market route unavailable for position mark",
+			zap.String("mint", mint), zap.Error(routeErr))
+		return false
+	}
+	if decision.Kind != "pump_curve" {
+		m.alertMissingMark(mint, fmt.Errorf("position market is %s (%s); bonding-curve price is unavailable", decision.Kind, decision.Reason))
+		return false
+	}
+
 	marketCapSOL, tokenPriceSOL, err := m.readBondingCurvePositionMetrics(ctx, mint)
 	if err != nil {
 		m.log.Warn("skip position mark without RPC-verified bonding-curve price",
@@ -1623,9 +1713,6 @@ func (m *Monitor) blockAutomaticSimulationExitRetries(mint, reason string, faile
 	m.blockAutomaticExitRetries(mint, reason, failedAttempts)
 }
 
-// timestampFromEvent is unchanged: it still parses only numeric/string Unix
-// seconds (or ms) and RFC3339. It intentionally does NOT fall back to
-// time.Now(); unverified tokens are resolved via CreationTimeResolver instead.
 func timestampFromEvent(values ...json.RawMessage) time.Time {
 	for _, raw := range values {
 		if len(raw) == 0 || string(raw) == "null" {
