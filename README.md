@@ -549,7 +549,7 @@ Este backend está em **desenvolvimento ativo**. Rotas, variáveis de ambiente, 
 
 ### Licença
 
-Este projeto é distribuído sob a licença **MIT** (ou a licença definida no arquivo `LICENSE` do repositório). Consulte o arquivo para os termos completos.
+Este projeto é distribuído sob a **Apache License 2.0**. Consulte os arquivos `LICENSE` e `NOTICE` na raiz do repositório para os termos completos.
 
 ### Contato e contribuição
 
