@@ -51,7 +51,7 @@ Para ativar execução real, o bot exige **prova estatística em simulação** (
 O teste com 29 operações permanece bloqueado. Ou seja: o bot só vai para live quando o PnL simulado provar que a estratégia funciona.
 
 ## Segurança e modo de execução
-
+```
 O padrão é `SIMULATION=true`. Neste modo o serviço registra a negociação simulada, mas não assina nem envia bytes de transação. O perfil de exemplo usa ordem de US$ 3, prioridade por transação de 0,001 SOL, taxa-base simulada de 0,000005 SOL, take-profit bruto de 50%, stop-loss de 25%, trailing stop de 12% armado após ganho de 10% sobre o custo e limite de retenção `MAX_HOLD_SECONDS=300` (configurável). RugCheck roda de forma assíncrona depois da entrada e não bloqueia o sniping. São parâmetros de operação, não promessa de lucro: preço, taxas, slippage, liquidez e execução podem causar perdas.
 
 A simulação calcula saídas virtuais a partir das atualizações de preço por token do PumpPortal. Para isso, `PUMPPORTAL_API_KEY` também é obrigatória em simulação; o PumpPortal exige uma carteira vinculada com pelo menos 0,02 SOL para essa assinatura. A cotação SOL/USD validada é reutilizada por até 30 segundos; se expirar e a atualização falhar, novas entradas são bloqueadas. A banca exibida como saldo disponível desconta o capital alocado em posições abertas e incorpora resultados realizados após cada saída.
@@ -63,7 +63,7 @@ As marcas do WebSocket são a fonte principal e processadas em segundo plano com
 Sem marca válida, a posição permanece aberta e gera alerta. A recuperação por quarentena é separada do max hold e atua somente sobre saídas travadas após `STUCK_EXIT_QUARANTINE_SECONDS` (120s por padrão), nunca em posições saudáveis. `TOKEN_MAX_AGE_SECONDS` tem padrão de 30 segundos, respeita o valor configurado sem tolerância adicional e `0` desativa apenas o corte de idade; eventos sem timestamp confiável continuam bloqueados. A configuração é passada tanto à estratégia quanto ao monitor.
 
 `MAX_SLIPPAGE_BPS`, `MAX_QUOTE_AGE_MS` e `MAX_CURVE_IMPACT_BPS` são limites independentes e obrigatórios, calibrados com resultados reais. A confirmação live persiste o valor, a quantidade de tokens e a taxa observados no recibo on-chain. A venda usa o saldo confirmado da carteira e só é assinada se a instrução Pump.fun oferecer e aplicar o mínimo SOL calculado. Esses limites não eliminam atraso de rede, prioridade insuficiente nem competição com outras ordens; slippage só garante o mínimo quando o próprio programa de swap aplica essa proteção.
-
+```
 ### Perfis de entrada (A e B)
 
 O bot escolhe **um perfil de entrada** por candidato, com critérios independentes. O modo é configurado por `ENTRY_PROFILE_MODE`:
