@@ -537,3 +537,27 @@ Quando o bloqueio por score está ativo, ele compara o score que já vem no `Req
 
 ---
 
+### Aviso legal e responsabilidade
+
+O Impressor Solana Bot é uma ferramenta de **execução de estratégias e observação de mercado**. Ele **não promete lucro**, não garante retorno e não substitui aconselhamento financeiro. Preço, taxas, slippage, liquidez, competição por prioridade e latência de rede podem causar perdas totais ou parciais do capital alocado.
+
+Toda estratégia deve ser validada em **modo simulação** (`SIMULATION=true`) e só deve ir para execução real após cumprir os critérios de prontidão descritos neste README. O usuário é o único responsável pelas decisões de configuração, alocação de capital e operação do bot.
+
+### Estado do projeto
+
+Este backend está em **desenvolvimento ativo**. Rotas, variáveis de ambiente, migrations e contratos de API podem mudar. A execução real é **bloqueada por padrão** e exige múltiplas confirmações explícitas (`SIMULATION=false`, `ENABLE_LIVE_TRADING=true`, chave privada carregada apenas no ambiente de execução e gate de paper trading satisfeito).
+
+### Licença
+
+Este projeto é distribuído sob a licença **MIT** (ou a licença definida no arquivo `LICENSE` do repositório). Consulte o arquivo para os termos completos.
+
+### Contato e contribuição
+
+- **Issues e pull requests:** abertos para correções, melhorias de robustez e documentação.
+- **Segurança:** não abra issues públicas para vulnerabilidades. Reporte de forma privada ao mantenedor.
+- **Repositório:** consulte o `README.md` raiz e o `.env.example` para a lista completa de variáveis e perfis de operação.
+
+### Lembrete final
+
+**Parar o bot nunca significa vender todas as posições.** Posições abertas, transações sem resultado conhecido e saídas travadas exigem reconciliação manual ou automática antes de novas entradas. Opere com capital que você pode perder.
+
