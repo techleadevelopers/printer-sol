@@ -13,11 +13,11 @@ A estratégia padrão é conservadora e observável: o bot só entra quando os f
 O bot foi desenhado para operar com regras de saída claras e mensuráveis, permitindo avaliar o PnL realizado por perfil, por faixa de score e por motivo de saída:
 
 ```
-- **Take-profit bruto:** 50% (configurável).
-- **Stop-loss:** 25% (configurável).
-- **Trailing stop:** 12%, armado após ganho de 10% sobre o custo.
-- **Max-hold:** `MAX_HOLD_SECONDS=300` (5 minutos) — fecha posições flat se não houver marca válida ou se o retorno ficar entre -10% e +5%.
-- **Saída por quarentena:** apenas para saídas travadas (`STUCK_EXIT_QUARANTINE_SECONDS=120s`), nunca em posições saudáveis.
+- Take-profit bruto: 50% (configurável).
+- Stop-loss: 25% (configurável).
+- Trailing stop: 12%, armado após ganho de 10% sobre o custo.
+- Max-hold: `MAX_HOLD_SECONDS=300` (5 minutos) — fecha posições flat se não houver marca válida ou se o retorno ficar entre -10% e +5%.
+- Saída por quarentena: apenas para saídas travadas (`STUCK_EXIT_QUARANTINE_SECONDS=120s`), nunca em posições saudáveis.
 ```
 
 O **P&L realizado** só inclui vendas concluídas. O **P&L aberto** é uma estimativa baseada na variação do market cap (não é valor garantido de venda). O relatório de desempenho separa **P&L live fechado** (deltas confirmados da carteira e taxas registradas) de **P&L estimado em aberto**.
@@ -27,8 +27,8 @@ O **P&L realizado** só inclui vendas concluídas. O **P&L aberto** é uma estim
 O bot escolhe **um perfil de entrada por candidato** e agrega os resultados separadamente (`PerformanceByProfile`), para comparar estratégias sem misturar métricas:
 
 
-- **Perfil A — primeiro pump:** entra nos primeiros segundos de vida do token. Foco em capturar o primeiro movimento. Não exige momentum nem holders.
-- **Perfil B — momentum validado:** entra quando o token já demonstrou atividade (volume, buy ratio, unique buyers, aceleração). Foco em continuidade de movimento com confirmação.
+- Perfil A — primeiro pump entra nos primeiros segundos de vida do token. Foco em capturar o primeiro movimento. Não exige momentum nem holders.
+- Perfil B — momentum validado: entra quando o token já demonstrou atividade (volume, buy ratio, unique buyers, aceleração). Foco em continuidade de movimento com confirmação.
 
 Cada perfil tem seu próprio **score 0–100** (volume, buy ratio, unique buyers, aceleração). O score **não bloqueia compras por padrão** (`MIN_ENTRY_SCORE_*=0`), mas é gravado em `Trade.EntryScore` e `risk_assessments.entry_score`, permitindo analisar `PerformanceByScoreBucket` (0–20, 20–40, 40–60, 60–80, 80–100) e só depois calibrar limites mínimos.
 
@@ -36,19 +36,19 @@ Cada perfil tem seu próprio **score 0–100** (volume, buy ratio, unique buyers
 
 Para ativar execução real, o bot exige **prova estatística em simulação** (`LIVE_UNLOCK_REQUIRES_PAPER=true`):
 ```
-- Pelo menos **7 dias** de histórico e **100 operações fechadas**.
-- **P&L líquido e expectativa positivos**.
-- **Win rate ≥ 45%**.
-- **Profit factor ≥ 1,2**.
-- **Drawdown máximo ≤ metade da banca inicial**.
-- Pelo menos **10 saídas por motivo**: take-profit, trailing, stop-loss e max-hold.
+- Pelo menos 7 dias de histórico e 100 operações fechadas.
+- P&L líquido e expectativa positivos.
+- Win rate ≥ 45%.
+- Profit factor ≥ 1,2.
+- Drawdown máximo ≤ metade da banca inicial.
+- Pelo menos 10 saídas por motivo: take-profit, trailing, stop-loss e max-hold.
 - Reconciliação limpa.
-- Retenção média ≤ **180 segundos**.
-- Taxas ≤ **15% do P&L bruto**.
-- Mais de **30% das saídas por trailing stop**.
+- Retenção média ≤ 180 segundos.
+- Taxas ≤ 15% do P&L bruto**.
+- Mais de 30% das saídas por trailing stop.
 ```
 
-O teste com 29 operações permanece bloqueado. Ou seja: **o bot só vai para live quando o PnL simulado provar que a estratégia funciona**.
+O teste com 29 operações permanece bloqueado. Ou seja: o bot só vai para live quando o PnL simulado provar que a estratégia funciona.
 
 ## Segurança e modo de execução
 
