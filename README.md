@@ -5,7 +5,8 @@ O Impressor Solana Bot é um backend em Go para execução de estratégias de tr
 A estratégia padrão é conservadora e observável: o bot só entra quando os filtros de mercado e momentum são satisfeitos, e sai por take-profit, trailing stop, stop-loss ou max-hold. O objetivo é capturar movimentos reais de preço com risco controlado — não é um "sniper cego" que compra todo mint.
 
 ```
-Aviso: O bot não promete lucro. Preço, taxas, slippage, liquidez e execução podem causar perdas. Toda estratégia é calibrável e deve ser validada em simulação antes de qualquer capital real.
+Aviso: O bot não promete lucro. Preço, taxas, slippage, liquidez e execução podem causar perdas.
+Toda estratégia é calibrável e deve ser validada em simulação antes de qualquer capital real.
 ```
 
 ### Estratégia de geração de PnL
