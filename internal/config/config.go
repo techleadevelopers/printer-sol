@@ -15,7 +15,7 @@ type Config struct {
 	HTTPAddr, DatabaseURL, DatabasePath, SimulationDatabaseURL, RealDatabaseURL, PrivateKey, KeyProviderRef, WalletPublicAddress, PumpPortalKey, PumpPortalURL, PumpPortalWS, AdminPassword, SOLUSDPriceURL string
 	SolscanAPIKey                                                                                                                                                                                        string
 	Simulation, EnableLiveTrading, LiveUnlockRequiresPaper, SkipPreflight, EnableRugCheck                                                                                                                  bool
-	UseWSMarketCap                                                                                                                                                                                        bool
+	UseWSMarketCap, PumpPortalDetection                                                                                                                                                                   bool
 	MaxTradeSOL, MaxDailyLossSOL, FeeReserveSOL, MaxExposureSOL, MaxSlippagePct, MaxPriorityFeeSOL, TradeUSD, SimulationBalanceSOL, TakeProfitGrossPct, StopLossPct, TrailingStopPct                        float64
 	SimulationBaseFeeSOL                                                                                                                                                                                    float64
 	TokenQueueSize, MaxOpenPositions, MaxConfirmationWaitSeconds, MaxSubmissionAttempts, RPCHealthCheckIntervalSeconds, TokenMaxAgeSeconds, MaxHoldSeconds, StuckExitQuarantineSeconds int
@@ -109,6 +109,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.UseWSMarketCap, err = boolEnv("USE_WS_MARKET_CAP", true); err != nil {
+		return c, err
+	}
+	if c.PumpPortalDetection, err = boolEnv("PUMPPORTAL_DETECTION", true); err != nil {
 		return c, err
 	}
 	if c.SimulationDatabaseURL != "" || c.RealDatabaseURL != "" {
@@ -473,7 +476,7 @@ func Load() (Config, error) {
 	if !c.Simulation && c.TradeUSD <= 0 {
 		return c, fmt.Errorf("live trading requires an explicit TRADE_USD greater than zero")
 	}
-	if c.Simulation && strings.TrimSpace(c.PumpPortalKey) == "" {
+	if c.Simulation && strings.TrimSpace(c.PumpPortalKey) == "" && c.PumpPortalDetection {
 		return c, fmt.Errorf("simulation requires PUMPPORTAL_API_KEY to receive token price updates for virtual exits")
 	}
 	if !c.Simulation && (c.StopLossPct <= 0 || c.MaxHoldSeconds <= 0) {

@@ -48,6 +48,24 @@ type MarketDecisionLike struct {
 	Reason string
 }
 
+// LogNotification é a representação local (desacoplada do rpcmanager) de uma
+// notificação de log relevante para descoberta de novos tokens via RPC.
+//
+// Nota: o campo Err é error (não any) para poder ser passado a zap.Error.
+// O adapter em main.go converte rpcmanager.LogNotification → tokenmonitor.LogNotification.
+type LogNotification struct {
+	Signature string
+	Logs      []string
+	Err       error
+	Slot      uint64
+}
+
+// LogSubscriber abstrai a subscrição de logs RPC para descoberta de novos
+// tokens quando PUMPPORTAL_DETECTION=false.
+type LogSubscriber interface {
+	SubscribeNewTokenLogs(ctx context.Context, programID string, handler func(LogNotification)) error
+}
+
 type Entrier interface {
 	BuyNewTokenUSD(context.Context, string, float64, float64, float64, string, string) (string, error)
 	ClosePaperPosition(context.Context, string, float64, string) (string, error)
@@ -84,7 +102,14 @@ type Settings struct {
 	Momentum              MomentumConfig
 	Profiles              Profiles
 	Holders               HolderSource
-	MaxOpenPositions      int // NOVO: limite de posições abertas (vem do MAX_OPEN_POSITIONS)
+	MaxOpenPositions      int           // limite de posições abertas (MAX_OPEN_POSITIONS)
+	PumpPortalDetection   bool          // respeita a flag PUMPPORTAL_DETECTION
+	LogSubscriber         LogSubscriber // descoberta via RPC quando PumpPortal está desligado
+	// FetchEntryMetrics injeta rpcs.BondingCurveEntryMetrics para preencher
+	// MarketCapSOL nos eventos descobertos via RPC (que não trazem market cap
+	// no payload). Sem isto o consumeEvent rejeita com
+	// "missing creation market cap for take-profit baseline".
+	FetchEntryMetrics func(ctx context.Context, mint string) (float64, float64, error)
 }
 
 type candidate struct {
@@ -159,7 +184,11 @@ type Monitor struct {
 	priceSourceAlerted              bool
 	rpcRateLimitFailures            int
 	rpcRateLimitUntil               time.Time
-	maxOpenPositions                int // NOVO
+	maxOpenPositions                int
+	pumpPortalDetection             bool
+	logSubscriber                   LogSubscriber
+	// obter market cap via RPC para eventos descobertos sem payload.
+	fetchEntryMetrics func(ctx context.Context, mint string) (float64, float64, error)
 }
 
 const exitRetryDelay = 5 * time.Second
@@ -169,6 +198,9 @@ const staleSimulationSellRecoveryAge = time.Minute
 const staleLiveSellRecoveryAge = time.Minute
 const defaultStuckExitQuarantineAge = 2 * time.Minute
 const creationResolveTimeout = 3 * time.Second
+
+// timeout para a chamada RPC que obtém o market cap de entrada.
+const entryMetricsTimeout = 3 * time.Second
 
 func (m *Monitor) runOperation(fn func()) bool {
 	return m.runOperationAt(m.resetGeneration.Load(), fn)
@@ -293,6 +325,7 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		Profiles:              DefaultProfiles(),
 		Holders:               NoopHolderSource{},
 		MaxOpenPositions:      12,
+		PumpPortalDetection:   true,
 	}
 	if len(options) > 0 {
 		option := options[0]
@@ -334,6 +367,9 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		if option.Holders != nil {
 			settings.Holders = option.Holders
 		}
+		settings.PumpPortalDetection = option.PumpPortalDetection
+		settings.LogSubscriber = option.LogSubscriber
+		settings.FetchEntryMetrics = option.FetchEntryMetrics
 	}
 	if settings.SnipeConcurrency > 10 {
 		settings.SnipeConcurrency = 10
@@ -373,24 +409,39 @@ func New(ws, key string, size int, db *database.DB, s *strategy.Strategy, entry 
 		profiles:         settings.Profiles,
 		holders:          settings.Holders,
 		bus:              b, log: l,
-		maxOpenPositions: settings.MaxOpenPositions,
+		maxOpenPositions:    settings.MaxOpenPositions,
+		pumpPortalDetection: settings.PumpPortalDetection,
+		logSubscriber:       settings.LogSubscriber,
+		fetchEntryMetrics:   settings.FetchEntryMetrics,
 	}
 	if mon.creationResolver == nil {
 		l.Warn("tokenmonitor: CreationResolver is nil; tokens without a payload timestamp will be rejected by the age gate")
 	}
 	return mon
 }
+
 func (m *Monitor) SetTrailingStopPct(pct float64) {
 	if pct > 0 {
 		m.trailingStop = pct
 	}
 }
+
 func (m *Monitor) MaxHoldSeconds() int {
 	if m == nil {
 		return 0
 	}
 	return int(m.maxHold / time.Second)
 }
+
+// Run inicia todos os workers do Monitor.
+//
+// NOTA IMPORTANTE sobre PUMPPORTAL_DETECTION:
+//   - Se m.pumpPortalDetection == true, mantém o comportamento original: liga ao
+//     WebSocket da PumpPortal (feed de new-token) via runConnections.
+//   - Se m.pumpPortalDetection == false, NÃO liga ao WebSocket da PumpPortal
+//     (evita o ban de 1h). A descoberta via RPC é arrancada AQUI dentro do Run
+//     (go m.runRPCDiscovery(ctx)), mantendo o ciclo de vida do Monitor
+//     consistente — tudo o que é do monitor arranca e morre com ele.
 func (m *Monitor) Run(ctx context.Context) {
 	m.restoreOpenPositions()
 	go m.consume(ctx)
@@ -399,7 +450,15 @@ func (m *Monitor) Run(ctx context.Context) {
 	go m.runSeenJanitor(ctx)
 	go m.runCandidateChecker(ctx)
 	go m.runPricePoller(ctx)
-	m.runConnections(ctx)
+
+	if m.pumpPortalDetection {
+		m.runConnections(ctx)
+		return
+	}
+
+	m.log.Info("PumpPortal WebSocket desligado (PUMPPORTAL_DETECTION=false). Descoberta via RPC ativa.")
+	go m.runRPCDiscovery(ctx)
+	<-ctx.Done()
 }
 
 func (m *Monitor) runSeenJanitor(ctx context.Context) {
@@ -784,10 +843,134 @@ func (m *Monitor) alertMissingMark(mint string, markErr error) {
 		m.log.Warn("record missing-mark risk alert", zap.String("mint", mint), zap.Error(logErr))
 	}
 }
+
+// runRPCDiscovery arranca a descoberta de novos tokens via subscrição de logs
+// RPC. É usada quando PUMPPORTAL_DETECTION=false para evitar o ban de 1h da
+// PumpPortal. Se LogSubscriber não estiver configurado, apenas regista um aviso
+// e mantém-se à espera do contexto.
+//
+// O parser de logs entrega cada notificação a handleRPCNotification, que é
+// responsável por obter o market cap via RPC (FetchEntryMetrics) e injetar o
+// Event — caso contrário o consumeEvent rejeita o token por MarketCapSOL=0.
+func (m *Monitor) runRPCDiscovery(ctx context.Context) {
+	if m.logSubscriber == nil {
+		m.log.Warn("tokenmonitor: LogSubscriber não configurado; descoberta via RPC desativada (PumpPortal também desligado)")
+		<-ctx.Done()
+		return
+	}
+	handler := func(n LogNotification) {
+		m.handleRPCNotification(ctx, n)
+	}
+	if err := m.logSubscriber.SubscribeNewTokenLogs(ctx, pumpFunProgramIDForDiscovery, handler); err != nil {
+		m.log.Warn("tokenmonitor: falha ao subscrever logs RPC para descoberta", zap.Error(err))
+	}
+	<-ctx.Done()
+}
+
+// handleRPCNotification recebe uma notificação de log RPC, extrai o mint via
+// parser Anchor do Pump.fun (CreateEvent) e, como o payload RPC não traz market
+// cap, chama FetchEntryMetrics para obter o valor antes de injetar o Event.
+// Sem esta chamada, o consumeEvent rejeita o token com
+// "missing creation market cap for take-profit baseline".
+func (m *Monitor) handleRPCNotification(ctx context.Context, n LogNotification) {
+	if n.Err != nil {
+		m.log.Debug("RPC new-token log subscription error", zap.Error(n.Err))
+		return
+	}
+	if m.resetting.Load() || ctx.Err() != nil {
+		return
+	}
+
+	mint, ok := extractMintFromPumpFunLogs(n.Logs)
+	if !ok || mint == "" {
+		m.log.Debug("RPC new-token log received without a parsable mint",
+			zap.String("signature", n.Signature),
+			zap.Int("logs", len(n.Logs)))
+		return
+	}
+
+	received := time.Now().UTC()
+	if !m.rememberMint(mint, received) {
+		return
+	}
+
+	marketCapSOL := 0.0
+	if m.fetchEntryMetrics != nil {
+		rpcCtx, cancel := context.WithTimeout(ctx, entryMetricsTimeout)
+		marketCap, _, err := m.fetchEntryMetrics(rpcCtx, mint)
+		cancel()
+		if err != nil {
+			m.log.Warn("RPC entry metrics unavailable; token will be rejected by market-cap gate",
+				zap.String("mint", mint),
+				zap.String("signature", n.Signature),
+				zap.Error(err))
+		} else if marketCap > 0 {
+			marketCapSOL = marketCap
+		}
+	} else {
+		m.log.Warn("tokenmonitor: FetchEntryMetrics não injetado; tokens descobertos via RPC serão rejeitados por MarketCapSOL=0",
+			zap.String("mint", mint))
+	}
+
+	event := Event{
+		Mint:         mint,
+		Signature:    n.Signature,
+		Received:     received,
+		Created:      time.Time{}, // resolvido em consumeEvent via CreationResolver
+		MarketCapSOL: marketCapSOL,
+		Raw:          buildRPCRawPayload(n),
+	}
+
+	m.bus.Publish("token_detected", map[string]any{
+		"mint": mint, "creator": "", "receivedAt": received.UTC(), "source": "rpc_logs",
+	})
+	if !m.addCandidate(event) {
+		m.rejectCandidate(event, "candidate queue full")
+	}
+}
+
+func buildRPCRawPayload(n LogNotification) string {
+	raw, err := json.Marshal(map[string]any{
+		"source":    "rpc_logs",
+		"signature": n.Signature,
+		"slot":      n.Slot,
+		"logs":      n.Logs,
+	})
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// runConnections mantém a ligação WebSocket à PumpPortal com reconexão automática.
+//
+// IMPORTANTE: A PumpPortal aplica bans de IP de 1 HORA quando deteta abuso, e
+// RENOVA o ban a cada tentativa de conexão durante esse período. Por isso, quando
+// recebemos "bad handshake" (HTTP 403), NÃO devemos tentar reconectar em backoff
+// curto — temos de esperar a hora completa para o ban expirar.
 func (m *Monitor) runConnections(ctx context.Context) {
 	backoff := time.Second
 	for ctx.Err() == nil {
-		if err := m.connect(ctx); err != nil {
+		err := m.connect(ctx)
+		if err != nil {
+			errStr := err.Error()
+
+			if strings.Contains(errStr, "bad handshake") || strings.Contains(errStr, "403") {
+				m.log.Error("PumpPortal ban detetado (bad handshake). A aguardar 1 hora para o ban expirar.",
+					zap.Error(err))
+				m.bus.Publish("operational_error", map[string]any{
+					"component": "token_monitor",
+					"message":   "PumpPortal IP ban detetado; a aguardar 1h antes de reconectar",
+				})
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(1 * time.Hour):
+					backoff = time.Second
+					continue
+				}
+			}
+
 			m.log.Warn("token websocket disconnected; reconnect scheduled",
 				zap.Error(err), zap.Duration("retry_in", backoff))
 			select {
@@ -803,7 +986,9 @@ func (m *Monitor) runConnections(ctx context.Context) {
 		}
 	}
 }
+
 func (m *Monitor) Connected() bool { return m.connected.Load() }
+
 func (m *Monitor) connect(ctx context.Context) error {
 	u, _ := url.Parse(m.ws)
 	q := u.Query()
@@ -1003,6 +1188,7 @@ func (m *Monitor) connect(ctx context.Context) error {
 		})
 	}
 }
+
 func (m *Monitor) consume(ctx context.Context) {
 	concurrency := m.snipeConcurrency
 	if concurrency < 1 {
@@ -1373,8 +1559,7 @@ func (m *Monitor) markTradeLocked(ctx context.Context, mint string) bool {
 	}
 	if err != nil {
 		m.log.Warn("update take-profit mark", zap.Error(err))
-		return false
-	}
+		return false	}
 	if legacyBaselineRebased {
 		detail := "legacy position was re-anchored to a fresh RPC spot price; P&L before re-anchoring is unavailable"
 		payload, _ := json.Marshal(map[string]any{"mint": mint, "detail": detail})

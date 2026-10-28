@@ -9,10 +9,15 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"github.com/gorilla/websocket"
-	"go.uber.org/zap"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
 	"solana-sniper-backend/internal/bot"
 	"solana-sniper-backend/internal/config"
 	"solana-sniper-backend/internal/database"
@@ -21,10 +26,6 @@ import (
 	"solana-sniper-backend/internal/rpcmanager"
 	"solana-sniper-backend/internal/tokenmonitor"
 	"solana-sniper-backend/internal/wallet"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
 )
 
 type Server struct {
@@ -69,6 +70,7 @@ func New(db *database.DB, w *wallet.Wallet, r *rpcmanager.Manager, e *execution.
 	mux.HandleFunc("/ws/events", s.ws)
 	return corsPolicy(mux)
 }
+
 func method(w http.ResponseWriter, r *http.Request, m string) bool {
 	if r.Method != m {
 		fail(w, 405, "method_not_allowed", "method not allowed")
@@ -76,6 +78,7 @@ func method(w http.ResponseWriter, r *http.Request, m string) bool {
 	}
 	return true
 }
+
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
@@ -86,53 +89,54 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, map[string]any{"status": "ok", "eventMonitorStatus": monitorState, "checkedAt": time.Now().UTC()})
 }
+
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
 	positions, err := s.db.OpenPositionCount()
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load open position count")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load open position count", err)
 		return
 	}
 	detected, err := s.db.TokenEventCount()
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load detected token count")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load detected token count", err)
 		return
 	}
 	analyzed, err := s.db.RiskAssessmentCount()
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load token analysis count")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load token analysis count", err)
 		return
 	}
 	openPnl, err := s.db.OpenPnlSOLFresh(s.cfg.Simulation, s.positionMarkCutoff(time.Now().UTC()))
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load estimated open P&L")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load estimated open P&L", err)
 		return
 	}
 	unmarkedPositions, err := s.db.UnmarkedOpenPositionCount(s.cfg.Simulation)
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load position price coverage")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load position price coverage", err)
 		return
 	}
 	costs, err := s.db.TradeCostsSOL()
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load transaction costs")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load transaction costs", err)
 		return
 	}
 	performance, err := s.db.Performance(s.cfg.Simulation)
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load realized trade performance")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load realized trade performance", err)
 		return
 	}
 	trades, err := s.tradeItems(s.cfg.Simulation)
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load recent trades")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load recent trades", err)
 		return
 	}
 	tradeCount, err := s.db.TradeCount()
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load trade count")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load trade count", err)
 		return
 	}
 	now := time.Now().UTC()
@@ -140,13 +144,13 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	periodEnd := periodStart.AddDate(0, 0, 1)
 	periodTotal, positive, negative, err := s.db.TradePeriodStats(periodStart, periodEnd)
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load daily trade results")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load daily trade results", err)
 		return
 	}
 	if s.cfg.Simulation {
 		periodTrades, periodErr := s.db.SimulationTrades(periodStart, periodEnd)
 		if periodErr != nil {
-			fail(w, http.StatusInternalServerError, "database_unavailable", "could not load daily paper trade results")
+			s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load daily paper trade results", periodErr)
 			return
 		}
 		periodTotal, positive, negative = 0, 0, 0
@@ -161,14 +165,14 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	cumulativeResult, err := s.cumulativeResult(s.cfg.Simulation)
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load P&L history")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load P&L history", err)
 		return
 	}
 	var staleMarks map[string]any
 	if s.cfg.Simulation {
 		total, flat, pctFlat, statsErr := s.db.PaperMarkStats()
 		if statsErr != nil {
-			fail(w, http.StatusInternalServerError, "database_unavailable", "could not load paper mark statistics")
+			s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load paper mark statistics", statsErr)
 			return
 		}
 		staleMarks = map[string]any{"total": total, "flat": flat, "pctFlat": pctFlat}
@@ -189,12 +193,12 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Simulation {
 		run, runErr := s.db.SimulationRun()
 		if runErr != nil {
-			fail(w, http.StatusServiceUnavailable, "simulation_not_started", "simulation session is not initialized")
+			s.failWithLog(w, http.StatusServiceUnavailable, "simulation_not_started", "simulation session is not initialized", runErr)
 			return
 		}
 		summary, sessionTrades, allFeesPaid, summaryErr := s.simulationReportData(run, run.StartedAt, now.Add(time.Nanosecond))
 		if summaryErr != nil {
-			fail(w, http.StatusInternalServerError, "database_unavailable", "could not load paper performance")
+			s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load paper performance", summaryErr)
 			return
 		}
 		simSummary = &summary
@@ -240,8 +244,8 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	dashboard := map[string]any{
 		"botStatus": string(s.controller.State()), "mode": s.mode(), "walletBalanceSol": walletBalance,
 		"walletBalanceAvailable": balanceAvailable,
-		"walletBalanceLow": balanceAvailable && balance < s.engine.Limits().FeeReserveSOL,
-		"feesReserveSol": s.engine.Limits().FeeReserveSOL,
+		"walletBalanceLow":       balanceAvailable && balance < s.engine.Limits().FeeReserveSOL,
+		"feesReserveSol":         s.engine.Limits().FeeReserveSOL,
 		"detectedTokens": detected, "analyzedTokens": analyzed, "tradesCount": tradeCount, "openPositions": positions,
 		"sellAttempts": performance.SellAttempts, "failedSellAttempts": performance.FailedSellAttempts,
 		"realizedPnlSol": netRealizedPnl, "grossRealizedPnlSol": grossRealizedPnl,
@@ -249,7 +253,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		"totalEstimatedPnlComplete": unmarkedPositions == 0,
 		"netPnlSol": totalEstimatedPnl, "estimatedOpenPnlComplete": unmarkedPositions == 0,
 		"unmarkedOpenPositions": unmarkedPositions, "costsSol": feesPaid, "feesPaidSol": feesPaid,
-"openPnlBasis":     "bonding_curve_spot_price_ratio_estimate",
+		"openPnlBasis":     "bonding_curve_spot_price_ratio_estimate",
 		"performance":      performancePayload,
 		"cumulativeResult": cumulativeResult,
 		"tradesByPeriod":   []map[string]any{{"period": now.Format("2006-01-02"), "total": periodTotal, "positive": positive, "negative": negative}},
@@ -258,7 +262,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.Simulation {
 		dashboard["virtualEquitySol"] = virtualEquity
-dashboard["simulationBalanceSol"] = simSummary.BalanceStartSOL
+		dashboard["simulationBalanceSol"] = simSummary.BalanceStartSOL
 		dashboard["simulationResetBalanceSol"] = s.cfg.SimulationBalanceSOL
 		dashboard["simulation"] = simSummary
 		dashboard["closedTrades"] = simSummary.TotalTrades
@@ -267,23 +271,35 @@ dashboard["simulationBalanceSol"] = simSummary.BalanceStartSOL
 	dashboard["transactionsCount"] = tradeCount
 	write(w, 200, dashboard)
 }
+
 func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
 	rows, e := s.db.ListTokens()
 	if e != nil {
-		fail(w, 500, "database_unavailable", "database unavailable")
+		s.failWithLog(w, 500, "database_unavailable", "database unavailable", e)
 		return
 	}
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var mint, creator, at, reason, tradeSide, tradeState, positionState, postEntryRiskReason string
-		var latency int64
-		var approved sql.NullBool
-		if err := rows.Scan(&mint, &creator, &at, &latency, &approved, &reason, &tradeSide, &tradeState, &positionState, &postEntryRiskReason); err != nil {
-			fail(w, http.StatusInternalServerError, "database_unavailable", "could not read token state")
+		var (
+			mint, creator, at, reason, tradeSide, tradeState, positionState, postEntryRiskReason string
+			entryProfile                                                                        string
+			latency                                                                             int64
+			approved                                                                            sql.NullBool
+			entryScore                                                                          sql.NullFloat64
+		)
+		// ListTokens devolve 12 colunas. A ordem abaixo tem de coincidir com o SELECT.
+		// SELECT: mint, creator, received_at, latency_ms, approved, reason,
+		//         entry_profile, entry_score, trade_side, trade_state, position_state, post_entry_risk
+		if err := rows.Scan(
+			&mint, &creator, &at, &latency, &approved, &reason,
+			&entryProfile, &entryScore,
+			&tradeSide, &tradeState, &positionState, &postEntryRiskReason,
+		); err != nil {
+			s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not read token state", err)
 			return
 		}
 		analysisStatus, riskResult := "detected", "not_assessed"
@@ -315,23 +331,37 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 		if postEntryRiskReason != "" {
 			postEntryRisk = postEntryRiskReason
 		}
+		var entryProfileValue any
+		if entryProfile != "" {
+			entryProfileValue = entryProfile
+		}
+		var entryScoreValue any
+		if entryScore.Valid {
+			entryScoreValue = entryScore.Float64
+		}
 		out = append(out, map[string]any{
 			"id": mint, "detectedAt": at, "name": nil, "symbol": nil, "mint": mint,
 			"creatorWallet": creator, "analysisStatus": analysisStatus,
 			"liquiditySol": nil, "tradeCount": nil, "riskResult": riskResult,
 			"decisionReason": decisionReason, "postEntryRiskReason": postEntryRisk,
+			"entryProfile": entryProfileValue, "entryScore": entryScoreValue,
 			"operationStatus": operationStatus,
 		})
 	}
+	if err := rows.Err(); err != nil {
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not read token rows", err)
+		return
+	}
 	write(w, 200, map[string]any{"items": out, "nextCursor": nil})
 }
+
 func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
 	rows, e := s.db.ListPositionsForMode(s.cfg.Simulation)
 	if e != nil {
-		fail(w, 500, "database_unavailable", "database unavailable")
+		s.failWithLog(w, 500, "database_unavailable", "database unavailable", e)
 		return
 	}
 	defer rows.Close()
@@ -343,7 +373,7 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(&mint, &q, &cost, &status, &opened, &updated,
 			&entryMarketCap, &currentMarketCap, &markUpdated, &markSource,
 			&entryTokenPrice, &currentTokenPrice, &positionFees, &realized, &latestSellState); err != nil {
-			fail(w, http.StatusInternalServerError, "database_unavailable", "could not read position data")
+			s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not read position data", err)
 			return
 		}
 		quantity, _ := strconv.ParseFloat(q, 64)
@@ -403,57 +433,84 @@ func (s *Server) positions(w http.ResponseWriter, r *http.Request) {
 		out = append(out, position)
 	}
 	if err := rows.Err(); err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not read positions")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not read positions", err)
 		return
 	}
 	write(w, 200, map[string]any{"items": out, "mode": s.mode()})
 }
+
 func (s *Server) trades(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
 	items, err := s.tradeItems(s.cfg.Simulation)
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "database_unavailable", "could not load trades")
+		s.failWithLog(w, http.StatusInternalServerError, "database_unavailable", "could not load trades", err)
 		return
 	}
 	write(w, 200, map[string]any{"items": items, "nextCursor": nil})
 }
+
+// tradeItems devolve a lista de trades genérica. As chamadas a SimulationRun /
+// SimulationTrades são apenas enriquecimento opcional (NetPnLSOL/GrossPnLSOL);
+// se falharem, logamos um Warn e seguimos com o que ListTrades devolveu, para
+// que o dashboard nunca rebente só porque a sessão de simulação não existe.
 func (s *Server) tradeItems(simulation bool) ([]map[string]any, error) {
 	rows, err := s.db.ListTrades()
 	if err != nil {
+		if s.log != nil {
+			s.log.Warn("tradeItems: ListTrades failed", zap.Error(err))
+		}
 		return nil, err
 	}
 	defer rows.Close()
+
 	items := []map[string]any{}
 	simNetByID := make(map[string]database.SimulationTrade)
 	liveNetByID := make(map[string]database.SimulationTrade)
+
 	if simulation {
 		run, runErr := s.db.SimulationRun()
 		if runErr != nil {
-			return nil, runErr
-		}
-		simTrades, simErr := s.db.SimulationTrades(run.StartedAt, time.Now().UTC().Add(time.Nanosecond))
-		if simErr != nil {
-			return nil, simErr
-		}
-		for _, trade := range simTrades {
-			simNetByID[trade.ID] = trade
+			if s.log != nil {
+				s.log.Warn("tradeItems: SimulationRun unavailable; continuing without simulation net P&L enrichment",
+					zap.Error(runErr))
+			}
+		} else {
+			simTrades, simErr := s.db.SimulationTrades(run.StartedAt, time.Now().UTC().Add(time.Nanosecond))
+			if simErr != nil {
+				if s.log != nil {
+					s.log.Warn("tradeItems: SimulationTrades failed; continuing without simulation net P&L enrichment",
+						zap.Error(simErr))
+				}
+			} else {
+				for _, trade := range simTrades {
+					simNetByID[trade.ID] = trade
+				}
+			}
 		}
 	} else {
 		liveTrades, liveErr := s.db.LiveTrades(time.Time{}, time.Now().UTC().Add(time.Nanosecond))
 		if liveErr != nil {
-			return nil, liveErr
-		}
-		for _, trade := range liveTrades {
-			liveNetByID[trade.ID] = trade
+			if s.log != nil {
+				s.log.Warn("tradeItems: LiveTrades failed; continuing without live net P&L enrichment",
+					zap.Error(liveErr))
+			}
+		} else {
+			for _, trade := range liveTrades {
+				liveNetByID[trade.ID] = trade
+			}
 		}
 	}
+
 	for rows.Next() {
 		var id, mint, side, quantityText, signature, state, createdAt, exitReason string
+		var entryProfile string
+		var entryScore sql.NullFloat64
 		var requested, executed, effectivePrice, fees, slippage float64
 		var realized sql.NullFloat64
-		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &effectivePrice, &fees, &slippage, &signature, &state, &createdAt, &realized, &exitReason); err != nil {
+		// ListTrades devolve 16 colunas. A ordem do Scan tem de coincidir com o SELECT.
+		if err := rows.Scan(&id, &mint, &side, &quantityText, &requested, &executed, &effectivePrice, &fees, &slippage, &signature, &state, &createdAt, &realized, &exitReason, &entryProfile, &entryScore); err != nil {
 			return nil, err
 		}
 		quantity, _ := strconv.ParseFloat(quantityText, 64)
@@ -469,7 +526,7 @@ func (s *Server) tradeItems(simulation bool) ([]map[string]any, error) {
 			"side": side, "quantity": quantity, "requestedValueSol": requested,
 			"buyValueSol": nil, "sellValueSol": nil, "executedValueSol": nil, "feesSol": fees,
 			"effectivePriceSol": nil,
-			"slippage": slippage, "grossPnlSol": nil, "netPnlSol": nil, "realizedPnlSol": nil,
+			"slippage":          slippage, "grossPnlSol": nil, "netPnlSol": nil, "realizedPnlSol": nil,
 			"exitReason": exitReason, "transactionId": nil, "signature": nil, "status": status,
 		}
 		if !isCompletedTradeState(state) {
@@ -561,6 +618,7 @@ func (s *Server) cumulativeResult(simulation bool) ([]map[string]any, error) {
 	}
 	return result, nil
 }
+
 func simulationBalanceHistory(run database.SimulationRun, trades []database.SimulationTrade, currentEquity float64, now time.Time) []map[string]any {
 	history := make([]map[string]any, 0, len(trades)+2)
 	history = append(history, map[string]any{"timestamp": run.StartedAt, "value": run.BalanceStartSOL})
@@ -606,12 +664,14 @@ func positionMarkMaxAge(pollSeconds int) time.Duration {
 func (s *Server) positionMarkCutoff(now time.Time) time.Time {
 	return now.Add(-positionMarkMaxAge(s.cfg.PricePollSeconds))
 }
+
 func (s *Server) mode() string {
 	if s.cfg.Simulation {
 		return "simulation"
 	}
 	return "real"
 }
+
 func (s *Server) balanceSOL(ctx context.Context) (float64, bool) {
 	if s.cfg.Simulation {
 		balance, err := s.db.SimulationAvailableBalanceSOL(s.engine.SimulationBalanceSOL())
@@ -630,25 +690,27 @@ func (s *Server) balanceSOL(ctx context.Context) (float64, bool) {
 	}
 	return 0, false
 }
+
 func (s *Server) rpcsList(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
 	}
 	write(w, 200, map[string]any{"items": s.rpcs.Endpoints(), "available": s.rpcs.Available()})
 }
+
 func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		write(w, 200, map[string]any{
-			"simulation":             s.cfg.Simulation,
-			"liveTradingEnabled":     s.cfg.EnableLiveTrading,
-			"maxHoldSeconds":         s.cfg.MaxHoldSeconds,
+			"simulation":              s.cfg.Simulation,
+			"liveTradingEnabled":      s.cfg.EnableLiveTrading,
+			"maxHoldSeconds":          s.cfg.MaxHoldSeconds,
 			"effectiveMaxHoldSeconds": s.monitor.MaxHoldSeconds(),
-"entryDelaySeconds":      s.cfg.EntryDelaySeconds,
-"tokenMaxAgeSeconds":     s.cfg.TokenMaxAgeSeconds,
-"minMarketCapSol":        s.cfg.MinMarketCapSOL,
-"maxMarketCapSol":        s.cfg.MaxMarketCapSOL,
-"useWsMarketCap":         s.cfg.UseWSMarketCap,
-			"limits":                 s.engine.Limits(),
+			"entryDelaySeconds":       s.cfg.EntryDelaySeconds,
+			"tokenMaxAgeSeconds":      s.cfg.TokenMaxAgeSeconds,
+			"minMarketCapSol":         s.cfg.MinMarketCapSOL,
+			"maxMarketCapSol":         s.cfg.MaxMarketCapSOL,
+			"useWsMarketCap":          s.cfg.UseWSMarketCap,
+			"limits":                  s.engine.Limits(),
 		})
 		return
 	}
@@ -669,6 +731,7 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.SetSetting("risk_limits", string(b))
 	write(w, 200, map[string]any{"limits": l})
 }
+
 func (s *Server) walletInfo(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "GET") {
 		return
@@ -686,6 +749,7 @@ func (s *Server) walletInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, result)
 }
+
 func (s *Server) admin(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
@@ -695,6 +759,7 @@ func (s *Server) admin(h http.HandlerFunc) http.HandlerFunc {
 		h(w, r)
 	}
 }
+
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
 		return
@@ -711,6 +776,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusOK, map[string]string{"token": s.sessionToken()})
 }
+
 func (s *Server) authorized(r *http.Request) bool {
 	header := r.Header.Get("Authorization")
 	if !strings.HasPrefix(header, "Bearer ") {
@@ -719,9 +785,11 @@ func (s *Server) authorized(r *http.Request) bool {
 	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
 	return s.validSessionToken(token, time.Now().UTC())
 }
+
 func (s *Server) sessionToken() string {
 	return s.sessionTokenAt(time.Now().UTC())
 }
+
 func (s *Server) sessionTokenAt(now time.Time) string {
 	payload := strconv.FormatInt(now.UTC().Unix(), 10)
 	mac := hmac.New(sha256.New, []byte(s.cfg.AdminPassword))
@@ -729,6 +797,7 @@ func (s *Server) sessionTokenAt(now time.Time) string {
 	token := payload + "." + hex.EncodeToString(mac.Sum(nil))
 	return base64.RawURLEncoding.EncodeToString([]byte(token))
 }
+
 func (s *Server) validSessionToken(token string, now time.Time) bool {
 	if token == "" || len(token) > 256 {
 		return false
@@ -754,6 +823,7 @@ func (s *Server) validSessionToken(token string, now time.Time) bool {
 	expected := hex.EncodeToString(mac.Sum(nil))
 	return subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expected)) == 1
 }
+
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
 		return
@@ -761,6 +831,7 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	s.controller.Stop()
 	write(w, 200, map[string]any{"state": s.controller.State(), "positionsRetained": true})
 }
+
 func (s *Server) pause(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
 		return
@@ -768,6 +839,7 @@ func (s *Server) pause(w http.ResponseWriter, r *http.Request) {
 	s.controller.Pause()
 	write(w, 200, map[string]any{"state": s.controller.State()})
 }
+
 func (s *Server) resume(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
 		return
@@ -775,6 +847,7 @@ func (s *Server) resume(w http.ResponseWriter, r *http.Request) {
 	s.controller.Resume()
 	write(w, 200, map[string]any{"state": s.controller.State()})
 }
+
 func (s *Server) emergency(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
 		return
@@ -783,7 +856,7 @@ func (s *Server) emergency(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, map[string]any{"state": s.controller.State(), "positionsRetained": true})
 }
 
-// cors handles browser preflight before routes perform method or auth checks.
+// corsPolicy handles browser preflight before routes perform method or auth checks.
 // Origins are explicit: credentials are never combined with a wildcard origin.
 func corsPolicy(next http.Handler) http.Handler {
 	allowed := configuredOrigins()
@@ -810,6 +883,7 @@ func corsPolicy(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
 func configuredOrigins() map[string]struct{} {
 	allowed := map[string]struct{}{
 		"https://solana-sniper-bot-dashboard.vercel.app": {},
@@ -822,10 +896,12 @@ func configuredOrigins() map[string]struct{} {
 	}
 	return allowed
 }
+
 func (s *Server) originAllowed(origin string) bool {
 	_, ok := configuredOrigins()[origin]
 	return ok
 }
+
 func (s *Server) rpcTest(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
 		return
@@ -844,6 +920,7 @@ func (s *Server) rpcTest(w http.ResponseWriter, r *http.Request) {
 	defer c()
 	write(w, 200, s.rpcs.Test(ctx, v.URL))
 }
+
 func (s *Server) rpcSelect(w http.ResponseWriter, r *http.Request) {
 	if !method(w, r, "POST") {
 		return
@@ -921,6 +998,7 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, 8192)
 	d := json.NewDecoder(r.Body)
@@ -931,15 +1009,43 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	}
 	return true
 }
+
 func write(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
-w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
 func fail(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
-w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "message": message}})
+}
+
+// failWithLog regista o erro real com o logger do servidor e devolve ao cliente
+// a mensagem genérica + o detalhe técnico (campo "detail"), para que o browser
+// consiga mostrar a causa exata em vez de esconder tudo atrás de "database_unavailable".
+func (s *Server) failWithLog(w http.ResponseWriter, status int, code, message string, cause error) {
+	if s != nil && s.log != nil && cause != nil {
+		s.log.Warn("api request failed",
+			zap.String("code", code),
+			zap.String("message", message),
+			zap.Error(cause))
+	}
+	detail := ""
+	if cause != nil {
+		detail = cause.Error()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+			"detail":  detail,
+		},
+	})
 }

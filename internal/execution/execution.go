@@ -534,6 +534,7 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 	if e.simulation {
 		if r.Side == "buy" {
 			if err := e.db.FinalizeSimulationBuy(id, r.Mint, r.Amount, simulationFees); err != nil {
+				_ = e.db.MarkTradeFailed(id)
 				return id, fmt.Errorf("record simulated position: %w", err)
 			}
 		} else {
@@ -541,6 +542,11 @@ func (e *Engine) Execute(ctx context.Context, r Request) (string, error) {
 				if resolutionErr := e.resolveSimulationSellFinalizationError(id, r, simulationFees, finalizeErr); resolutionErr != nil {
 					return id, resolutionErr
 				}
+				e.emit("sell_failed", map[string]any{
+					"tradeId": id, "mint": r.Mint, "simulation": true,
+					"reason": "simulated sell could not be finalized",
+				})
+				return id, nil
 			}
 		}
 		e.emit(r.Side+"_confirmed", map[string]any{"tradeId": id, "mint": r.Mint, "simulation": true, "profile": entryProfile, "score": entryScore})
@@ -1177,7 +1183,7 @@ func (e *Engine) validatePreparedTransaction(tx *solana.Transaction, request Req
 		if request.Side == "sell" {
 			return validateProtectedPumpSell(tx, prepared)
 		}
-		return validateProtectedPumpBuy(tx, request.Mint)
+		return validateProtectedPumpBuy(tx, request.Mint, request, prepared)
 
 	case MarketPumpSwap:
 		return validatePumpSwapTransaction(tx, request, prepared, prepared.market)
@@ -1306,6 +1312,14 @@ func validatePumpSwapTransaction(tx *solana.Transaction, request Request, prepar
 			return err
 		}
 
+		requestedMint, err := solana.PublicKeyFromBase58(request.Mint)
+		if err != nil {
+			return fmt.Errorf("invalid requested mint: %w", err)
+		}
+		if baseMintKey != requestedMint && quoteMintKey != requestedMint {
+			return fmt.Errorf("PumpSwap sell does not reference the requested mint %s", request.Mint)
+		}
+
 		if baseMintKey == (solana.PublicKey{}) || quoteMintKey == (solana.PublicKey{}) {
 			return fmt.Errorf("PumpSwap sell has zero base or quote mint")
 		}
@@ -1328,7 +1342,7 @@ func validatePumpSwapTransaction(tx *solana.Transaction, request Request, prepar
 	return nil
 }
 
-func validateProtectedPumpBuy(tx *solana.Transaction, mint string) error {
+func validateProtectedPumpBuy(tx *solana.Transaction, mint string, request Request, prepared livePreparation) error {
 	pumpProgram, err := solana.PublicKeyFromBase58(pumpFunProgramIDForExecution)
 	if err != nil {
 		return fmt.Errorf("invalid Pump.fun program identifier: %w", err)
@@ -1342,8 +1356,18 @@ func validateProtectedPumpBuy(tx *solana.Transaction, mint string) error {
 		return fmt.Errorf("derive requested mint bonding curve: %w", err)
 	}
 	discriminator := anchorInstructionDiscriminator("buy")
+
+	// Limite superior do que aceitamos gastar em SOL (lamports).
+	maxSOLCostLamports := math.Ceil(request.Amount * (1 + request.Slippage/100) * 1e9)
+	if maxSOLCostLamports <= 0 || maxSOLCostLamports > float64(^uint64(0)) {
+		return fmt.Errorf("invalid SOL cost ceiling for buy")
+	}
+	maxSOLCost := uint64(maxSOLCostLamports)
+
 	for _, ix := range tx.Message.Instructions {
-		if int(ix.ProgramIDIndex) >= len(tx.Message.AccountKeys) || tx.Message.AccountKeys[ix.ProgramIDIndex] != pumpProgram || len(ix.Data) < 24 || !bytes.Equal(ix.Data[:8], discriminator[:]) {
+		if int(ix.ProgramIDIndex) >= len(tx.Message.AccountKeys) ||
+			tx.Message.AccountKeys[ix.ProgramIDIndex] != pumpProgram ||
+			len(ix.Data) < 24 || !bytes.Equal(ix.Data[:8], discriminator[:]) {
 			continue
 		}
 		var hasMint, hasCurve bool
@@ -1355,10 +1379,20 @@ func validateProtectedPumpBuy(tx *solana.Transaction, mint string) error {
 			hasMint = hasMint || account == mintKey
 			hasCurve = hasCurve || account == curve
 		}
-		if hasMint && hasCurve {
-			return nil
+		if !hasMint || !hasCurve {
+			return fmt.Errorf("Pump.fun buy does not reference the requested mint and its bonding curve")
 		}
-		return fmt.Errorf("Pump.fun buy does not reference the requested mint and its bonding curve")
+		// Layout do discriminador "buy" do Pump.fun (Anchor):
+		// amount: u64 | max_sol_cost: u64
+		amount := binary.LittleEndian.Uint64(ix.Data[8:16])
+		maxSolCostIx := binary.LittleEndian.Uint64(ix.Data[16:24])
+		if amount == 0 {
+			return fmt.Errorf("Pump.fun buy has zero token amount")
+		}
+		if maxSolCostIx == 0 || maxSolCostIx > maxSOLCost {
+			return fmt.Errorf("Pump.fun buy max SOL cost %d exceeds allowed ceiling %d", maxSolCostIx, maxSOLCost)
+		}
+		return nil
 	}
 	return fmt.Errorf("prepared transaction has no verifiable direct Pump.fun buy")
 }

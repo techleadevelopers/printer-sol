@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -65,6 +66,63 @@ func (e executionEntrier) ClosePaperPosition(ctx context.Context, mint string, r
 
 func (e executionEntrier) CloseLivePosition(ctx context.Context, mint string, slippage, priorityFee float64, reason string) (string, error) {
 	return e.engine.CloseLivePosition(ctx, mint, slippage, priorityFee, reason)
+}
+
+// rpcLogAdapter adapta *rpcmanager.Manager à interface tokenmonitor.LogSubscriber.
+// O único ponto de incompatibilidade é o tipo de LogNotification, que difere
+// entre os dois pacotes (intencionalmente, para manter o tokenmonitor
+// desacoplado do rpcmanager). Este adapter converte um no outro.
+//
+// Nota: rpcmanager.LogNotification.Err é `any`, enquanto
+// tokenmonitor.LogNotification.Err é `error` (necessário para zap.Error no
+// monitor.go). A conversão é feita aqui, no único ponto de contacto entre os
+// dois pacotes.
+type rpcLogAdapter struct {
+	rpcs *rpcmanager.Manager
+}
+
+func (a rpcLogAdapter) SubscribeNewTokenLogs(ctx context.Context, programID string, handler func(tokenmonitor.LogNotification)) error {
+	return a.rpcs.SubscribeNewTokenLogs(ctx, programID, func(n rpcmanager.LogNotification) {
+		handler(tokenmonitor.LogNotification{
+			Signature: n.Signature,
+			Logs:      n.Logs,
+			Err:       toError(n.Err),
+			Slot:      n.Slot,
+		})
+	})
+}
+
+// toError normaliza o campo Err vindo do rpcmanager (que é `any`) para `error`,
+// que é o tipo que o tokenmonitor.LogNotification espera. Aceita nil, error e
+// string; qualquer outro valor é formatado com %v.
+func toError(v any) error {
+	switch e := v.(type) {
+	case nil:
+		return nil
+	case error:
+		return e
+	case string:
+		if e == "" {
+			return nil
+		}
+		return errors.New(e)
+	default:
+		return fmt.Errorf("%v", e)
+	}
+}
+
+// rpcEntryMetricsAdapter adapta *rpcmanager.Manager à assinatura esperada pelo
+// tokenmonitor para obter o market cap de entrada no fluxo de descoberta via RPC.
+// Sem esta injeção, o handleRPCNotification injeta MarketCapSOL=0 e o
+// consumeEvent rejeita o token com "missing creation market cap for take-profit
+// baseline". Delegamos diretamente em BondingCurveEntryMetrics (mesma assinatura:
+// (ctx, mint) -> (marketCapSOL, tokenPriceSOL, err)).
+type rpcEntryMetricsAdapter struct {
+	rpcs *rpcmanager.Manager
+}
+
+func (a rpcEntryMetricsAdapter) FetchEntryMetrics(ctx context.Context, mint string) (float64, float64, error) {
+	return a.rpcs.BondingCurveEntryMetrics(ctx, mint)
 }
 
 func main() {
@@ -209,6 +267,9 @@ func main() {
 			Profiles:              profiles,
 			Holders:               holders,
 			MaxOpenPositions:      cfg.MaxOpenPositions, // NOVO: vem de MAX_OPEN_POSITIONS
+			PumpPortalDetection:   cfg.PumpPortalDetection, // CORREÇÃO: respeita PUMPPORTAL_DETECTION
+			LogSubscriber:         rpcLogAdapter{rpcs: rpcs}, // NOVO
+			FetchEntryMetrics:     rpcEntryMetricsAdapter{rpcs: rpcs}.FetchEntryMetrics, // NOVO: preenche MarketCapSOL no fluxo RPC
 		},
 	)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
